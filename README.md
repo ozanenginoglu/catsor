@@ -4,6 +4,10 @@ A small cat that lives on your desktop. It's drawn from above, animated procedur
 
 Runs on **Linux (X11)** and **Windows**. It's a single binary written in Rust, with no GUI toolkit.
 
+![Demo: the cat follows the cursor, sits, pounces on a wiggling cursor, and gallops after a mouse shake](docs/demo.gif)
+
+### Coats and poses
+
 ![Preview: five coats walking (top) and rest/play poses (bottom)](docs/preview.png)
 
 ## Install
