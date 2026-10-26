@@ -1,6 +1,6 @@
 # Animation & rendering
 
-The cat is a 2D kinematic skeleton viewed from directly above. `CatSim` (`src/cat.rs`) moves the skeleton every frame, and `render.rs` builds a body around it with tiny-skia paths. There are no sprites. All lengths below are **unscaled px** and get multiplied by `scale` in the code.
+The cat is a 2D kinematic skeleton viewed from directly above. `CatSim` (`src/cat/`) moves the skeleton every frame, and `render.rs` builds a body around it with tiny-skia paths. There are no sprites. All lengths below are **unscaled px** and get multiplied by `scale` in the code.
 
 ## Body model
 
