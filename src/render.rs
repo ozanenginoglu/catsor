@@ -1,5 +1,6 @@
 use crate::cat::{
-    Activity, BODY_NODES, CatSim, CoatStyle, Gait, TOTAL_NODES, pounce_stretch, smoothstep,
+    Activity, BODY_NODES, CatSim, CoatStyle, Gait, TAIL_NODES, TOTAL_NODES, pounce_stretch,
+    smoothstep,
 };
 use glam::Vec2;
 use tiny_skia::{
@@ -199,9 +200,8 @@ pub fn render_cat(cat: &CatSim, pixmap: &mut PixmapMut, clip_mask: &mut Mask, wi
         draw_food_bowl(bowl_pos - window_origin, s, fill_ratio, pal.outline, pixmap);
     }
     let paws_on_top = cat.belly_roll > 0.35;
-
-    // 2. Articulated paws (drawn under torso normally, or on top of chest/hips once rolled onto back)
-    if !paws_on_top {
+    let head_angle = cat.body_angle + cat.head_yaw;
+    let paws = |pass, pixmap: &mut PixmapMut| {
         draw_paws(
             cat,
             &local,
@@ -209,30 +209,38 @@ pub fn render_cat(cat: &CatSim, pixmap: &mut PixmapMut, clip_mask: &mut Mask, wi
             &normals,
             window_origin,
             &pal,
+            pass,
             pixmap,
         );
+    };
+
+    // 2. Outline pass: the outlines of every part joined to the body go down first, so the
+    //    fills below cover them where parts meet and only the shared silhouette stays outlined
+    if !paws_on_top {
+        paws(Pass::Outline, pixmap);
+    }
+    draw_tail(cat, &local, &pal, Pass::Outline, pixmap);
+    draw_body_outline(cat, &local, &tangents, &normals, &pal, pixmap);
+    draw_head_outline(cat, local[0], head_angle, &pal, pixmap);
+
+    // 3. Articulated paws (under the torso normally, or on top of chest/hips once rolled onto back)
+    if !paws_on_top {
+        paws(Pass::Fill, pixmap);
     }
 
-    // 3. Sleek rounded S-curve tail (always drawn underneath the body & head so it never covers the face)
-    draw_tail(cat, &local, &pal, pixmap);
+    // 4. Sleek rounded S-curve tail (always drawn underneath the body & head so it never covers the face)
+    draw_tail(cat, &local, &pal, Pass::Fill, pixmap);
 
-    // 4. Layered body silhouette, edge-clipped coat patches, exposed belly (with roll animation), and muscle creases
+    // 5. Layered body silhouette, edge-clipped coat patches, exposed belly (with roll animation), and muscle creases
     draw_body(cat, &local, &tangents, &normals, &pal, clip_mask, pixmap);
 
+    // Paws raised over the belly cover the body, so they keep their own full outline
     if paws_on_top {
-        draw_paws(
-            cat,
-            &local,
-            &tangents,
-            &normals,
-            window_origin,
-            &pal,
-            pixmap,
-        );
+        paws(Pass::Outline, pixmap);
+        paws(Pass::Fill, pixmap);
     }
 
-    // 5. Head, snout/nose, head patches, and independent 3D triangular ears
-    let head_angle = cat.body_angle + cat.head_yaw;
+    // 6. Head, snout/nose, head patches, and independent 3D triangular ears
     draw_head_and_ears(cat, local[0], head_angle, s, &pal, clip_mask, pixmap);
 }
 
@@ -404,12 +412,21 @@ struct LegFrame {
     s: f32,
 }
 
+/// The cat is drawn in two passes so that parts joined on the body share one silhouette: every
+/// part's outline goes down first, then the fills cover the outlines wherever parts overlap
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    Outline,
+    Fill,
+}
+
 /// Draws legs in the paw colour with the coat outline
 struct LegPen<'p, 'a> {
     fill: Color,
     outline: Color,
     /// Toe notches on the top of the foot (off when the soles face up)
     toe_lines: bool,
+    pass: Pass,
     pixmap: &'p mut PixmapMut<'a>,
 }
 
@@ -482,10 +499,12 @@ impl LegPen<'_, '_> {
             paw,
         ];
 
-        // Outline every piece first, so the fills cover the seams where they overlap
-        let outline = round_stroke(LEG_OUTLINE_WIDTH * radius);
-        for path in shapes.iter().flatten() {
-            stroke_solid(self.pixmap, path, self.outline, &outline);
+        if self.pass == Pass::Outline {
+            let outline = round_stroke(LEG_OUTLINE_WIDTH * radius);
+            for path in shapes.iter().flatten() {
+                stroke_solid(self.pixmap, path, self.outline, &outline);
+            }
+            return;
         }
         for path in shapes.iter().flatten() {
             fill_solid(self.pixmap, path, self.fill);
@@ -516,6 +535,7 @@ const PAW_HALF_WIDTH: f32 = 0.92;
 const LEG_OUTLINE_WIDTH: f32 = 0.5;
 
 /// Draws the legs that show in the current pose
+#[allow(clippy::too_many_arguments)]
 fn draw_paws(
     cat: &CatSim,
     local: &[Vec2; TOTAL_NODES],
@@ -523,6 +543,7 @@ fn draw_paws(
     normals: &[Vec2; TOTAL_NODES],
     window_origin: Vec2,
     pal: &Palette,
+    pass: Pass,
     pixmap: &mut PixmapMut,
 ) {
     let f = LegFrame {
@@ -543,6 +564,7 @@ fn draw_paws(
         fill: paw_color,
         outline: pal.outline,
         toe_lines: cat.belly_roll <= 0.04,
+        pass,
         pixmap,
     };
 
@@ -689,7 +711,7 @@ fn draw_belly_up_side(
     pen.curved(shoulder, elbow, fore_tip, 2.25 * s);
 
     let bean_s = ((reach - 0.35) / 0.65).clamp(0.0, 1.0) * s;
-    if bean_s > 0.15 {
+    if bean_s > 0.15 && pen.pass == Pass::Fill {
         draw_paw_beans(
             hind_tip,
             (hind_tip - knee).normalize_or_zero(),
@@ -770,47 +792,135 @@ fn draw_paw_beans(paw_tip: Vec2, dir: Vec2, s: f32, pixmap: &mut PixmapMut) {
     }
 }
 
-fn draw_tail(cat: &CatSim, local: &[Vec2; TOTAL_NODES], pal: &Palette, pixmap: &mut PixmapMut) {
-    let s = cat.scale * cat.tail_puff;
+/// Samples along the tail's centre line (the same quadratic chain through the tail nodes), each
+/// with its position `u` counted in nodes from the tail root (0) to the tip (`TAIL_NODES`)
+fn tail_centerline(local: &[Vec2; TOTAL_NODES]) -> Vec<(Vec2, f32)> {
+    const STEPS: usize = 6;
     let tail_start = BODY_NODES - 1;
-
-    let mut pb = PathBuilder::new();
-    pb.move_to(local[tail_start].x, local[tail_start].y);
+    let mut pts = vec![(local[tail_start], 0.0)];
+    let mut from = local[tail_start];
     for i in tail_start..(TOTAL_NODES - 1) {
-        let mid = (local[i] + local[i + 1]) * 0.5;
-        pb.quad_to(local[i].x, local[i].y, mid.x, mid.y);
+        let ctrl = local[i];
+        let to = (local[i] + local[i + 1]) * 0.5;
+        let k = (i - tail_start) as f32;
+        let (u0, u1) = ((k - 0.5).max(0.0), k + 0.5);
+        for step in 1..=STEPS {
+            let t = step as f32 / STEPS as f32;
+            let v = 1.0 - t;
+            let p = from * (v * v) + ctrl * (2.0 * v * t) + to * (t * t);
+            pts.push((p, u0 + (u1 - u0) * t));
+        }
+        from = to;
     }
-    let last = local[TOTAL_NODES - 1];
-    pb.line_to(last.x, last.y);
+    pts.push((local[TOTAL_NODES - 1], TAIL_NODES as f32));
+    pts
+}
 
-    let Some(tail_path) = pb.finish() else {
+/// Half-width of the tail's shade layer at `u`: thick where it leaves the rump, thinning
+/// towards the tip
+fn tail_half_width(u: f32, s: f32) -> f32 {
+    let root_flare = 1.0 + 0.45 * (1.0 - smoothstep((u - 0.6) / 2.2));
+    let tip_thin = 1.0 - 0.18 * (u / TAIL_NODES as f32);
+    1.85 * s * root_flare * tip_thin
+}
+
+/// A closed band along `centerline` between `u0` and `u1`, `width_mult` times the tail's
+/// half-width, with a round cap when it reaches the tip
+fn tail_band(
+    centerline: &[(Vec2, f32)],
+    u0: f32,
+    u1: f32,
+    width_mult: f32,
+    s: f32,
+) -> Option<Path> {
+    let at = |u: f32| {
+        let i = centerline
+            .windows(2)
+            .position(|w| u <= w[1].1)
+            .unwrap_or(centerline.len() - 2);
+        let ((a, ua), (b, ub)) = (centerline[i], centerline[i + 1]);
+        a.lerp(b, ((u - ua) / (ub - ua).max(1e-6)).clamp(0.0, 1.0))
+    };
+    let mut pts = vec![(at(u0), u0)];
+    pts.extend(
+        centerline
+            .iter()
+            .copied()
+            .filter(|&(_, u)| u > u0 && u < u1),
+    );
+    pts.push((at(u1), u1));
+
+    let n = pts.len();
+    let dir = |i: usize| {
+        (pts[(i + 1).min(n - 1)].0 - pts[i.saturating_sub(1)].0)
+            .try_normalize()
+            .unwrap_or(Vec2::ZERO)
+    };
+    let edge = |i: usize, sign: f32| {
+        let (p, u) = pts[i];
+        let d = dir(i);
+        p + Vec2::new(-d.y, d.x) * (sign * width_mult * tail_half_width(u, s))
+    };
+    let mut pb = PathBuilder::new();
+    let start = edge(0, 1.0);
+    pb.move_to(start.x, start.y);
+    for i in 1..n {
+        let p = edge(i, 1.0);
+        pb.line_to(p.x, p.y);
+    }
+    // Round the tip off with a half circle from one edge to the other, inside the same contour
+    // so it fills with the same winding
+    if u1 >= TAIL_NODES as f32 {
+        const ARC_STEPS: usize = 8;
+        let (tip, d) = (pts[n - 1].0, dir(n - 1));
+        let normal = Vec2::new(-d.y, d.x);
+        let r = width_mult * tail_half_width(u1, s);
+        for k in 1..ARC_STEPS {
+            let (sin, cos) = (std::f32::consts::PI * k as f32 / ARC_STEPS as f32).sin_cos();
+            let p = tip + (normal * cos + d * sin) * r;
+            pb.line_to(p.x, p.y);
+        }
+    }
+    for i in (0..n).rev() {
+        let p = edge(i, -1.0);
+        pb.line_to(p.x, p.y);
+    }
+    pb.close();
+    pb.finish()
+}
+
+fn draw_tail(
+    cat: &CatSim,
+    local: &[Vec2; TOTAL_NODES],
+    pal: &Palette,
+    pass: Pass,
+    pixmap: &mut PixmapMut,
+) {
+    let s = cat.scale * cat.tail_puff;
+    let centerline = tail_centerline(local);
+    let tip = TAIL_NODES as f32;
+
+    let Some(shade_band) = tail_band(&centerline, 0.0, tip, 1.0, s) else {
         return;
     };
+    if pass == Pass::Outline {
+        stroke_solid(pixmap, &shade_band, pal.outline, &round_stroke(1.5 * s));
+        return;
+    }
 
     let (tail_base_col, tail_shade_col) = match cat.coat {
         CoatStyle::Calico => (rgba(220, 124, 54, 255), rgba(182, 92, 32, 255)),
         _ => (pal.base, pal.flank_shade),
     };
-
-    let mut stroke = round_stroke(5.2 * s);
-    stroke_solid(pixmap, &tail_path, pal.outline, &stroke);
-
-    stroke.width = 3.7 * s;
-    stroke_solid(pixmap, &tail_path, tail_shade_col, &stroke);
-
-    stroke.width = 2.4 * s;
-    stroke_solid(pixmap, &tail_path, tail_base_col, &stroke);
+    fill_solid(pixmap, &shade_band, tail_shade_col);
+    if let Some(base_band) = tail_band(&centerline, 0.0, tip, 0.65, s) {
+        fill_solid(pixmap, &base_band, tail_base_col);
+    }
 
     if cat.coat == CoatStyle::Calico {
-        stroke.width = 3.4 * s;
-        for ring_idx in [6usize, 8usize, 10usize] {
-            let p0 = local[ring_idx];
-            let p1 = local[ring_idx].lerp(local[ring_idx + 1], 0.52);
-            let mut ring_pb = PathBuilder::new();
-            ring_pb.move_to(p0.x, p0.y);
-            ring_pb.line_to(p1.x, p1.y);
-            if let Some(rp) = ring_pb.finish() {
-                stroke_solid(pixmap, &rp, rgba(178, 82, 24, 235), &stroke);
+        for ring_u in [1.0f32, 3.0, 5.0] {
+            if let Some(ring) = tail_band(&centerline, ring_u, ring_u + 0.52, 0.92, s) {
+                fill_solid(pixmap, &ring, rgba(178, 82, 24, 235));
             }
         }
     }
@@ -889,6 +999,44 @@ fn build_torso_contour(
     pb.finish()
 }
 
+/// Fore/aft shift of the shoulders and hips with the stride, as `(shoulder, hip)`
+fn torso_gait_shifts(cat: &CatSim) -> (f32, f32) {
+    let phase_rad = cat.gait_cycle * std::f32::consts::TAU;
+    let shoulder_shift = -(phase_rad.cos()) * cat.gait_weight * 1.60 * cat.scale;
+    let hip_shift = phase_rad.sin() * cat.gait_weight * 1.05 * cat.scale;
+    (shoulder_shift, hip_shift)
+}
+
+/// Strokes the torso outline for the outline pass. The stroke is centred on the contour and
+/// the fill covers its inner half, so it is twice the visible width.
+fn draw_body_outline(
+    cat: &CatSim,
+    local: &[Vec2; TOTAL_NODES],
+    tangents: &[Vec2; TOTAL_NODES],
+    normals: &[Vec2; TOTAL_NODES],
+    pal: &Palette,
+    pixmap: &mut PixmapMut,
+) {
+    let (shoulder_shift, hip_shift) = torso_gait_shifts(cat);
+    if let Some(outer_path) = build_torso_contour(
+        local,
+        tangents,
+        normals,
+        &body_half_widths(cat),
+        1.0,
+        shoulder_shift,
+        hip_shift,
+        cat.curl_amount,
+    ) {
+        stroke_solid(
+            pixmap,
+            &outer_path,
+            pal.outline,
+            &round_stroke(2.3 * cat.scale),
+        );
+    }
+}
+
 fn draw_body(
     cat: &CatSim,
     local: &[Vec2; TOTAL_NODES],
@@ -898,11 +1046,8 @@ fn draw_body(
     clip_mask: &mut Mask,
     pixmap: &mut PixmapMut,
 ) {
-    let s = cat.scale;
     let widths = body_half_widths(cat);
-    let phase_rad = cat.gait_cycle * std::f32::consts::TAU;
-    let shoulder_shift = -(phase_rad.cos()) * cat.gait_weight * 1.60 * s;
-    let hip_shift = phase_rad.sin() * cat.gait_weight * 1.05 * s;
+    let (shoulder_shift, hip_shift) = torso_gait_shifts(cat);
 
     let Some(outer_path) = build_torso_contour(
         local,
@@ -958,8 +1103,6 @@ fn draw_body(
             cat, local, tangents, normals, &widths, pal, clip_mask, pixmap,
         );
     }
-    let stroke = round_stroke(1.15 * s);
-    stroke_solid(pixmap, &outer_path, pal.outline, &stroke);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1212,6 +1355,23 @@ struct HeadFrame {
     roll: f32,
 }
 
+/// Strokes the head outline for the outline pass, at twice the visible width like the torso's
+fn draw_head_outline(
+    cat: &CatSim,
+    head_center: Vec2,
+    head_angle: f32,
+    pal: &Palette,
+    pixmap: &mut PixmapMut,
+) {
+    let s = cat.scale;
+    let fwd = Vec2::from_angle(head_angle);
+    let side = Vec2::new(-fwd.y, fwd.x);
+    let roll = smoothstep(cat.belly_roll);
+    if let Some(outer_head) = build_head_path_rolled(head_center, fwd, side, s, roll) {
+        stroke_solid(pixmap, &outer_head, pal.outline, &round_stroke(2.2 * s));
+    }
+}
+
 fn draw_head_and_ears(
     cat: &CatSim,
     head_center: Vec2,
@@ -1242,19 +1402,37 @@ fn draw_head_and_ears(
     let neck_shadow_center = head_center - fwd * (1.8 * s);
     if let Some(shadow_path) = build_head_path_rolled(neck_shadow_center, fwd, side, s * 1.03, roll)
     {
-        fill_solid(pixmap, &shadow_path, rgba(0, 0, 0, 32));
+        fill_solid(pixmap, &shadow_path, rgba(0, 0, 0, 22));
     }
 
     let Some(outer_head) = build_head_path_rolled(head_center, fwd, side, s, roll) else {
         return;
     };
-    fill_solid(pixmap, &outer_head, pal.flank_shade);
+    // `clip_mask` still holds the torso. The head's darker rim only shades the part outside the
+    // torso; over the shoulders it takes the coat's base colour so the neck blends into the body.
+    fill_solid_masked(pixmap, &outer_head, pal.base, clip_mask);
+    clip_mask.invert();
+    fill_solid_masked(pixmap, &outer_head, pal.flank_shade, clip_mask);
+    clip_mask.invert();
 
     let inner_offset = fwd * (0.35 * (1.0 - 2.0 * roll) * s);
     if let Some(inner_head) =
         build_head_path_rolled(head_center + inner_offset, fwd, side, s * 0.84, roll)
     {
         fill_solid(pixmap, &inner_head, pal.base);
+    }
+
+    // Curled up asleep, the head rests on top of the flank rather than growing out of it, so a
+    // faint occlusion line keeps it readable where it lies over the torso
+    let rest_on_body = smoothstep((cat.curl_amount.abs() - 0.42) / 0.12);
+    if rest_on_body > 0.01 {
+        stroke_solid_masked(
+            pixmap,
+            &outer_head,
+            scale_alpha(pal.outline, 0.55 * rest_on_body),
+            &round_stroke(1.0 * s),
+            clip_mask,
+        );
     }
 
     if let Some(patch_col) = pal.patch_primary {
@@ -1273,8 +1451,6 @@ fn draw_head_and_ears(
         clip_mask.fill_path(&outer_head, FillRule::Winding, true, Transform::identity());
         draw_upturned_face(cat, &h, pal, clip_mask, pixmap);
     }
-
-    stroke_solid(pixmap, &outer_head, pal.outline, &round_stroke(1.1 * s));
 
     if !belly_up {
         draw_ears(cat, &h, pal, pixmap);

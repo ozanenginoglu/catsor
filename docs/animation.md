@@ -107,7 +107,7 @@ Each tail segment chases a target angle. The follow rate is 16/s at the base and
 - extra noise and a hook at the tip,
 - while Sitting, Grooming or AloofNotice, a **sitting wrap** (`sit_tail_wrap`, eases in over ~1 s): extra bend per segment (`SIT_TAIL_WRAP`) turns the tail sideways off the rump, runs it forward along the flank and hooks it in toward the front paws. Only the tip keeps flicking. It unwraps quickly when the cat moves or turns.
 
-The tail is always drawn **under** the body and head, so it never covers the face.
+The tail is always drawn **under** the body and head, so it never covers the face. It shares the body's outline, so no line separates it from the rump.
 
 ### Head & ears
 
@@ -121,10 +121,11 @@ Draw order:
 
 1. Soft ground shadow
 2. Food bowl and kibble (while eating; it empties as `feeding_fill_ratio` drops)
-3. Paws, with toe beans (moved after the body when `belly_roll > 0.35`). Each leg is a tapered shape that narrows from the shoulder or hip to a slim wrist and ends in an oval paw, wider than the wrist, centred on the paw position; two toe notches mark the top of the foot (left off when the soles face up). While walking, trotting and galloping, each leg is drawn from its shoulder or hip anchor to the simulated `paws[i]` position. Walking and trotting draw only legs that reach past the chest or haunches. A hind leg is drawn from the back of the haunch (4.5 px behind the hip, 3.2 px out), so only the lower leg shows beyond the rump instead of a long stick running along its side. Galloping draws all four and lets the body cover what's underneath, and a swinging hind leg flares up to 4 px outward, because in a rotary gallop the hind feet pass outside the forefeet
-4. Tail: a tapering S-curve with an outline
-5. Body: an outer outline, then the inner fill. The outline is also written into `clip_mask`, so **coat patches, the exposed belly and muscle creases are clipped to the body silhouette**
-6. Head, snout and nose, head patches, and ears. The mask is cleared and refilled with the head outline, so head patches are clipped to the head
+3. **Outline pass** (`Pass::Outline`): the outlines of the legs, tail, body and head, in that order. The fills drawn after it cover the outlines wherever parts overlap, so the cat gets **one shared silhouette** with no seams where the tail, legs and neck join the body. Body and head outlines are stroked at twice their visible width, because the fill covers the inner half
+4. Paws, with toe beans (`Pass::Fill`). When `belly_roll > 0.35` the paws are drawn after the body instead, with their own outline and fill, because they lie on top of the belly. Each leg is a tapered shape that narrows from the shoulder or hip to a slim wrist and ends in an oval paw, wider than the wrist, centred on the paw position; two toe notches mark the top of the foot (left off when the soles face up). While walking, trotting and galloping, each leg is drawn from its shoulder or hip anchor to the simulated `paws[i]` position. Walking and trotting draw only legs that reach past the chest or haunches. A hind leg is drawn from the back of the haunch (4.5 px behind the hip, 3.2 px out), so only the lower leg shows beyond the rump instead of a long stick running along its side. Galloping draws all four and lets the body cover what's underneath, and a swinging hind leg flares up to 4 px outward, because in a rotary gallop the hind feet pass outside the forefeet
+5. Tail: a band along the tail curve (`tail_band`) that is about 1.45× thicker where it leaves the rump, thins towards the tip and ends in a round cap. It has a darker shade layer and a lighter centre; calico rings are short bands of the same shape
+6. Body: an outer flank-shade fill, then the inner base fill. The outer contour is also written into `clip_mask`, so **coat patches, the exposed belly and muscle creases are clipped to the body silhouette**
+7. Head, snout and nose, head patches, and ears. The head's darker rim is drawn only outside the torso (the still-set body mask, inverted); over the shoulders it takes the base colour, so the neck blends into the body. When curled up asleep (`|curl_amount|` above ~0.42), a faint outline is drawn where the head lies over the torso so it stays readable. The mask is then cleared and refilled with the head outline, so head patches are clipped to the head
 
 How wide the body is at each node comes from `body_half_widths`. The base widths are neck 5.8, shoulders 8.9, waist 7.8, hips 8.5 and rump 5.0. On top of that, breathing adds width, a compact posture plumps the waist and hips, a stretched posture slims the shoulders and waist, and crouching widens the hips.
 
