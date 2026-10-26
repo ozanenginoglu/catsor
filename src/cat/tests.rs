@@ -1676,3 +1676,106 @@ fn shaking_off_a_crouching_cat_calls_off_its_pounce() {
         );
     }
 }
+
+/// Teases a settled cat the way a person would: an aimed move out to `spot`, then flicking the
+/// pointer back and forth across the cat's line of sight. Returns whether it stalked and pounced.
+fn tease_with_pointer(
+    cat: &mut CatSim,
+    from: Vec2,
+    spot: Vec2,
+    axis: Vec2,
+    hz: f32,
+    dt: f32,
+) -> (bool, bool) {
+    let (mut stalked, mut pounced) = (false, false);
+    let move_steps = (0.3 / dt) as usize;
+    for i in 1..=move_steps {
+        cat.update(
+            from.lerp(spot, smoothstep(i as f32 / move_steps as f32)),
+            dt,
+        );
+    }
+    let mut t = 0.0;
+    while t < 4.0 && !pounced {
+        t += dt;
+        let flick = (std::f32::consts::TAU * hz * t).sin() * 20.0;
+        cat.update(spot + axis * flick, dt);
+        stalked |= matches!(cat.activity, Activity::StalkWiggle { .. });
+        pounced |= matches!(cat.activity, Activity::Pouncing { .. });
+    }
+    (stalked, pounced)
+}
+
+#[test]
+fn moving_the_pointer_away_and_wiggling_it_makes_a_sitting_cat_stalk_and_pounce() {
+    for temperament in Temperament::ALL {
+        for (hz, dt, axis) in [
+            (4.0, 1.0 / 60.0, Vec2::Y),
+            (5.0, 1.0 / 144.0, Vec2::Y),
+            (4.0, 1.0 / 30.0, Vec2::new(0.5, 0.87)),
+            // A horizontal wiggle in pounce range is play, not a shake calling the cat over
+            (4.5, 1.0 / 60.0, Vec2::X),
+        ] {
+            let start = Vec2::new(400.0, 400.0);
+            let mut cat = CatSim::new(start, 1.0, CoatStyle::Calico);
+            cat.behaviors.temperament = temperament;
+            let rest = cat.nodes[0] + Vec2::new(38.0, 0.0);
+            for _ in 0..(2.0 / dt) as usize {
+                cat.update(rest, dt);
+            }
+            assert_eq!(cat.activity, Activity::Sitting, "{temperament:?}");
+
+            let spot = cat.nodes[0] + Vec2::new(150.0, 0.0);
+            let (stalked, pounced) = tease_with_pointer(&mut cat, rest, spot, axis, hz, dt);
+            assert!(
+                stalked && pounced && !cat.sprinting,
+                "{temperament:?} at {hz} Hz, dt {dt:.3}, axis {axis}: stalked {stalked}, pounced {pounced}, sprinting {}",
+                cat.sprinting
+            );
+        }
+    }
+}
+
+#[test]
+fn ordinary_pointing_near_the_cat_never_starts_a_stalk() {
+    // Aimed moves between spots around the cat, each overshooting a little and correcting back,
+    // with short pauses: busy everyday mouse use, not a laser-pointer tease
+    let dt = 1.0 / 60.0;
+    for temperament in Temperament::ALL {
+        let start = Vec2::new(500.0, 400.0);
+        let mut cat = CatSim::new(start, 1.0, CoatStyle::Calico);
+        cat.behaviors.temperament = temperament;
+        let mut cursor = cat.nodes[0] + Vec2::new(38.0, 0.0);
+        let mut max_excitement = 0.0f32;
+        for i in 0..40 {
+            let angle = i as f32 * 0.6;
+            let target = start + Vec2::from_angle(angle) * (110.0 + (i % 3) as f32 * 30.0);
+            let overshoot = target + (target - cursor) * 0.08;
+            let from = cursor;
+            for k in 1..=15 {
+                cursor = from.lerp(overshoot, smoothstep(k as f32 / 15.0));
+                cat.update(cursor, dt);
+                max_excitement = max_excitement.max(cat.play_excitement);
+            }
+            for k in 1..=6 {
+                cursor = overshoot.lerp(target, smoothstep(k as f32 / 6.0));
+                cat.update(cursor, dt);
+            }
+            for _ in 0..9 {
+                cat.update(cursor, dt);
+            }
+            max_excitement = max_excitement.max(cat.play_excitement);
+            assert!(
+                !matches!(
+                    cat.activity,
+                    Activity::StalkWiggle { .. } | Activity::Pouncing { .. }
+                ),
+                "{temperament:?} stalked ordinary pointing after {i} moves"
+            );
+        }
+        assert!(
+            max_excitement < 0.4,
+            "{temperament:?} got excited ({max_excitement:.2}) by ordinary pointing"
+        );
+    }
+}

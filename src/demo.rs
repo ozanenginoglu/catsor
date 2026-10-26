@@ -29,14 +29,14 @@ enum Gesture {
     /// (smooth start, smooth stop), undershooting slightly and finishing with a small correction,
     /// like a real aimed hand movement
     Move { to: Vec2, secs: f32, bend: f32 },
-    /// Teasing the cat like a laser dot: a quick move to just in front of its face, then flicking
-    /// the pointer side to side, and partway through sliding the whole dot `glide` px (unscaled)
-    /// farther away. Aimed relative to where the cat is, as a person would
+    /// Teasing the cat like a laser dot: an aimed move out to `dist` px (unscaled) in front of
+    /// its face, then flicking the pointer side to side. Aimed relative to where the cat is, as
+    /// a person would
     Tease {
         secs: f32,
         amp: f32,
         hz: f32,
-        glide: f32,
+        dist: f32,
     },
     /// Shaking the mouse left and right to call the cat over
     Shake { secs: f32, amp: f32, hz: f32 },
@@ -70,12 +70,12 @@ fn gesture_track(gesture: &Gesture, pos: Vec2, cat: &CatSim) -> Vec<Vec2> {
             secs,
             amp,
             hz,
-            glide,
+            dist,
         } => {
             let head = cat.nodes[0];
             let out = (pos - head).normalize_or(Vec2::X);
-            let center = head + out * 52.0 * cat.scale;
-            aimed_move(&mut track, pos, center, 0.3, 0.0);
+            let center = head + out * dist * cat.scale;
+            aimed_move(&mut track, pos, center, 0.45, 0.08);
             // Flick across the cat's line of sight, slightly tilted
             let axis = Vec2::new(-out.y, out.x).rotate(Vec2::from_angle(0.15));
             let n = steps(secs);
@@ -85,9 +85,8 @@ fn gesture_track(gesture: &Gesture, pos: Vec2, cat: &CatSim) -> Vec<Vec2> {
                 // The hand's rhythm wanders a little, and the dot drifts slowly
                 let phase = TAU * hz * t + 0.6 * (TAU * 0.7 * t).sin();
                 let along = phase.sin() * amp * cat.scale * k;
-                let across = (TAU * 0.45 * t).sin() * amp * cat.scale * -0.2 * k;
-                let slide = glide * cat.scale * min_jerk((t / secs - 0.45) / 0.35);
-                track.push(center + axis * along + out * (across + slide));
+                let across = (TAU * 0.45 * t).sin() * amp * cat.scale * 0.3 * k;
+                track.push(center + axis * along + out * across);
             }
         }
         Gesture::Shake { secs, amp, hz } => {
@@ -214,19 +213,19 @@ fn regenerate_demo_gif() {
             bend: 0.10,
         },
         Hold(6.2),
-        // Flick the pointer like a laser dot just in front of the cat, then slide it away: the
-        // cat crouches, wiggles its rear and pounces
+        // Point a little way off and flick the pointer like a laser dot: the cat gets up,
+        // crouches, wiggles its rear and pounces
         Tease {
-            secs: 2.4,
-            amp: 54.0,
-            hz: 6.0,
-            glide: 75.0,
+            secs: 1.9,
+            amp: 14.0,
+            hz: 4.5,
+            dist: 135.0,
         },
         Hold(0.4),
         // The "dot" escapes a little, then rests while the cat recovers
         Move {
-            to: v(820.0, 400.0),
-            secs: 0.45,
+            to: v(700.0, 460.0),
+            secs: 0.5,
             bend: -0.15,
         },
         Hold(4.0),

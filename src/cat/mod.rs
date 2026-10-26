@@ -334,8 +334,18 @@ pub struct CatSim {
 
     /// Raw cursor position in screen coordinates
     pub raw_cursor: Vec2,
-    /// Previous meaningful cursor step direction, used to distinguish back-and-forth wiggles from point-to-point moves
-    last_cursor_dir: Vec2,
+    /// Cursor movement not yet long enough (4 px) to give a reliable direction, and how long it
+    /// took. Collecting it makes wiggle detection independent of the frame rate
+    wiggle_segment: Vec2,
+    wiggle_segment_time: f32,
+    /// Direction, length and peak speed (px/s) of the current wiggle stroke. Strokes are split
+    /// where the cursor reverses, which tells back-and-forth wiggles from point-to-point moves
+    wiggle_stroke_dir: Vec2,
+    wiggle_stroke_len: f32,
+    wiggle_stroke_peak: f32,
+    /// Whether the current stroke reversed out of a fast, short wiggle stroke. A move that
+    /// overshoots and corrects has one such stroke; a back-and-forth has them in a row
+    wiggle_after_fast_stroke: bool,
     /// Instantaneous cursor velocity (px/s) to detect laser-pointer wiggles
     pub cursor_speed: f32,
     /// Accumulated "play/wiggle" excitement from rapid back-and-forth cursor oscillations
@@ -540,7 +550,12 @@ impl CatSim {
             behaviors: BehaviorConfig::default(),
             feeding_phase: None,
             raw_cursor: start_pos,
-            last_cursor_dir: Vec2::ZERO,
+            wiggle_segment: Vec2::ZERO,
+            wiggle_segment_time: 0.0,
+            wiggle_stroke_dir: Vec2::ZERO,
+            wiggle_stroke_len: 0.0,
+            wiggle_stroke_peak: 0.0,
+            wiggle_after_fast_stroke: false,
             cursor_speed: 0.0,
             play_excitement: 0.0,
             shake_dir_x: 0.0,

@@ -64,6 +64,8 @@ stateDiagram-v2
     StandingUp --> Walking: ~0.48 s, target far
     StandingUp --> StandingIdle: ~0.48 s, target near
     StandingUp --> StalkWiggle: wiggle excitement
+    Walking --> StalkWiggle: wiggle excitement (not sprinting)
+    StandingIdle --> StalkWiggle: wiggle excitement
     StalkWiggle --> Pouncing: wiggle done
     StalkWiggle --> StandingUp: cursor > 240 px (auto pounce only)
     Pouncing --> Walking: landed, target still far
@@ -97,19 +99,20 @@ Not shown in the diagram: Grooming, PawBatting and TailChasing all go to `Standi
 
 **Realistic** aims for real-cat pacing rather than a personality. The cat is ~45 px long, so 1 px is about 1 cm. It walks at 66 px/s (~0.65 m/s at ~1.6 strides/s, a relaxed cat walk) instead of 104, and trots at up to 135 px/s only toward distant targets. It settles slowly and fidgets rarely. Its sprint speed is the same as Balanced. The other temperaments scale a brisker walk and trot (104/152 px/s) by their speed multiplier, which also scales the sprint.
 
-Temperament also sets how fast wiggles build `play_excitement`: Playful 2.5, Balanced 1.8, Realistic 1.5, Aloof 1.1, Lazy 0.9. "Aloof chance" is the probability that a lying cat first goes into `AloofNotice` (a 0.22–0.38 s ear-flick pause) before getting up. It only applies when the cursor is within 210 px.
+Temperament also sets how fast wiggles build `play_excitement`: each counted reversal adds 0.1 × Playful 2.5, Balanced 1.8, Realistic 1.5, Aloof 1.1 or Lazy 0.9. "Aloof chance" is the probability that a lying cat first goes into `AloofNotice` (a 0.22–0.38 s ear-flick pause) before getting up. It only applies when the cursor is within 210 px.
 
 ## Cursor gestures
 
 ### Laser-pointer wiggle → pounce
 
-A frame counts toward `play_excitement` only if **all** of these are true:
+`track_wiggle_strokes` splits cursor movement into *strokes*. Movement is collected until it covers 4 px, which gives a direction that doesn't depend on the frame rate. A new stroke starts when that direction reverses (dot product < −0.25 with the stroke's direction). A stroke is *fast* if it is 8–150 px long and peaked above 250 px/s. A pause of 0.25 s, or a single-frame jump of 75 px or more, forgets the stroke so far.
+
+A reversal counts toward `play_excitement` only if **all** of these are true:
 - Playful Hunting is on.
-- The cursor step is longer than 4 px and **reverses** direction (dot product < −0.25 with the previous step direction).
-- The instantaneous speed is over 250 px/s, and the step is under 75 px.
+- It ends a fast stroke that itself began by reversing out of a fast stroke. So a back-and-forth flick counts, but an aimed move that overshoots and corrects back does not: it has only one fast stroke, and the correction is slow and short.
 - The cursor is 75–230 px from the cat's head.
 
-A step of 75 px or more, or a cursor 230 px or more from the head, resets excitement to 0. Otherwise excitement decays at 0.65/s. Once excitement is above **0.55** and the cursor is 85–230 px away, a Sitting or StandingUp cat goes into `StalkWiggle`, a low crouch with flattened ears. It lasts 0.6–0.85 s, or 1.4–2.4 s for Realistic. The cat holds a still stare for the first 30% of the crouch, then the butt wiggle fades in: weight shifting between the hind paws at about 3 Hz, right up to the launch. Then it goes into `Pouncing`, a leap of at most 180 px (90 px, about two body lengths, for Realistic; a cat with farther to go lands short and walks the rest). The leap follows `pounce_travel`, a trapezoidal speed profile: a hard push-off over the first 20%, steady flight, then braking over the last 25% as the forepaws land.
+A jump of 75 px or more, or a cursor 230 px or more from the head, resets excitement to 0. Otherwise excitement decays at 0.4/s. Once excitement is above **0.55** and both the raw and the smoothed cursor are 85–230 px away, a Sitting, StandingUp, StandingIdle or Walking (not sprinting) cat goes into `StalkWiggle`, a low crouch with flattened ears. Walking and StandingIdle matter because a cursor moved out to pounce range wakes a sitting cat before a wiggle there has built enough excitement; the cat then stops on its way over and crouches. A Balanced cat needs under a second of a 4 Hz wiggle. The crouch lasts 0.6–0.85 s, or 1.4–2.4 s for Realistic. The cat holds a still stare for the first 30% of the crouch, then the butt wiggle fades in: weight shifting between the hind paws at about 3 Hz, right up to the launch. Then it goes into `Pouncing`, a leap of at most 180 px (90 px, about two body lengths, for Realistic; a cat with farther to go lands short and walks the rest). The leap follows `pounce_travel`, a trapezoidal speed profile: a hard push-off over the first 20%, steady flight, then braking over the last 25% as the forepaws land.
 
 > The reversal requirement is deliberate (commit `2c02ff9`). Before it, a sudden point-to-point mouse move counted as excitement and made the cat do a straight-line pounce across the screen. Normal moves must always lead to a walk.
 
@@ -118,7 +121,7 @@ A step of 75 px or more, or a cursor 230 px or more from the head, resets excite
 - A *horizontal step* is |dx| > 2.5 px, |dx| ≥ 0.75·|dy|, and vx > 180 px/s.
 - Steps in the same direction add up into a *stroke*. When the direction reverses, the previous stroke counts if it covered ≥ 12 px and peaked above 240 px/s. Each counted stroke adds **0.68** `shake_energy` (capped at 2.0).
 - Energy decays at 1.35/s. The stroke resets after 0.25 s with no horizontal steps, or after a large vertical move.
-- At `shake_energy ≥ 1.0`, so about two quick reversals, `sprinting` turns on. Any state is forced into `Walking` with turning and acceleration tuned for a gallop, and `gallop_weight` blends in (see [animation.md](animation.md#gaits)). Sprinting ends once the cat has stopped and its energy has run out. Shakes are ignored while the cat is eating or when Follow Cursor is off.
+- At `shake_energy ≥ 1.0`, so about two quick reversals, `sprinting` turns on. The exception is a shake at pounce range: with Playful Hunting on, if both the raw and the smoothed cursor are 75–230 px from the head, the energy is used up and nothing starts (`shake_is_laser_play`). A side-to-side wiggle there is laser play for the stalk above, not a call to come over. Any state is forced into `Walking` with turning and acceleration tuned for a gallop, and `gallop_weight` blends in (see [animation.md](animation.md#gaits)). Sprinting ends once the cat has stopped and its energy has run out. Shakes are ignored while the cat is eating or when Follow Cursor is off.
 
 ### Shake over the cat → roaming
 

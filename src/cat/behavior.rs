@@ -163,24 +163,11 @@ impl CatSim {
 
     /// Builds `play_excitement` from back-and-forth cursor reversals near the cat.
     fn track_wiggle(&mut self, cursor_step: Vec2, raw_dist_to_head: f32, dt: f32) {
-        let cursor_delta = cursor_step.length();
-        let inst_speed = cursor_delta / dt;
-        let is_wiggle_reversal = if cursor_delta > 4.0 * self.scale {
-            let step_dir = cursor_step / cursor_delta;
-            let reversed = self.last_cursor_dir.length_squared() > 0.5
-                && step_dir.dot(self.last_cursor_dir) < -0.25;
-            self.last_cursor_dir = step_dir;
-            reversed
-        } else {
-            false
-        };
-
         // Only true back-and-forth cursor reversals (like wiggling a laser pointer) build hunting excitement;
         // a sudden point-to-point mouse move must never be misclassified as a wiggle.
+        let is_wiggle_reversal = self.track_wiggle_strokes(cursor_step, dt);
         if self.behaviors.playful_quirks
             && is_wiggle_reversal
-            && inst_speed > 250.0 * self.scale
-            && cursor_delta < 75.0 * self.scale
             && raw_dist_to_head > 75.0 * self.scale
             && raw_dist_to_head < 230.0 * self.scale
         {
@@ -191,12 +178,65 @@ impl CatSim {
                 Temperament::Aloof => 1.1,
                 Temperament::Realistic => 1.5,
             };
-            self.play_excitement = (self.play_excitement + (dt * gain).max(0.06 * gain)).min(1.5);
-        } else if cursor_delta >= 75.0 * self.scale || raw_dist_to_head >= 230.0 * self.scale {
+            self.play_excitement = (self.play_excitement + 0.1 * gain).min(1.5);
+        } else if cursor_step.length() >= 75.0 * self.scale
+            || raw_dist_to_head >= 230.0 * self.scale
+        {
             self.play_excitement = 0.0;
         } else {
-            self.play_excitement = (self.play_excitement - dt * 0.65).max(0.0);
+            self.play_excitement = (self.play_excitement - dt * 0.4).max(0.0);
         }
+    }
+
+    /// Splits cursor movement into strokes at each reversal. Returns whether a reversal this
+    /// frame ended the second of two fast, short strokes in a row: a back-and-forth flick.
+    fn track_wiggle_strokes(&mut self, cursor_step: Vec2, dt: f32) -> bool {
+        if cursor_step.length() >= 75.0 * self.scale {
+            // A jump, not a hand movement
+            self.reset_wiggle_strokes();
+            return false;
+        }
+        self.wiggle_segment += cursor_step;
+        self.wiggle_segment_time += dt;
+        let seg_len = self.wiggle_segment.length();
+        if seg_len <= 4.0 * self.scale {
+            if self.wiggle_segment_time > 0.25 {
+                // The pointer came to rest: whatever comes next is a new movement
+                self.reset_wiggle_strokes();
+            }
+            return false;
+        }
+
+        let dir = self.wiggle_segment / seg_len;
+        let speed = seg_len / self.wiggle_segment_time;
+        self.wiggle_segment = Vec2::ZERO;
+        self.wiggle_segment_time = 0.0;
+        let reversed =
+            self.wiggle_stroke_dir != Vec2::ZERO && dir.dot(self.wiggle_stroke_dir) < -0.25;
+        let mut back_and_forth = false;
+        if reversed {
+            let fast_stroke = self.wiggle_stroke_len >= 8.0 * self.scale
+                && self.wiggle_stroke_len < 150.0 * self.scale
+                && self.wiggle_stroke_peak > 250.0 * self.scale;
+            back_and_forth = fast_stroke && self.wiggle_after_fast_stroke;
+            self.wiggle_after_fast_stroke = fast_stroke;
+        }
+        if reversed || self.wiggle_stroke_dir == Vec2::ZERO {
+            self.wiggle_stroke_len = seg_len;
+            self.wiggle_stroke_peak = speed;
+        } else {
+            self.wiggle_stroke_len += seg_len;
+            self.wiggle_stroke_peak = self.wiggle_stroke_peak.max(speed);
+        }
+        self.wiggle_stroke_dir = dir;
+        back_and_forth
+    }
+
+    fn reset_wiggle_strokes(&mut self) {
+        self.wiggle_segment = Vec2::ZERO;
+        self.wiggle_segment_time = 0.0;
+        self.wiggle_stroke_dir = Vec2::ZERO;
+        self.wiggle_after_fast_stroke = false;
     }
 
     /// Detects rapid horizontal (left-right) mouse shakes to make the cat run to the cursor.
@@ -265,6 +305,10 @@ impl CatSim {
             } else if !self.sprinting && self.cursor_over_cat() {
                 self.start_roaming();
                 return;
+            } else if !self.sprinting && self.shake_is_laser_play() {
+                // Back-and-forth at pounce range is a laser dot to hunt, not a call to come over
+                self.shake_energy = 0.0;
+                return;
             }
             if !self.sprinting {
                 self.sprinting = true;
@@ -276,6 +320,16 @@ impl CatSim {
             self.pinned_rest = false;
             self.play_excitement = 0.0;
         }
+    }
+
+    /// Whether a shake is really laser-pointer play: Playful Hunting is on and the shake is
+    /// at pounce range in front of the cat (both where the pointer is and the middle of the shake)
+    fn shake_is_laser_play(&self) -> bool {
+        let in_range = |p: Vec2| {
+            let dist = p.distance(self.nodes[0]);
+            dist > 75.0 * self.scale && dist < 230.0 * self.scale
+        };
+        self.behaviors.playful_quirks && in_range(self.raw_cursor) && in_range(self.smooth_cursor)
     }
 
     /// Whether the shake is centred over the cat's body. The smoothed cursor sits near the
@@ -791,10 +845,7 @@ impl CatSim {
             Activity::StandingUp { mut progress } => {
                 // If user is wiggling the cursor enticingly at pounce range, drop into StalkWiggle!
                 if steer.wants_to_pounce {
-                    self.activity = Activity::StalkWiggle {
-                        timer: 0.0,
-                        wiggle_duration: self.crouch_duration(),
-                    };
+                    self.start_stalk();
                 } else {
                     // Smoothly stand up over ~0.48s before taking a single step
                     progress += dt * 2.1;
@@ -811,7 +862,11 @@ impl CatSim {
             }
             Activity::Walking => {
                 self.idle_time = 0.0;
-                if steer.dist_to_target < 6.0 * self.scale && self.speed < 18.0 * self.scale {
+                if steer.wants_to_pounce && !self.sprinting {
+                    // Walking up to a dancing laser dot: stop and crouch
+                    self.start_stalk();
+                } else if steer.dist_to_target < 6.0 * self.scale && self.speed < 18.0 * self.scale
+                {
                     self.speed = 0.0;
                     if self.shake_energy < 0.8 {
                         self.sprinting = false;
@@ -826,7 +881,9 @@ impl CatSim {
                 if self.wake_anchor.is_some() && dist_to_cursor > wake_radius_sit {
                     self.wake_anchor = None;
                 }
-                if steer.dist_to_target > 18.0 * self.scale {
+                if steer.wants_to_pounce && !self.sprinting {
+                    self.start_stalk();
+                } else if steer.dist_to_target > 18.0 * self.scale {
                     self.activity = Activity::Walking;
                 } else if timer >= 1.6 {
                     self.curl_side = self.rand_side();
@@ -907,10 +964,7 @@ impl CatSim {
         if steer.wakes(tuning.wake_radius_sit) {
             // Normal or sudden point-to-point cursor moves always stand up and walk
             if steer.wants_to_pounce {
-                self.activity = Activity::StalkWiggle {
-                    timer: 0.0,
-                    wiggle_duration: self.crouch_duration(),
-                };
+                self.start_stalk();
             } else {
                 // First stand up before walking!
                 self.activity = Activity::StandingUp { progress: 0.0 };
@@ -980,6 +1034,13 @@ impl CatSim {
     }
 
     /// Pre-pounce crouch. `timer` already includes this tick.
+    fn start_stalk(&mut self) {
+        self.activity = Activity::StalkWiggle {
+            timer: 0.0,
+            wiggle_duration: self.crouch_duration(),
+        };
+    }
+
     fn step_stalk(&mut self, steer: &Steering, timer: f32, wiggle_duration: f32, dt: f32) {
         // Lock eyes/head onto target/cursor and flatten airplane ears. The crouch starts with a
         // still stare, then the hindquarters shift weight from one hind paw to the other
