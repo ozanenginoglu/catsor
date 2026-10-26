@@ -3,7 +3,7 @@ use crate::cat::{
 };
 use glam::Vec2;
 use tiny_skia::{
-    Color, FillRule, LineCap, LineJoin, Mask, Paint, Path, PathBuilder, PixmapMut, Stroke,
+    Color, FillRule, LineCap, LineJoin, Mask, Paint, Path, PathBuilder, PixmapMut, Rect, Stroke,
     Transform,
 };
 
@@ -408,24 +408,112 @@ struct LegFrame {
 struct LegPen<'p, 'a> {
     fill: Color,
     outline: Color,
+    /// Toe notches on the top of the foot (off when the soles face up)
+    toe_lines: bool,
     pixmap: &'p mut PixmapMut<'a>,
 }
 
 impl LegPen<'_, '_> {
     fn straight(&mut self, shoulder_pos: Vec2, paw_tip: Vec2, radius: f32) {
-        let mut pb = PathBuilder::new();
-        pb.move_to(shoulder_pos.x, shoulder_pos.y);
-        pb.line_to(paw_tip.x, paw_tip.y);
-        stroke_limb(pb, radius, self.fill, self.outline, self.pixmap);
+        self.limb(
+            shoulder_pos,
+            (shoulder_pos + paw_tip) * 0.5,
+            paw_tip,
+            radius,
+        );
     }
 
     fn curved(&mut self, anchor_pos: Vec2, joint_pos: Vec2, paw_tip: Vec2, radius: f32) {
-        let mut pb = PathBuilder::new();
-        pb.move_to(anchor_pos.x, anchor_pos.y);
-        pb.quad_to(joint_pos.x, joint_pos.y, paw_tip.x, paw_tip.y);
-        stroke_limb(pb, radius, self.fill, self.outline, self.pixmap);
+        self.limb(anchor_pos, joint_pos, paw_tip, radius);
+    }
+
+    /// A leg tapering from `anchor_pos` along a quadratic curve through `joint_pos` down to a
+    /// slim wrist, ending in an oval paw centred on `paw_tip` that is wider than the wrist
+    fn limb(&mut self, anchor_pos: Vec2, joint_pos: Vec2, paw_tip: Vec2, radius: f32) {
+        let Some(dir) = (paw_tip - joint_pos).try_normalize() else {
+            return;
+        };
+        let perp = Vec2::new(-dir.y, dir.x);
+
+        let curve = |t: f32| {
+            let u = 1.0 - t;
+            anchor_pos * (u * u) + joint_pos * (2.0 * u * t) + paw_tip * (t * t)
+        };
+        let curve_tangent =
+            |t: f32| (joint_pos - anchor_pos) * (1.0 - t) + (paw_tip - joint_pos) * t;
+        let half_width =
+            |t: f32| radius * (LEG_TOP_WIDTH + (LEG_WRIST_WIDTH - LEG_TOP_WIDTH) * smoothstep(t));
+
+        const SAMPLES: usize = 8;
+        let edge = |t: f32, sign: f32| {
+            let n = curve_tangent(t)
+                .try_normalize()
+                .map_or(perp, |d| Vec2::new(-d.y, d.x));
+            curve(t) + n * (sign * half_width(t))
+        };
+        let mut leg = PathBuilder::new();
+        let start = edge(0.0, 1.0);
+        leg.move_to(start.x, start.y);
+        for i in 1..=SAMPLES {
+            let p = edge(i as f32 / SAMPLES as f32, 1.0);
+            leg.line_to(p.x, p.y);
+        }
+        for i in (0..=SAMPLES).rev() {
+            let p = edge(i as f32 / SAMPLES as f32, -1.0);
+            leg.line_to(p.x, p.y);
+        }
+        leg.close();
+
+        let paw = Rect::from_ltrb(
+            -PAW_HALF_LEN * radius,
+            -PAW_HALF_WIDTH * radius,
+            PAW_HALF_LEN * radius,
+            PAW_HALF_WIDTH * radius,
+        )
+        .and_then(PathBuilder::from_oval)
+        .and_then(|oval| {
+            oval.transform(Transform::from_row(
+                dir.x, dir.y, perp.x, perp.y, paw_tip.x, paw_tip.y,
+            ))
+        });
+        let shapes = [
+            leg.finish(),
+            PathBuilder::from_circle(anchor_pos.x, anchor_pos.y, LEG_TOP_WIDTH * radius),
+            paw,
+        ];
+
+        // Outline every piece first, so the fills cover the seams where they overlap
+        let outline = round_stroke(LEG_OUTLINE_WIDTH * radius);
+        for path in shapes.iter().flatten() {
+            stroke_solid(self.pixmap, path, self.outline, &outline);
+        }
+        for path in shapes.iter().flatten() {
+            fill_solid(self.pixmap, path, self.fill);
+        }
+
+        if self.toe_lines {
+            let toe = round_stroke((0.2 * radius).max(0.6));
+            for sign in [-1.0f32, 1.0] {
+                let from = paw_tip + dir * (0.45 * radius) + perp * (sign * 0.28 * radius);
+                let to = paw_tip + dir * (1.12 * radius) + perp * (sign * 0.34 * radius);
+                let mut pb = PathBuilder::new();
+                pb.move_to(from.x, from.y);
+                pb.line_to(to.x, to.y);
+                if let Some(path) = pb.finish() {
+                    stroke_solid(self.pixmap, &path, scale_alpha(self.outline, 0.75), &toe);
+                }
+            }
+        }
     }
 }
+
+/// Leg shape relative to the leg radius: half-widths at the shoulder/hip and at the wrist,
+/// the paw oval's half-length and half-width, and the outline stroke width
+const LEG_TOP_WIDTH: f32 = 0.86;
+const LEG_WRIST_WIDTH: f32 = 0.52;
+const PAW_HALF_LEN: f32 = 1.2;
+const PAW_HALF_WIDTH: f32 = 0.92;
+const LEG_OUTLINE_WIDTH: f32 = 0.5;
 
 /// Draws the legs that show in the current pose
 fn draw_paws(
@@ -454,6 +542,7 @@ fn draw_paws(
     let mut pen = LegPen {
         fill: paw_color,
         outline: pal.outline,
+        toe_lines: cat.belly_roll <= 0.04,
         pixmap,
     };
 
@@ -660,24 +749,6 @@ fn draw_gait_legs(
             pen.straight(anchor, paw_local, 2.15 * s);
         }
     }
-}
-
-/// Strokes a limb path as a round-capped outline with a narrower fill on top
-fn stroke_limb(
-    pb: PathBuilder,
-    radius: f32,
-    fill_col: Color,
-    outline_col: Color,
-    pixmap: &mut PixmapMut,
-) {
-    let Some(path) = pb.finish() else {
-        return;
-    };
-    let mut stroke = round_stroke(radius * 2.05);
-    stroke_solid(pixmap, &path, outline_col, &stroke);
-
-    stroke.width = radius * 1.5;
-    stroke_solid(pixmap, &path, fill_col, &stroke);
 }
 
 fn draw_paw_beans(paw_tip: Vec2, dir: Vec2, s: f32, pixmap: &mut PixmapMut) {
