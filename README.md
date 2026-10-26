@@ -81,6 +81,8 @@ Left- or right-click the tray icon to open the menu. Press Esc or click outside 
 
 - **Wiggle the cursor back and forth** about 85–230 px from the cat. It crouches, wiggles its butt, and pounces.
 - **Shake the mouse quickly left and right.** The cat gallops over to the cursor.
+- **Shake the mouse right over the cat** to shoo it off. It goes its own way: it wanders around the screen, naps, and keeps away from the cursor. Shake the mouse again (anywhere) to call it back. It gallops over and goes back to following you.
+- **Turn off Follow Cursor** in the tray menu and the cat roams the same way, until you turn it back on.
 - **Leave it alone.** It sits, then lies down, then curls up and sleeps.
 
 ### Feeding mode (keep-awake)

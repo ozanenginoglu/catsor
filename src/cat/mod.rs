@@ -324,6 +324,7 @@ impl Gait {
     }
 }
 
+#[cfg_attr(test, derive(Clone))]
 pub struct CatSim {
     pub scale: f32,
     pub coat: CoatStyle,
@@ -351,6 +352,26 @@ pub struct CatSim {
     pub shake_energy: f32,
     /// Whether the cat is actively running/sprinting toward the cursor after a left-right shake
     pub sprinting: bool,
+    /// Ignores shakes until the cursor stops shaking, so the shake that sent the cat roaming
+    /// can't call it straight back
+    shake_lockout: bool,
+    /// Whether the cat is off on its own after a shake over it: it wanders and keeps away from
+    /// the cursor until another shake calls it back
+    pub roaming: bool,
+    /// Whether the cat is roaming because Follow Cursor is off, rather than because it was
+    /// shaken off; turning Follow Cursor back on then ends roaming
+    roaming_by_menu: bool,
+    /// Where the roaming cat is heading, and whether it is still on its way there
+    roam_target: Vec2,
+    roam_going: bool,
+    /// Time until the roaming cat, resting, wanders off again
+    roam_timer: f32,
+    /// Time before the roaming cat may pick another place to flee to
+    flee_cooldown: f32,
+    /// Where roaming started; the cat wanders around it when `roam_bounds` is unknown
+    roam_origin: Vec2,
+    /// Screen area (min, max) the roaming cat stays inside, set by the platform backend
+    pub roam_bounds: Option<(Vec2, Vec2)>,
     /// Low-pass smoothed cursor target so rapid mouse jitter is ignored
     pub smooth_cursor: Vec2,
     /// Target resting spot near the cursor (offset so cat doesn't cover pointer)
@@ -528,6 +549,15 @@ impl CatSim {
             shake_idle_timer: 0.0,
             shake_energy: 0.0,
             sprinting: false,
+            shake_lockout: false,
+            roaming: false,
+            roaming_by_menu: false,
+            roam_target: head_pos,
+            roam_going: false,
+            roam_timer: 0.0,
+            flee_cooldown: 0.0,
+            roam_origin: start_pos,
+            roam_bounds: None,
             smooth_cursor: start_pos,
             rest_target: head_pos,
             nodes,
@@ -968,6 +998,12 @@ impl CatSim {
     /// Highest stride frequency (strides/s) when moving forward; faster speeds lengthen the stride
     /// instead
     const MAX_CADENCE: f32 = 4.2;
+    /// How close (unscaled px) the cursor may come to a roaming cat before it moves away
+    const ROAM_FLEE_RADIUS: f32 = 110.0;
+    /// How far (unscaled px) from the cursor a roaming cat prefers to wander to
+    const ROAM_CLEARANCE: f32 = 180.0;
+    /// How close (unscaled px) to its body the cursor must shake to send the cat roaming
+    const SHAKE_OFF_RADIUS: f32 = 18.0;
 
     /// Stable torso anchor in screen space for positioning the compact ARGB overlay window
     /// without jittering when the tail sways, hips wiggle, or posture curls/extends.
@@ -1009,6 +1045,13 @@ pub fn pounce_travel(progress: f32) -> f32 {
 /// during push-off, stays long in the air and gathers again as it lands.
 pub fn pounce_stretch(progress: f32) -> f32 {
     smoothstep(progress / 0.2) * (1.0 - smoothstep((progress - 0.75) / 0.25))
+}
+
+/// Distance from `p` to the segment `a`–`b`
+pub fn dist_to_segment(p: Vec2, a: Vec2, b: Vec2) -> f32 {
+    let ab = b - a;
+    let t = ((p - a).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
+    p.distance(a + ab * t)
 }
 
 #[inline]

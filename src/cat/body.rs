@@ -4,7 +4,7 @@ use glam::Vec2;
 impl CatSim {
     pub(super) fn update_head_and_ears(
         &mut self,
-        angle_to_cursor: f32,
+        look_angle: f32,
         dist_to_cursor: f32,
         cursor_delta: f32,
         dt: f32,
@@ -40,7 +40,7 @@ impl CatSim {
             }
             Activity::PawBatting { side, timer, .. } => {
                 // Intently watches the cursor while batting at it, then glances away
-                let rel = wrap_angle(angle_to_cursor - self.body_angle).clamp(-0.6, 0.6);
+                let rel = wrap_angle(look_angle - self.body_angle).clamp(-0.6, 0.6);
                 rel * 0.7 + (timer * 14.0).sin() * 0.06 * side
             }
             Activity::TailChasing { dir, .. } => {
@@ -51,13 +51,13 @@ impl CatSim {
             Activity::Circling { dir, .. } => dir * 0.3,
             Activity::StalkWiggle { .. } | Activity::Pouncing { .. } => {
                 // Dead-locked gaze on the target
-                wrap_angle(angle_to_cursor - self.body_angle).clamp(-0.65, 0.65)
+                wrap_angle(look_angle - self.body_angle).clamp(-0.65, 0.65)
             }
             Activity::Stretching { progress, .. } => {
                 (progress * std::f32::consts::TAU).sin() * 0.06
             }
             _ => {
-                let rel_cursor = wrap_angle(angle_to_cursor - self.body_angle);
+                let rel_cursor = wrap_angle(look_angle - self.body_angle);
                 let wander = Self::fbm(self.time * 0.32, 77) * 0.38;
                 let cursor_attention = if matches!(
                     self.activity,

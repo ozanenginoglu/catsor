@@ -1041,6 +1041,17 @@ impl WinApp {
             return;
         }
         let cursor_pos = Vec2::new(pt.x as f32, pt.y as f32);
+        // A roaming cat stays within the work area of the monitor it is on. Looked up every
+        // frame so it follows the cat across monitors and display changes.
+        let center = self.cat.window_center();
+        let work = monitor_work_area(POINT {
+            x: center.x as i32,
+            y: center.y as i32,
+        });
+        self.cat.roam_bounds = Some((
+            Vec2::new(work.left as f32, work.top as f32),
+            Vec2::new(work.right as f32, work.bottom as f32),
+        ));
         if self.cat.is_carrying_bowl() {
             if !is_key_down(VK_LBUTTON) {
                 self.bowl_click_armed = true;

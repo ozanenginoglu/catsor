@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use tiny_skia::{Mask, Pixmap};
 use x11rb::connection::Connection;
 use x11rb::protocol::Event;
+use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::shape::{self, ConnectionExt as _};
 use x11rb::protocol::xfixes::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
@@ -340,6 +341,47 @@ struct X11App {
     start_on_login: bool,
     keep_awake: X11KeepAwake,
     tray: Option<TrayController>,
+    /// Active monitors as (min, max) corners in root coordinates, refreshed every few seconds
+    monitors: Vec<(Vec2, Vec2)>,
+    monitors_checked: Instant,
+}
+
+/// Each active monitor's (min, max) corners from RandR, or the whole root window when RandR
+/// 1.5 monitors aren't available
+fn query_monitors(conn: &RustConnection, root: Window) -> Vec<(Vec2, Vec2)> {
+    let monitors: Vec<(Vec2, Vec2)> = conn
+        .randr_get_monitors(root, true)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+        .map(|reply| {
+            reply
+                .monitors
+                .iter()
+                .filter(|m| m.width > 0 && m.height > 0)
+                .map(|m| {
+                    let min = Vec2::new(m.x as f32, m.y as f32);
+                    (min, min + Vec2::new(m.width as f32, m.height as f32))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if !monitors.is_empty() {
+        return monitors;
+    }
+    conn.get_geometry(root)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+        .map(|geo| vec![(Vec2::ZERO, Vec2::new(geo.width as f32, geo.height as f32))])
+        .unwrap_or_default()
+}
+
+/// The monitor containing `p`, or else the one nearest to it
+fn monitor_at(monitors: &[(Vec2, Vec2)], p: Vec2) -> Option<(Vec2, Vec2)> {
+    monitors.iter().copied().min_by(|a, b| {
+        let da = p.distance(p.clamp(a.0, a.1));
+        let db = p.distance(p.clamp(b.0, b.1));
+        da.total_cmp(&db)
+    })
 }
 
 pub fn run(args: &Args, prefs: UserPrefs) -> BoxResult<()> {
@@ -392,6 +434,8 @@ impl X11App {
         let start_cursor = Vec2::new(pointer.root_x as f32, pointer.root_y as f32);
         let mut cat = CatSim::new(start_cursor, prefs.scale, prefs.coat);
         cat.behaviors = prefs.behaviors;
+        let _ = conn.randr_query_version(1, 5).map(|cookie| cookie.reply());
+        let monitors = query_monitors(&conn, env.root);
 
         // Compact window bounding box around the cat (~108x108 at scale 1.0)
         let win_dim = cat_window_dim(prefs.scale);
@@ -452,6 +496,8 @@ impl X11App {
             start_on_login,
             keep_awake: X11KeepAwake::new(),
             tray,
+            monitors,
+            monitors_checked: Instant::now(),
         })
     }
 
@@ -640,6 +686,7 @@ impl X11App {
     /// Advances the simulation from the root-window cursor. A hidden cat stays paused unless
     /// it is feeding.
     fn step_cat(&mut self, dt: f32) {
+        self.update_roam_bounds();
         if (!self.cat_hidden || self.cat.feeding_preset().is_some())
             && let Ok(cookie) = self.conn.query_pointer(self.env.root)
             && let Ok(reply) = cookie.reply()
@@ -650,6 +697,16 @@ impl X11App {
         } else {
             self.keep_awake.set_active(&self.conn, false);
         }
+    }
+
+    /// Keeps a roaming cat on the monitor it is on. The monitor layout is re-read every few
+    /// seconds so plugging, unplugging or rearranging screens is picked up.
+    fn update_roam_bounds(&mut self) {
+        if self.monitors_checked.elapsed() >= Duration::from_secs(2) {
+            self.monitors_checked = Instant::now();
+            self.monitors = query_monitors(&self.conn, self.env.root);
+        }
+        self.cat.roam_bounds = monitor_at(&self.monitors, self.cat.window_center());
     }
 
     fn sync_tray(&mut self, retry_dock: bool) -> BoxResult<()> {

@@ -62,6 +62,10 @@ When a feed preset is picked, the loop **grabs the pointer and keyboard on the r
 
 If the grab fails (another client already holds a grab), the bowl is placed at the cursor straight away. The grab is released as soon as the cat stops carrying the bowl, whatever the reason. The bowl is drawn in its **own small click-through window** while it's being carried or walked to. Once eating starts, `render_cat` draws it as part of the cat's frame.
 
+### Roaming bounds
+
+Each frame, `update_roam_bounds` sets `cat.roam_bounds` to the monitor that contains the cat's `window_center()`, or the nearest one. Monitors come from RandR 1.5 `GetMonitors` (active monitors only) and are re-read every 2 s, so plugging, unplugging or rearranging screens is picked up. Per-monitor bounds matter because with monitors of different sizes, the root window has areas no screen shows. If RandR monitors aren't available, the whole root window is used. Docks and panels (e.g. xmobar) aren't excluded. Roam targets stay 30 px inside the monitor edge, so the cat may partly overlap a bar.
+
 ### Keep-awake (feeding mode)
 
 `X11KeepAwake` is active while `cat.keeps_awake()` is true, which covers WalkingToBowl and Eating.
@@ -88,7 +92,7 @@ The binary is built for the **GUI subsystem** (`windows_subsystem = "windows"` i
 
 **App icon.** `build.rs` embeds `assets/catsor.ico` as the exe's icon resource, so Explorer, Task Manager and shortcuts show the cat. It writes the compiled `.res` itself (each image as an `RT_ICON`, plus `RT_GROUP_ICON` 1) instead of compiling an `.rc` script. MSVC links the `.res` directly. GNU converts it to a COFF object with `windres --input-format=res`, which skips windres' C preprocessor. The preprocessor step breaks when the project path contains spaces, and it is also why the `winresource` crate was dropped. The output is byte-identical to `llvm-rc` for `1 ICON "catsor.ico"`. The `.ico` (16–256 px, PNG-compressed entries) and the Linux launcher icon `assets/catsor.png` are generated from `render_tray_icon` by the ignored test `regenerate_app_icons`, so they match the tray icon. The overlay and menu windows are tool windows with no taskbar button, so they don't need a window-class icon.
 
-The process declares itself **per-monitor DPI aware (v2)**, so window positions match `GetCursorPos` coordinates on scaled displays. Menu placement uses the work area of the monitor under the cursor (`monitor_work_area`).
+The process declares itself **per-monitor DPI aware (v2)**, so window positions match `GetCursorPos` coordinates on scaled displays. Menu placement uses the work area of the monitor under the cursor (`monitor_work_area`). A roaming cat's `roam_bounds` is set every frame to the work area of the monitor the cat is on, so it stays on that monitor, clear of the taskbar, and follows display changes.
 
 ### Start on login (`autostart.rs`)
 

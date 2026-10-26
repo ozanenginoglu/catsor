@@ -428,31 +428,71 @@ fn curved_walk_trajectory_remains_compact_and_smooth() {
 }
 
 #[test]
-fn follow_cursor_toggle_anchors_cat_in_place() {
-    let start = Vec2::new(300.0, 300.0);
+fn follow_cursor_off_lets_the_cat_roam_and_back_on_follows_again() {
+    const DT: f32 = 1.0 / 60.0;
+    let start = Vec2::new(800.0, 500.0);
     let mut cat = CatSim::new(start, 1.0, CoatStyle::Calico);
+    cat.roam_bounds = Some((Vec2::ZERO, Vec2::new(1600.0, 1000.0)));
     for _ in 0..15 {
-        cat.update(start, 1.0 / 60.0);
+        cat.update(start, DT);
     }
     cat.behaviors.follow_cursor = false;
-    let anchored_waist = cat.nodes[3];
 
-    // Move cursor far away; cat should stay sitting/relaxing at its current spot
-    for _ in 0..120 {
-        cat.update(Vec2::new(900.0, 700.0), 1.0 / 60.0);
+    // A far-off cursor doesn't draw the cat over; it settles in, then wanders on its own
+    let far = Vec2::new(1400.0, 850.0);
+    cat.update(far, DT);
+    assert!(
+        cat.roaming,
+        "Turning Follow Cursor off should start roaming"
+    );
+    let mut closest = f32::MAX;
+    let mut moved = 0.0;
+    let mut prev = cat.nodes[0];
+    for _ in 0..(60 * 60) {
+        cat.update(far, DT);
+        moved += cat.nodes[0].distance(prev);
+        prev = cat.nodes[0];
+        closest = closest.min(cat.nodes[0].distance(far));
     }
     assert!(
-        !matches!(
-            cat.activity,
-            Activity::Walking | Activity::StandingUp { .. }
-        ),
-        "Expected cat not to walk when follow_cursor is disabled, got {:?}",
-        cat.activity
+        moved > 200.0,
+        "Roaming cat should wander, moved only {moved:.0}px"
     );
     assert!(
-        cat.nodes[3].distance(anchored_waist) < 1.0,
-        "Cat waist drifted {:.2}px while follow_cursor was disabled",
-        cat.nodes[3].distance(anchored_waist)
+        closest > 150.0,
+        "Cat came within {closest:.0}px of the cursor"
+    );
+
+    // It keeps away from a cursor put on it, and shakes don't call it back
+    let on_cat = cat.nodes[0];
+    for i in 0..300 {
+        let shake = if (i / 5) % 2 == 0 { -40.0 } else { 40.0 };
+        let cursor = if i < 60 {
+            on_cat + Vec2::new(shake, 0.0)
+        } else {
+            on_cat
+        };
+        cat.update(cursor, DT);
+    }
+    assert!(
+        cat.roaming && !cat.sprinting,
+        "Shakes must not override Follow Cursor being off"
+    );
+    assert!(
+        cat.nodes[0].distance(on_cat) > CatSim::ROAM_FLEE_RADIUS,
+        "Roaming cat should flee a cursor placed on it"
+    );
+
+    // Turning Follow Cursor back on ends roaming and the cat comes to the cursor
+    cat.behaviors.follow_cursor = true;
+    for _ in 0..(10 * 60) {
+        cat.update(on_cat, DT);
+    }
+    assert!(!cat.roaming, "Turning Follow Cursor on should end roaming");
+    assert!(
+        cat.nodes[0].distance(on_cat) < 60.0,
+        "Cat should follow the cursor again, head is {:.0}px away",
+        cat.nodes[0].distance(on_cat)
     );
 }
 
@@ -1387,4 +1427,252 @@ fn bowl_placement_carries_under_cursor_and_walks_cat_to_clicked_bowl_spot() {
         Some(click_spot),
         "Bowl must remain pinned at the placed coordinate"
     );
+}
+
+#[test]
+fn shaking_over_the_cat_sends_it_roaming_until_a_shake_calls_it_back() {
+    const DT: f32 = 1.0 / 60.0;
+    let lo = Vec2::new(0.0, 0.0);
+    let hi = Vec2::new(1600.0, 1000.0);
+    let start = Vec2::new(800.0, 500.0);
+    let mut cat = CatSim::new(start, 1.0, CoatStyle::Calico);
+    cat.roam_bounds = Some((lo, hi));
+    let shake = |cat: &mut CatSim, center: Vec2, strokes: usize| {
+        for i in 0..strokes {
+            let dir = if i % 2 == 0 { 1.0 } else { -1.0 };
+            for &dx in &[-40.0, -20.0, 0.0, 20.0, 40.0] {
+                cat.update(center + Vec2::new(dir * dx, 0.0), DT);
+            }
+        }
+    };
+
+    // 1. Put the cursor on the cat's back and let it settle, then shake it there
+    let on_back = cat.nodes[3];
+    for _ in 0..30 {
+        cat.update(on_back, DT);
+    }
+    shake(&mut cat, on_back, 3);
+    assert!(cat.roaming, "Shaking over the cat should send it roaming");
+    assert!(
+        !cat.sprinting,
+        "Shaking the cat off must not make it sprint"
+    );
+
+    // 2. Shaking on after it was shaken off doesn't call it straight back
+    shake(&mut cat, on_back, 6);
+    assert!(cat.roaming, "The same shake must not end roaming");
+
+    // 3. It walks away from the still cursor, and keeps away when the cursor follows it
+    for _ in 0..240 {
+        cat.update(on_back, DT);
+    }
+    assert!(
+        cat.nodes[0].distance(on_back) > 150.0,
+        "Roaming cat should move away from the cursor, head is {:.0}px away",
+        cat.nodes[0].distance(on_back)
+    );
+    let chaser = cat.nodes[0];
+    for _ in 0..60 {
+        cat.update(chaser, DT);
+    }
+    for _ in 0..240 {
+        cat.update(chaser, DT);
+    }
+    assert!(
+        cat.nodes[0].distance(chaser) > CatSim::ROAM_FLEE_RADIUS,
+        "Roaming cat should flee a cursor placed on it, head is {:.0}px away",
+        cat.nodes[0].distance(chaser)
+    );
+
+    // 4. Left alone, it wanders around on its own inside the screen, clear of the cursor
+    let still = chaser;
+    let mut moved = 0.0;
+    let mut prev = cat.nodes[0];
+    for _ in 0..(90 * 60) {
+        cat.update(still, DT);
+        let head = cat.nodes[0];
+        moved += head.distance(prev);
+        prev = head;
+        assert!(
+            head.cmpge(lo).all() && head.cmple(hi).all(),
+            "Cat left the screen at {head}"
+        );
+        assert!(
+            head.distance(still) > 90.0,
+            "Roaming cat came within {:.0}px of the cursor",
+            head.distance(still)
+        );
+        assert!(cat.roaming && !cat.sprinting);
+    }
+    assert!(
+        moved > 300.0,
+        "Roaming cat should wander, moved only {moved:.0}px"
+    );
+
+    // 5. It ignores the cursor completely: a twin cat whose cursor sweeps around (out of
+    // fleeing range) turns its head, ears and body exactly like one whose cursor stays still
+    let mut frames = 0;
+    while (cat.roam_going || cat.activity != Activity::Sitting || cat.roam_timer < 2.5)
+        && frames < 60 * 60
+    {
+        cat.update(still, DT);
+        frames += 1;
+    }
+    assert!(!cat.roam_going && cat.activity == Activity::Sitting);
+    let mut twin = cat.clone();
+    let away = (still - cat.nodes[0]).normalize();
+    let side = away.perp();
+    for frame in 0..120 {
+        let t = frame as f32 * DT;
+        let sweep =
+            still + away * (40.0 + 40.0 * (t * 5.0).sin()) + side * (90.0 * (t * 3.0).sin());
+        cat.update(still, DT);
+        twin.update(sweep, DT);
+        assert_eq!(twin.activity, cat.activity);
+        assert_eq!(
+            twin.head_yaw, cat.head_yaw,
+            "Roaming cat's head followed the cursor"
+        );
+        assert_eq!(
+            twin.body_angle, cat.body_angle,
+            "Roaming cat turned toward the cursor"
+        );
+        assert_eq!(twin.ear_left_twitch, cat.ear_left_twitch);
+        assert_eq!(twin.ear_right_twitch, cat.ear_right_twitch);
+    }
+
+    // 6. A shake calls it back at a gallop; then it follows the cursor normally
+    shake(&mut cat, still, 3);
+    assert!(!cat.roaming, "A shake should end roaming");
+    assert!(cat.sprinting, "The cat should sprint back when called");
+    for _ in 0..240 {
+        cat.update(still, DT);
+    }
+    assert!(!cat.sprinting);
+    assert!(
+        cat.nodes[0].distance(still) < 60.0,
+        "Called cat should come to the cursor, head is {:.0}px away",
+        cat.nodes[0].distance(still)
+    );
+    let moved_cursor = still + Vec2::new(if still.x > 800.0 { -300.0 } else { 300.0 }, 0.0);
+    for _ in 0..360 {
+        cat.update(moved_cursor, DT);
+    }
+    assert!(
+        cat.nodes[0].distance(moved_cursor) < 60.0,
+        "After returning the cat should follow the cursor again"
+    );
+}
+
+/// A cat roaming because Follow Cursor is off, inside a 1600x1000 screen
+fn roaming_cat(start: Vec2) -> CatSim {
+    let mut cat = CatSim::new(start, 1.0, CoatStyle::Calico);
+    cat.roam_bounds = Some((Vec2::ZERO, Vec2::new(1600.0, 1000.0)));
+    cat.behaviors.follow_cursor = false;
+    cat.update(start, 1.0 / 60.0);
+    assert!(cat.roaming);
+    cat
+}
+
+#[test]
+fn cornered_roaming_cat_slips_out_along_the_wall() {
+    const DT: f32 = 1.0 / 60.0;
+    // Head in the top-left corner, cursor between it and the middle of the screen
+    let mut cat = roaming_cat(Vec2::new(110.0, 40.0));
+    let corner_head = cat.nodes[0];
+    let cursor = corner_head + Vec2::new(60.0, 60.0);
+    let mut picks = 0;
+    let mut prev_target = cat.roam_target;
+    for _ in 0..(6 * 60) {
+        cat.update(cursor, DT);
+        if cat.roam_target != prev_target {
+            picks += 1;
+            prev_target = cat.roam_target;
+        }
+    }
+    assert!(
+        cat.nodes[0].distance(cursor) > CatSim::ROAM_FLEE_RADIUS,
+        "Cornered cat should get away from the cursor, head is {:.0}px away",
+        cat.nodes[0].distance(cursor)
+    );
+    assert!(
+        picks < 10,
+        "Cornered cat kept re-picking where to go ({picks} times)"
+    );
+}
+
+#[test]
+fn roaming_cat_turns_aside_instead_of_walking_through_the_cursor() {
+    const DT: f32 = 1.0 / 60.0;
+    let mut cat = roaming_cat(Vec2::new(800.0, 500.0));
+    let far = Vec2::new(1500.0, 950.0);
+    let mut frames = 0;
+    while !(cat.roam_going && cat.activity == Activity::Walking && cat.speed > 60.0) {
+        cat.update(far, DT);
+        frames += 1;
+        assert!(frames < 60 * 60, "Cat never set off to wander");
+    }
+    // Park the cursor on its route, 90 px ahead
+    let route = (cat.roam_target - cat.nodes[0]).normalize();
+    let in_the_way = cat.nodes[0] + route * 90.0;
+    let mut closest = f32::MAX;
+    for _ in 0..(4 * 60) {
+        cat.update(in_the_way, DT);
+        closest = closest.min(cat.nodes[0].distance(in_the_way));
+    }
+    assert!(
+        closest > 45.0,
+        "Roaming cat walked up to {closest:.0}px of the cursor in its way"
+    );
+}
+
+#[test]
+fn shaking_just_in_front_of_a_resting_cat_calls_it_instead_of_shooing_it() {
+    const DT: f32 = 1.0 / 60.0;
+    let start = Vec2::new(800.0, 500.0);
+    let mut cat = CatSim::new(start, 1.0, CoatStyle::Calico);
+    // Let it walk over and settle, so the cursor sits about a stop radius ahead of its head
+    let cursor = Vec2::new(1000.0, 500.0);
+    for _ in 0..(5 * 60) {
+        cat.update(cursor, DT);
+    }
+    for i in 0..30 {
+        let dx = if (i / 5) % 2 == 0 { -40.0 } else { 40.0 };
+        cat.update(cursor + Vec2::new(dx, 0.0), DT);
+    }
+    assert!(!cat.roaming, "A shake in front of the cat must not shoo it");
+}
+
+#[test]
+fn shaking_off_a_crouching_cat_calls_off_its_pounce() {
+    const DT: f32 = 1.0 / 60.0;
+    let start = Vec2::new(800.0, 500.0);
+    let mut cat = CatSim::new(start, 1.0, CoatStyle::Calico);
+    cat.roam_bounds = Some((Vec2::ZERO, Vec2::new(1600.0, 1000.0)));
+    let on_back = cat.nodes[3];
+    for _ in 0..30 {
+        cat.update(on_back, DT);
+    }
+    cat.trigger(TriggerKind::Pounce);
+    cat.update(on_back, DT);
+    assert!(matches!(cat.activity, Activity::StalkWiggle { .. }));
+    for i in 0..20 {
+        let dx = if (i / 5) % 2 == 0 { -40.0 } else { 40.0 };
+        cat.update(on_back + Vec2::new(dx, 0.0), DT);
+        if cat.roaming {
+            break;
+        }
+    }
+    assert!(cat.roaming, "Shake over the crouching cat should shoo it");
+    for _ in 0..120 {
+        cat.update(on_back, DT);
+        assert!(
+            !matches!(
+                cat.activity,
+                Activity::StalkWiggle { .. } | Activity::Pouncing { .. }
+            ),
+            "Shaken-off cat still went for the cursor: {:?}",
+            cat.activity
+        );
+    }
 }

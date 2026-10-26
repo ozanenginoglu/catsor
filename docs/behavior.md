@@ -13,9 +13,10 @@ All behavior lives in `CatSim::update` in `src/cat/behavior.rs`. It's a single `
 | `idle_time` | Builds up while resting and is **not** reset between Sitting → Lying, so the "lie → sleep" time counts total idle time |
 | `play_excitement` | Built up by laser-pointer-style wiggles. Leads to a pounce |
 | `shake_energy` / `sprinting` | Built up by fast left-right mouse shakes. Leads to a gallop |
+| `roaming` | Set by a shake right over the cat, or while Follow Cursor is off. The cat ignores the cursor, wanders on its own and keeps away from it |
 | `pinned_rest` | Set only by the test-only `BellyUp` trigger. Keeps BellyUp from timing out |
 
-If **Follow Cursor** is off, the distance to the cursor is always treated as 0. The cat never wakes up or walks because of the cursor.
+If **Follow Cursor** is off, the cat is always roaming (see [Shake over the cat → roaming](#shake-over-the-cat--roaming)): it lives its own life, wanders and keeps away from the cursor, and shakes are ignored.
 
 ## State diagram
 
@@ -71,7 +72,7 @@ stateDiagram-v2
     Eating --> Grooming: timer done / stopped
 ```
 
-Not shown in the diagram: Grooming, PawBatting and TailChasing all go to `StandingUp` when the cursor moves past their wake radius (1.05×, 1.0× and 1.2× the sit radius). A sprint forces any state into `Walking`.
+Not shown in the diagram: Grooming, PawBatting and TailChasing all go to `StandingUp` when the cursor moves past their wake radius (1.05×, 1.0× and 1.2× the sit radius). A sprint forces any state into `Walking`. While roaming, "cursor" in the diagram means the cat's own wander target (see [Shake over the cat → roaming](#shake-over-the-cat--roaming)).
 
 ## Wake radii
 
@@ -118,6 +119,20 @@ A step of 75 px or more, or a cursor 230 px or more from the head, resets excite
 - Steps in the same direction add up into a *stroke*. When the direction reverses, the previous stroke counts if it covered ≥ 12 px and peaked above 240 px/s. Each counted stroke adds **0.68** `shake_energy` (capped at 2.0).
 - Energy decays at 1.35/s. The stroke resets after 0.25 s with no horizontal steps, or after a large vertical move.
 - At `shake_energy ≥ 1.0`, so about two quick reversals, `sprinting` turns on. Any state is forced into `Walking` with turning and acceleration tuned for a gallop, and `gallop_weight` blends in (see [animation.md](animation.md#gaits)). Sprinting ends once the cat has stopped and its energy has run out. Shakes are ignored while the cat is eating or when Follow Cursor is off.
+
+### Shake over the cat → roaming
+
+If the shake triggers while the smoothed cursor is within 18 px (`SHAKE_OFF_RADIUS`) of the cat's spine (head to tail base), and the cat isn't already sprinting, the cat is shaken off instead of sprinting: `roaming` turns on. Only the smoothed cursor counts, because it sits near the middle of the shake. The raw cursor swings ±40 px, so a shake right in front of a resting cat (the cursor sits a stop radius, ~38 px, from its head) would brush its head and shoo it when the user meant to call it. A crouch that hasn't launched yet is called off. A pounce already in the air just lands. Shakes are then ignored (`shake_lockout`) until the cursor has stopped making fast horizontal steps for 0.4 s, so carrying on with the same shake can't call the cat straight back.
+
+While roaming, the state machine runs as usual but is driven by `roam_target` instead of the cursor. The cursor distance that wakes the cat is 0. While the cat has somewhere to go, `Steering::roam_errand` is set and `Steering::wakes` gets it up from any rest. Once its head is within 8 px of the target, the errand is over and it rests, grooms and naps as normal. Laser-pointer pounces are off. The cat pays the cursor no attention at all. Its head, body turns (standing up, shuffling round while sitting) and gaze follow `Steering::look_angle`: where it is going, or straight ahead with idle glances while it rests. Cursor moves don't flick its ears or set off paw-bats. The cursor only matters for choosing where to go, and for when to flee.
+
+- **Fleeing:** when the cursor comes within 110 px (`ROAM_FLEE_RADIUS`) of the head, the cat picks a new spot unless its route is already clear. A route is clear when the cat is on its way to a spot at least 165 px from the cursor, and the cursor isn't *in the way*: ahead of the head and within 55 px of the straight line to the spot. It samples 16 spots 170–300 px away, within ±135° of the direction away from the cursor, so a cat cornered against the screen edge can slip out sideways along the wall. Spots under 60 px away or with the cursor in the way are skipped, and of the rest it takes the one farthest from the cursor, with a small bonus for distance travelled. If no spot qualifies, it stays put. Either way it won't pick again for 0.8 s (`flee_cooldown`).
+- **Wandering:** after resting 5–14 s (×0.6 Playful, ×2.2 Lazy, ×1.1 Aloof, ×3.5 Realistic), it walks to a random spot 110–320 px away and at least 180 px (`ROAM_CLEARANCE`) from the cursor, again skipping spots with the cursor in the way. The rest multiplier is `TemperamentTuning::roam_rest_mult`. If it's lying down or asleep at that point, there's a 55% chance it keeps resting for another rest period instead.
+- **Bounds:** targets stay 30 px inside `roam_bounds`. The backends set this every frame to the monitor the cat is on (see [platform-notes.md](platform-notes.md#roaming-bounds)). Without bounds the cat stays within 360 px of where roaming started.
+
+Any shake while roaming ends it and starts a normal sprint to the cursor, after which the cat follows as usual. Placing a food bowl or feeding also ends roaming.
+
+**Follow Cursor off** puts the cat in roaming too (`roaming_by_menu`). It carries on with what it was doing and first wanders off after half a rest period. Shakes are ignored then, so they can't call it back. Turning Follow Cursor on again ends this roaming and the cat walks back to the cursor. If the cat was already shaken off when Follow Cursor was turned off, turning it back on ends roaming as well. After feeding, the cat goes back to roaming if Follow Cursor is still off.
 
 ## Spontaneous quirks
 
