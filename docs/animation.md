@@ -141,4 +141,6 @@ Coat colours come from `Palette::for_coat`. Each `CoatStyle` sets a base, flank 
 cargo run -- --preview-sheet /tmp/sheet.png --scale 1.5
 ```
 
-This renders all five coats twice: walking on the top row, and a rest or play pose on the bottom row. It doesn't need a display, which makes it the quickest way to check a rendering change.
+This renders a 5×3 grid on white, one coat per column: moving poses on the top row (walk, trot, gallop, turning, tail chase), resting poses in the middle (sit, groom, loaf, side flop, sleep) and play poses at the bottom (stalk, pounce, paw bat, belly up, eating). `src/preview.rs` reaches every pose by running `CatSim::update`, either by steering the cat with the cursor or by setting `activity` on a cat that has sat down, and then centres each sprite in its cell by its rendered bounds. It doesn't need a display, which makes it the quickest way to check a rendering change. The same command with `docs/preview.png` as the path rewrites the README picture.
+
+`cargo test regenerate_demo_gif -- --ignored --nocapture` rewrites `docs/demo.gif` (it needs `ffmpeg`). `src/demo.rs` drives one cat with a scripted cursor made of deliberate gestures: aimed moves (a curved minimum-jerk stroke that lands slightly short, then a small correction), holds, a laser-dot tease aimed relative to the cat's head, and a left-right shake. It prints each activity change, so you can check that the stalk, pounce and gallop still happen after a behavior change.

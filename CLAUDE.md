@@ -22,6 +22,10 @@ cargo test regenerate_app_icons -- --ignored
 # Render a static multi-pose PNG of every coat and exit (no X server needed); use it to check rendering changes visually
 cargo run -- --preview-sheet /tmp/sheet.png --scale 1.5
 
+# Regenerate the README images: the coats-and-poses sheet, and the demo GIF (scripted human-like cursor driving CatSim; needs ffmpeg)
+cargo run -- --preview-sheet docs/preview.png --scale 1.5
+cargo test regenerate_demo_gif -- --ignored --nocapture
+
 # Type-check the Win32 backend from Linux (separate target dir avoids clobbering the normal build cache)
 RUSTFLAGS="--cfg windows_check" cargo check --target-dir target/wincheck
 ```

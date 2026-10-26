@@ -4,11 +4,11 @@ A small cat that lives on your desktop. It's drawn from above, animated procedur
 
 Runs on **Linux (X11)** and **Windows**. It's a single binary written in Rust, with no GUI toolkit.
 
-![Demo: the cat follows the cursor, sits, pounces on a wiggling cursor, and gallops after a mouse shake](docs/demo.gif)
+![Demo: the cat walks over to the cursor and sits, stalks and pounces when the cursor is flicked like a laser dot, and gallops over after a left-right mouse shake](docs/demo.gif)
 
 ### Coats and poses
 
-![Preview: five coats walking (top) and rest/play poses (bottom)](docs/preview.png)
+![Preview: the five coats (calico, brown, tuxedo, charcoal, silver), one per column. Top row: walk, trot, gallop, turning, tail chase. Middle row: sit, groom, loaf, side flop, sleep. Bottom row: stalk, pounce, paw bat, belly up, eating](docs/preview.png)
 
 ## Install
 
@@ -123,6 +123,8 @@ cargo test                       # behavioral simulation tests
 cargo test rapid_left_right      # one test by name
 cargo run -- --preview-sheet /tmp/sheet.png --scale 1.5    # check rendering changes visually
 cargo test regenerate_app_icons -- --ignored               # rewrite assets/catsor.{ico,png} after changing the tray icon
+cargo run -- --preview-sheet docs/preview.png --scale 1.5  # rewrite the README coats-and-poses picture
+cargo test regenerate_demo_gif -- --ignored                # rewrite the README demo GIF (needs ffmpeg)
 
 # Type-check the Windows backend from Linux
 RUSTFLAGS="--cfg windows_check" cargo check --target-dir target/wincheck
