@@ -127,7 +127,7 @@ Draw order:
 6. Body: an outer flank-shade fill, then the inner base fill. The outer contour is also written into `clip_mask`, so **coat patches, the exposed belly and muscle creases are clipped to the body silhouette**
 7. Head, snout and nose, head patches, and ears. The head's darker rim is drawn only outside the torso (the still-set body mask, inverted); over the shoulders it takes the base colour, so the neck blends into the body. When curled up asleep (`|curl_amount|` above ~0.42), a faint outline is drawn where the head lies over the torso so it stays readable. The mask is then cleared and refilled with the head outline, so head patches are clipped to the head
 
-How wide the body is at each node comes from `body_half_widths`. The base widths are neck 5.8, shoulders 8.9, waist 7.8, hips 8.5 and rump 5.0. On top of that, breathing adds width, a compact posture plumps the waist and hips, a stretched posture slims the shoulders and waist, and crouching widens the hips.
+How wide the body is at each node comes from `body_half_widths`. The base widths are neck 5.8, neck collar 6.5, shoulders 8.9, waist 7.8, hips 8.5 and rump 5.0. On top of that, breathing adds width, a compact posture plumps the waist and hips, a stretched posture slims the shoulders and waist, and crouching widens the hips.
 
 Coat colours come from `Palette::for_coat`. Each `CoatStyle` sets a base, flank shade, outline, crease, outer and inner ear, and nose colour, plus optional primary and secondary patch colours. Calico is cream with orange and dark patches, and Tuxedo is light with dark patches. Brown, Charcoal and Silver are solid colours with no patches. `coat_swatch_colors` gives the menu's coat swatches the same colours.
 

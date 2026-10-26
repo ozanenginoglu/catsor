@@ -1621,7 +1621,6 @@ fn draw_upturned_face(
     }
 }
 
-/// An open quadratic curve from `from` to `to`
 /// A crescent between the quadratic curve `from`-`ctrl`-`to` and a second one whose control
 /// point is moved by `bulge`, so it is thickest in the middle (about half of `bulge`) and comes
 /// to a point at both ends
@@ -1635,6 +1634,7 @@ fn crescent(from: Vec2, ctrl: Vec2, to: Vec2, bulge: Vec2) -> Option<Path> {
     pb.finish()
 }
 
+/// An open quadratic curve from `from` to `to`
 fn quad_curve(from: Vec2, ctrl: Vec2, to: Vec2) -> Option<Path> {
     let mut pb = PathBuilder::new();
     pb.move_to(from.x, from.y);
