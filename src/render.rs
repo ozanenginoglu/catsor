@@ -1204,9 +1204,8 @@ fn draw_muscle_creases(
     let dorsal_fade = (1.0 - cat.belly_roll / 0.65).clamp(0.0, 1.0);
     let (left_curl_mult, right_curl_mult) = torso_curl_multipliers(cat.curl_amount);
 
-    let crease_col = scale_alpha(pal.crease, dorsal_fade);
-
-    let stroke = round_stroke(0.9 * s);
+    // Faint and tapered at both ends: a hint of the muscle under the fur rather than a drawn line
+    let crease_col = scale_alpha(pal.crease, 0.6 * dorsal_fade);
 
     for sign in [-1.0f32, 1.0f32] {
         let side_mult = if sign >= 0.0 {
@@ -1220,8 +1219,9 @@ fn draw_muscle_creases(
         let p0 = sh_base + tangents[2] * (2.4 * s) + normals[2] * (sign * w2 * 0.74);
         let p1 = sh_base + normals[2] * (sign * w2 * 0.56);
         let p2 = sh_base - tangents[2] * (2.8 * s) + normals[2] * (sign * w2 * 0.68);
-        if let Some(path) = quad_curve(p0, p1, p2) {
-            stroke_solid_masked(pixmap, &path, crease_col, &stroke, body_mask);
+        let bulge = normals[2] * (sign * 1.5 * s);
+        if let Some(path) = crescent(p0, p1, p2, bulge) {
+            fill_solid_masked(pixmap, &path, crease_col, body_mask);
         }
     }
 
@@ -1237,8 +1237,9 @@ fn draw_muscle_creases(
         let p0 = hip_base + tangents[4] * (2.4 * s) + normals[4] * (sign * w4 * 0.72);
         let p1 = hip_base + normals[4] * (sign * w4 * 0.54);
         let p2 = hip_base - tangents[4] * (2.4 * s) + normals[4] * (sign * w4 * 0.62);
-        if let Some(path) = quad_curve(p0, p1, p2) {
-            stroke_solid_masked(pixmap, &path, crease_col, &stroke, body_mask);
+        let bulge = normals[4] * (sign * 1.5 * s);
+        if let Some(path) = crescent(p0, p1, p2, bulge) {
+            fill_solid_masked(pixmap, &path, crease_col, body_mask);
         }
     }
     // When curled up asleep, draw a soft inner curl fold line where the hind leg tucks against the waist
@@ -1621,6 +1622,19 @@ fn draw_upturned_face(
 }
 
 /// An open quadratic curve from `from` to `to`
+/// A crescent between the quadratic curve `from`-`ctrl`-`to` and a second one whose control
+/// point is moved by `bulge`, so it is thickest in the middle (about half of `bulge`) and comes
+/// to a point at both ends
+fn crescent(from: Vec2, ctrl: Vec2, to: Vec2, bulge: Vec2) -> Option<Path> {
+    let back = ctrl + bulge;
+    let mut pb = PathBuilder::new();
+    pb.move_to(from.x, from.y);
+    pb.quad_to(ctrl.x, ctrl.y, to.x, to.y);
+    pb.quad_to(back.x, back.y, from.x, from.y);
+    pb.close();
+    pb.finish()
+}
+
 fn quad_curve(from: Vec2, ctrl: Vec2, to: Vec2) -> Option<Path> {
     let mut pb = PathBuilder::new();
     pb.move_to(from.x, from.y);
