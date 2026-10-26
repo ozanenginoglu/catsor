@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Catsor
+Comment=Desktop cat that follows your mouse cursor
+Exec=catsor
+Icon=catsor
+Terminal=false
+Categories=Game;Amusement;
