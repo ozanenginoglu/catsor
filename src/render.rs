@@ -3,7 +3,8 @@ use crate::cat::{
 };
 use glam::Vec2;
 use tiny_skia::{
-    Color, FillRule, LineCap, LineJoin, Mask, Paint, PathBuilder, PixmapMut, Stroke, Transform,
+    Color, FillRule, LineCap, LineJoin, Mask, Paint, Path, PathBuilder, PixmapMut, Stroke,
+    Transform,
 };
 
 struct Palette {
@@ -100,6 +101,55 @@ fn scale_alpha(col: Color, factor: f32) -> Color {
         (col.blue() * 255.0).round() as u8,
         a,
     )
+}
+
+/// Fills `path` with a solid anti-aliased colour (non-zero winding)
+fn fill_solid(pixmap: &mut PixmapMut, path: &Path, color: Color) {
+    let mut paint = Paint::default();
+    paint.set_color(color);
+    pixmap.fill_path(path, &paint, FillRule::Winding, Transform::identity(), None);
+}
+
+/// Like [`fill_solid`], but only where `mask` is set
+fn fill_solid_masked(pixmap: &mut PixmapMut, path: &Path, color: Color, mask: &Mask) {
+    let mut paint = Paint::default();
+    paint.set_color(color);
+    pixmap.fill_path(
+        path,
+        &paint,
+        FillRule::Winding,
+        Transform::identity(),
+        Some(mask),
+    );
+}
+
+fn stroke_solid(pixmap: &mut PixmapMut, path: &Path, color: Color, stroke: &Stroke) {
+    let mut paint = Paint::default();
+    paint.set_color(color);
+    pixmap.stroke_path(path, &paint, stroke, Transform::identity(), None);
+}
+
+/// Like [`stroke_solid`], but only where `mask` is set
+fn stroke_solid_masked(
+    pixmap: &mut PixmapMut,
+    path: &Path,
+    color: Color,
+    stroke: &Stroke,
+    mask: &Mask,
+) {
+    let mut paint = Paint::default();
+    paint.set_color(color);
+    pixmap.stroke_path(path, &paint, stroke, Transform::identity(), Some(mask));
+}
+
+/// A stroke of `width` with round caps and joins
+fn round_stroke(width: f32) -> Stroke {
+    Stroke {
+        width,
+        line_cap: LineCap::Round,
+        line_join: LineJoin::Round,
+        ..Default::default()
+    }
 }
 
 /// Side length of the square cat overlay window for a given cat scale
@@ -246,15 +296,7 @@ fn draw_ground_shadow(
         0.0,
         cat.curl_amount,
     ) {
-        let mut paint = Paint::default();
-        paint.set_color(rgba(0, 0, 0, 36));
-        pixmap.fill_path(
-            &path,
-            &paint,
-            FillRule::Winding,
-            Transform::identity(),
-            None,
-        );
+        fill_solid(pixmap, &path, rgba(0, 0, 0, 36));
     }
 }
 
@@ -272,82 +314,38 @@ fn draw_food_bowl(
     outline_col: Color,
     pixmap: &mut PixmapMut,
 ) {
-    let mut paint = Paint::default();
-
     // 1. Floor drop shadow under the bowl
     let shadow_c = bowl_center + Vec2::new(1.2 * s, 1.8 * s);
     if let Some(shadow_path) = PathBuilder::from_circle(shadow_c.x, shadow_c.y, 9.1 * s) {
-        paint.set_color(rgba(0, 0, 0, 44));
-        pixmap.fill_path(
-            &shadow_path,
-            &paint,
-            FillRule::Winding,
-            Transform::identity(),
-            None,
-        );
+        fill_solid(pixmap, &shadow_path, rgba(0, 0, 0, 44));
     }
 
     // 2. Ceramic outer bowl body & rim highlight
     if let Some(outer_path) = PathBuilder::from_circle(bowl_center.x, bowl_center.y, 8.6 * s) {
-        paint.set_color(rgba(216, 98, 84, 255));
-        pixmap.fill_path(
-            &outer_path,
-            &paint,
-            FillRule::Winding,
-            Transform::identity(),
-            None,
-        );
+        fill_solid(pixmap, &outer_path, rgba(216, 98, 84, 255));
 
         if let Some(rim_path) =
             PathBuilder::from_circle(bowl_center.x - 0.35 * s, bowl_center.y - 0.35 * s, 7.5 * s)
         {
-            paint.set_color(rgba(238, 132, 116, 255));
-            pixmap.fill_path(
-                &rim_path,
-                &paint,
-                FillRule::Winding,
-                Transform::identity(),
-                None,
-            );
+            fill_solid(pixmap, &rim_path, rgba(238, 132, 116, 255));
         }
 
         let rim_stroke = Stroke {
             width: (1.05 * s).max(0.85),
             ..Default::default()
         };
-        paint.set_color(outline_col);
-        pixmap.stroke_path(
-            &outer_path,
-            &paint,
-            &rim_stroke,
-            Transform::identity(),
-            None,
-        );
+        stroke_solid(pixmap, &outer_path, outline_col, &rim_stroke);
     }
 
     // 3. Recessed inner bowl basin
     if let Some(well_path) = PathBuilder::from_circle(bowl_center.x, bowl_center.y, 6.3 * s) {
-        paint.set_color(rgba(68, 46, 44, 255));
-        pixmap.fill_path(
-            &well_path,
-            &paint,
-            FillRule::Winding,
-            Transform::identity(),
-            None,
-        );
+        fill_solid(pixmap, &well_path, rgba(68, 46, 44, 255));
 
         let inner_stroke = Stroke {
             width: (0.8 * s).max(0.65),
             ..Default::default()
         };
-        paint.set_color(rgba(42, 28, 28, 220));
-        pixmap.stroke_path(
-            &well_path,
-            &paint,
-            &inner_stroke,
-            Transform::identity(),
-            None,
-        );
+        stroke_solid(pixmap, &well_path, rgba(42, 28, 28, 220), &inner_stroke);
     }
 
     // 4. Depleting kibble mound & individual morsels proportional to remaining time
@@ -355,14 +353,7 @@ fn draw_food_bowl(
     if fill > 0.01 {
         let mound_r = (1.8 + 3.9 * fill.sqrt()) * s;
         if let Some(mound_path) = PathBuilder::from_circle(bowl_center.x, bowl_center.y, mound_r) {
-            paint.set_color(rgba(142, 86, 48, 255));
-            pixmap.fill_path(
-                &mound_path,
-                &paint,
-                FillRule::Winding,
-                Transform::identity(),
-                None,
-            );
+            fill_solid(pixmap, &mound_path, rgba(142, 86, 48, 255));
         }
 
         // Ordered from center outward so as `fill` decreases, outer morsels disappear first
@@ -389,32 +380,54 @@ fn draw_food_bowl(
         for &(ox, oy, warm_tint) in &KIBBLE_OFFSETS[..visible_count] {
             let kp = bowl_center + Vec2::new(ox * s, oy * s);
             if let Some(kp_path) = PathBuilder::from_circle(kp.x, kp.y, 1.25 * s) {
-                paint.set_color(if warm_tint {
-                    rgba(194, 122, 68, 255)
-                } else {
-                    rgba(172, 100, 56, 255)
-                });
-                pixmap.fill_path(
+                fill_solid(
+                    pixmap,
                     &kp_path,
-                    &paint,
-                    FillRule::Winding,
-                    Transform::identity(),
-                    None,
+                    if warm_tint {
+                        rgba(194, 122, 68, 255)
+                    } else {
+                        rgba(172, 100, 56, 255)
+                    },
                 );
-                paint.set_color(rgba(92, 52, 28, 210));
-                pixmap.stroke_path(
-                    &kp_path,
-                    &paint,
-                    &kibble_stroke,
-                    Transform::identity(),
-                    None,
-                );
+                stroke_solid(pixmap, &kp_path, rgba(92, 52, 28, 210), &kibble_stroke);
             }
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Body axes the legs are laid out along: at the shoulders (node 1) and at the hips (node 4)
+struct LegFrame {
+    fwd: Vec2,
+    side: Vec2,
+    hip_fwd: Vec2,
+    hip_side: Vec2,
+    s: f32,
+}
+
+/// Draws legs in the paw colour with the coat outline
+struct LegPen<'p, 'a> {
+    fill: Color,
+    outline: Color,
+    pixmap: &'p mut PixmapMut<'a>,
+}
+
+impl LegPen<'_, '_> {
+    fn straight(&mut self, shoulder_pos: Vec2, paw_tip: Vec2, radius: f32) {
+        let mut pb = PathBuilder::new();
+        pb.move_to(shoulder_pos.x, shoulder_pos.y);
+        pb.line_to(paw_tip.x, paw_tip.y);
+        stroke_limb(pb, radius, self.fill, self.outline, self.pixmap);
+    }
+
+    fn curved(&mut self, anchor_pos: Vec2, joint_pos: Vec2, paw_tip: Vec2, radius: f32) {
+        let mut pb = PathBuilder::new();
+        pb.move_to(anchor_pos.x, anchor_pos.y);
+        pb.quad_to(joint_pos.x, joint_pos.y, paw_tip.x, paw_tip.y);
+        stroke_limb(pb, radius, self.fill, self.outline, self.pixmap);
+    }
+}
+
+/// Draws the legs that show in the current pose
 fn draw_paws(
     cat: &CatSim,
     local: &[Vec2; TOTAL_NODES],
@@ -424,136 +437,28 @@ fn draw_paws(
     pal: &Palette,
     pixmap: &mut PixmapMut,
 ) {
-    let s = cat.scale;
-    let fwd = tangents[1];
-    let side = normals[1];
-    let hip_fwd = tangents[4];
-    let hip_side = normals[4];
+    let f = LegFrame {
+        fwd: tangents[1],
+        side: normals[1],
+        hip_fwd: tangents[4],
+        hip_side: normals[4],
+        s: cat.scale,
+    };
+    let (s, fwd, side, hip_fwd, hip_side) = (f.s, f.fwd, f.side, f.hip_fwd, f.hip_side);
 
     let paw_color = match cat.coat {
         CoatStyle::Tuxedo | CoatStyle::Calico | CoatStyle::Silver => rgba(236, 234, 230, 255),
         CoatStyle::Brown => rgba(138, 102, 74, 255),
         CoatStyle::Charcoal => rgba(48, 48, 52, 255),
     };
+    let mut pen = LegPen {
+        fill: paw_color,
+        outline: pal.outline,
+        pixmap,
+    };
 
     if cat.belly_roll > 0.04 {
-        // Smoothly animated transition onto (and off) the back:
-        // paws on `roll_side` extend first as the cat tips onto its side, followed by `-roll_side` paws lifting up!
-        let roll = smoothstep(cat.belly_roll);
-        let roll_side = cat.belly_roll_side;
-        let paddle = (cat.time * 2.6).sin() * roll;
-        let sway = roll_side * (0.55 * roll + 0.85 * (1.0 - roll));
-
-        let left_reach = if roll_side >= 0.0 {
-            (roll * 1.35).clamp(0.0, 1.0)
-        } else {
-            ((roll - 0.18) / 0.82).clamp(0.0, 1.0)
-        };
-        let right_reach = if roll_side < 0.0 {
-            (roll * 1.35).clamp(0.0, 1.0)
-        } else {
-            ((roll - 0.18) / 0.82).clamp(0.0, 1.0)
-        };
-
-        if left_reach > 0.05 {
-            let lh_hip = local[4] + hip_side * (4.6 * s) + hip_fwd * (0.4 * s);
-            let lh_knee = local[4] + hip_side * ((4.8 + 4.0 * left_reach + sway * 0.5) * s)
-                - hip_fwd * (1.0 * left_reach * s);
-            let lh_tip = local[4] + hip_side * ((5.2 + 5.6 * left_reach + sway) * s)
-                - hip_fwd * ((3.6 * left_reach - paddle * 0.8) * s);
-            draw_curved_paw(
-                lh_hip,
-                lh_knee,
-                lh_tip,
-                2.4 * s,
-                paw_color,
-                pal.outline,
-                pixmap,
-            );
-
-            let lf_sh = local[2] + side * (4.6 * s) - fwd * (0.3 * s);
-            let lf_elbow = local[2]
-                + side * ((4.8 + 4.4 * left_reach + sway * 0.5) * s)
-                + fwd * (0.9 * left_reach * s);
-            let lf_tip = local[2]
-                + side * ((5.0 + 3.5 * left_reach + sway) * s)
-                + fwd * ((4.0 * left_reach + paddle * 0.9) * s);
-            draw_curved_paw(
-                lf_sh,
-                lf_elbow,
-                lf_tip,
-                2.25 * s,
-                paw_color,
-                pal.outline,
-                pixmap,
-            );
-
-            let bean_s = ((left_reach - 0.35) / 0.65).clamp(0.0, 1.0) * s;
-            if bean_s > 0.15 {
-                draw_paw_beans(
-                    lh_tip,
-                    (lh_tip - lh_knee).normalize_or_zero(),
-                    bean_s,
-                    pixmap,
-                );
-                draw_paw_beans(
-                    lf_tip,
-                    (lf_tip - lf_elbow).normalize_or_zero(),
-                    bean_s,
-                    pixmap,
-                );
-            }
-        }
-
-        if right_reach > 0.05 {
-            let rh_hip = local[4] - hip_side * (4.6 * s) + hip_fwd * (0.4 * s);
-            let rh_knee = local[4]
-                - hip_side * ((4.8 + 4.0 * right_reach - sway * 0.5) * s)
-                - hip_fwd * (1.0 * right_reach * s);
-            let rh_tip = local[4]
-                - hip_side * ((5.2 + 5.6 * right_reach - sway) * s)
-                - hip_fwd * ((3.6 * right_reach + paddle * 0.8) * s);
-            draw_curved_paw(
-                rh_hip,
-                rh_knee,
-                rh_tip,
-                2.4 * s,
-                paw_color,
-                pal.outline,
-                pixmap,
-            );
-
-            let rf_sh = local[2] - side * (4.6 * s) - fwd * (0.3 * s);
-            let rf_elbow = local[2] - side * ((4.8 + 4.4 * right_reach - sway * 0.5) * s)
-                + fwd * (0.9 * right_reach * s);
-            let rf_tip = local[2] - side * ((5.0 + 3.5 * right_reach - sway) * s)
-                + fwd * ((4.0 * right_reach - paddle * 0.9) * s);
-            draw_curved_paw(
-                rf_sh,
-                rf_elbow,
-                rf_tip,
-                2.25 * s,
-                paw_color,
-                pal.outline,
-                pixmap,
-            );
-
-            let bean_s = ((right_reach - 0.35) / 0.65).clamp(0.0, 1.0) * s;
-            if bean_s > 0.15 {
-                draw_paw_beans(
-                    rh_tip,
-                    (rh_tip - rh_knee).normalize_or_zero(),
-                    bean_s,
-                    pixmap,
-                );
-                draw_paw_beans(
-                    rf_tip,
-                    (rf_tip - rf_elbow).normalize_or_zero(),
-                    bean_s,
-                    pixmap,
-                );
-            }
-        }
+        draw_belly_up_legs(cat, local, &f, &mut pen);
         return;
     }
 
@@ -564,22 +469,8 @@ fn draw_paws(
                 let reach = (8.5 + 6.8 * ext) * s;
                 let left_paw = local[0] + fwd * reach + side * (3.8 * s);
                 let right_paw = local[0] + fwd * reach - side * (3.8 * s);
-                draw_single_paw(
-                    local[1] + side * (4.2 * s),
-                    left_paw,
-                    2.4 * s,
-                    paw_color,
-                    pal.outline,
-                    pixmap,
-                );
-                draw_single_paw(
-                    local[1] - side * (4.2 * s),
-                    right_paw,
-                    2.4 * s,
-                    paw_color,
-                    pal.outline,
-                    pixmap,
-                );
+                pen.straight(local[1] + side * (4.2 * s), left_paw, 2.4 * s);
+                pen.straight(local[1] - side * (4.2 * s), right_paw, 2.4 * s);
             }
         }
         Activity::Grooming {
@@ -590,35 +481,14 @@ fn draw_paws(
             let lift = (timer * 7.5).sin() * 0.8 * s;
             let paw_pos = local[0] + fwd * (4.6 * s + lift) + side * (groom_side * 5.8 * s);
             let shoulder_anchor = local[1] + side * (groom_side * 4.8 * s);
-            draw_single_paw(
-                shoulder_anchor,
-                paw_pos,
-                2.4 * s,
-                paw_color,
-                pal.outline,
-                pixmap,
-            );
+            pen.straight(shoulder_anchor, paw_pos, 2.4 * s);
         }
         Activity::Eating { .. } => {
             // Planted front paws flanking the chest while crouched in front of the food bowl
             let left_paw = local[0] + fwd * (3.2 * s) + side * (5.2 * s);
             let right_paw = local[0] + fwd * (3.2 * s) - side * (5.2 * s);
-            draw_single_paw(
-                local[1] + side * (4.5 * s),
-                left_paw,
-                2.3 * s,
-                paw_color,
-                pal.outline,
-                pixmap,
-            );
-            draw_single_paw(
-                local[1] - side * (4.5 * s),
-                right_paw,
-                2.3 * s,
-                paw_color,
-                pal.outline,
-                pixmap,
-            );
+            pen.straight(local[1] + side * (4.5 * s), left_paw, 2.3 * s);
+            pen.straight(local[1] - side * (4.5 * s), right_paw, 2.3 * s);
         }
         Activity::PawBatting {
             side: bat_side,
@@ -631,14 +501,7 @@ fn draw_paws(
             let lateral = (bat_side * 4.2 + swat_wave * 1.8) * s;
             let paw_pos = local[0] + fwd * reach + side * lateral;
             let shoulder_anchor = local[1] + side * (bat_side * 5.0 * s);
-            draw_single_paw(
-                shoulder_anchor,
-                paw_pos,
-                2.5 * s,
-                paw_color,
-                pal.outline,
-                pixmap,
-            );
+            pen.straight(shoulder_anchor, paw_pos, 2.5 * s);
         }
         Activity::DramaticFlop {
             side: flop_side, ..
@@ -648,31 +511,17 @@ fn draw_paws(
             let f2 = local[2] + side * (flop_side * 10.0 * s) - fwd * (1.8 * s);
             let h1 = local[4] + hip_side * (flop_side * 10.8 * s) + hip_fwd * (1.8 * s);
             let h2 = local[4] + hip_side * (flop_side * 9.6 * s) - hip_fwd * (2.2 * s);
-            draw_single_paw(local[2], f1, 2.2 * s, paw_color, pal.outline, pixmap);
-            draw_single_paw(local[2], f2, 2.2 * s, paw_color, pal.outline, pixmap);
-            draw_single_paw(local[4], h1, 2.2 * s, paw_color, pal.outline, pixmap);
-            draw_single_paw(local[4], h2, 2.2 * s, paw_color, pal.outline, pixmap);
+            pen.straight(local[2], f1, 2.2 * s);
+            pen.straight(local[2], f2, 2.2 * s);
+            pen.straight(local[4], h1, 2.2 * s);
+            pen.straight(local[4], h2, 2.2 * s);
         }
         Activity::StalkWiggle { .. } => {
             // Wide planted rear feet gripping the floor during the pre-launch butt wiggle
             let lh = local[4] + hip_side * (9.2 * s) - hip_fwd * (1.5 * s);
             let rh = local[4] - hip_side * (9.2 * s) - hip_fwd * (1.5 * s);
-            draw_single_paw(
-                local[4] + hip_side * (5.0 * s),
-                lh,
-                2.3 * s,
-                paw_color,
-                pal.outline,
-                pixmap,
-            );
-            draw_single_paw(
-                local[4] - hip_side * (5.0 * s),
-                rh,
-                2.3 * s,
-                paw_color,
-                pal.outline,
-                pixmap,
-            );
+            pen.straight(local[4] + hip_side * (5.0 * s), lh, 2.3 * s);
+            pen.straight(local[4] - hip_side * (5.0 * s), rh, 2.3 * s);
         }
         Activity::Pouncing { progress, .. } => {
             // Leap: both front paws reaching out ahead, both hind paws kicking back after push-off
@@ -681,38 +530,10 @@ fn draw_paws(
             let rf = local[0] + fwd * ((8.5 + 5.5 * arc) * s) - side * (4.5 * s);
             let lh = local[4] - hip_fwd * ((6.5 + 4.5 * arc) * s) + hip_side * (5.2 * s);
             let rh = local[4] - hip_fwd * ((6.5 + 4.5 * arc) * s) - hip_side * (5.2 * s);
-            draw_single_paw(
-                local[1] + side * (4.2 * s),
-                lf,
-                2.4 * s,
-                paw_color,
-                pal.outline,
-                pixmap,
-            );
-            draw_single_paw(
-                local[1] - side * (4.2 * s),
-                rf,
-                2.4 * s,
-                paw_color,
-                pal.outline,
-                pixmap,
-            );
-            draw_single_paw(
-                local[4] + hip_side * (4.2 * s),
-                lh,
-                2.3 * s,
-                paw_color,
-                pal.outline,
-                pixmap,
-            );
-            draw_single_paw(
-                local[4] - hip_side * (4.2 * s),
-                rh,
-                2.3 * s,
-                paw_color,
-                pal.outline,
-                pixmap,
-            );
+            pen.straight(local[1] + side * (4.2 * s), lf, 2.4 * s);
+            pen.straight(local[1] - side * (4.2 * s), rf, 2.4 * s);
+            pen.straight(local[4] + hip_side * (4.2 * s), lh, 2.3 * s);
+            pen.straight(local[4] - hip_side * (4.2 * s), rh, 2.3 * s);
         }
         Activity::Walking
         | Activity::Zoomies { .. }
@@ -720,74 +541,125 @@ fn draw_paws(
         | Activity::Circling { .. }
             if cat.gait_weight > 0.08 =>
         {
-            // Legs follow the simulated paws in every gait. Walking and trotting only show the parts
-            // that reach past the chest or haunches. Galloping draws every leg: the body covers what
-            // is underneath, and swinging hind legs flare out past the flanks (in a rotary gallop the
-            // hind feet pass outside the forefeet).
-            let galloping = matches!(cat.activity, Activity::Walking | Activity::Zoomies { .. })
-                && cat.gait == Gait::Gallop;
-            // Forepaws (LF=0, RF=1) reach out ahead of the chest/collar during protraction & early stance
-            let fore_anchors = [
-                local[1] - fwd * (1.2 * s) + side * (4.8 * s),
-                local[1] - fwd * (1.2 * s) - side * (4.8 * s),
-            ];
-            for (i, &anchor) in fore_anchors.iter().enumerate() {
-                let paw_local = cat.paws[i].world_pos - window_origin;
-                if galloping || (paw_local - local[2]).dot(fwd) > 6.5 * s {
-                    draw_single_paw(anchor, paw_local, 2.2 * s, paw_color, pal.outline, pixmap);
-                }
-            }
-
-            // Hindpaws (LH=2, RH=3) extend backward behind the haunches during late stance push-off.
-            // The visible part is the lower leg coming out from under the back of the haunch, so it
-            // is anchored there rather than at the hip, where it would run along the narrowing rump.
-            let hind_anchors = [
-                local[4] - hip_fwd * (4.5 * s) + hip_side * (3.2 * s),
-                local[4] - hip_fwd * (4.5 * s) - hip_side * (3.2 * s),
-            ];
-            for (i, &anchor) in hind_anchors.iter().enumerate() {
-                let mut paw_local = cat.paws[i + 2].world_pos - window_origin;
-                if galloping {
-                    let outward = if i == 0 { hip_side } else { -hip_side };
-                    let flare = (cat.paws[i + 2].swing_progress * std::f32::consts::PI).sin();
-                    paw_local += outward * (4.0 * flare * cat.gallop_weight * s);
-                }
-                if galloping || (paw_local - local[4]).dot(hip_fwd) < -6.0 * s {
-                    draw_single_paw(anchor, paw_local, 2.15 * s, paw_color, pal.outline, pixmap);
-                }
-            }
+            draw_gait_legs(cat, local, &f, window_origin, &mut pen);
         }
         _ => {}
     }
 }
 
-fn draw_single_paw(
-    shoulder_pos: Vec2,
-    paw_tip: Vec2,
-    radius: f32,
-    fill_col: Color,
-    outline_col: Color,
-    pixmap: &mut PixmapMut,
-) {
-    let mut pb = PathBuilder::new();
-    pb.move_to(shoulder_pos.x, shoulder_pos.y);
-    pb.line_to(paw_tip.x, paw_tip.y);
-    stroke_limb(pb, radius, fill_col, outline_col, pixmap);
+/// Smoothly animated transition onto (and off) the back: paws on `belly_roll_side` extend
+/// first as the cat tips onto its side, followed by the other side's paws lifting up
+fn draw_belly_up_legs(cat: &CatSim, local: &[Vec2; TOTAL_NODES], f: &LegFrame, pen: &mut LegPen) {
+    let roll = smoothstep(cat.belly_roll);
+    let roll_side = cat.belly_roll_side;
+    let paddle = (cat.time * 2.6).sin() * roll;
+    let sway = roll_side * (0.55 * roll + 0.85 * (1.0 - roll));
+
+    let leading_reach = (roll * 1.35).clamp(0.0, 1.0);
+    let trailing_reach = ((roll - 0.18) / 0.82).clamp(0.0, 1.0);
+    let (left_reach, right_reach) = if roll_side >= 0.0 {
+        (leading_reach, trailing_reach)
+    } else {
+        (trailing_reach, leading_reach)
+    };
+    for (sign, reach) in [(1.0f32, left_reach), (-1.0, right_reach)] {
+        if reach > 0.05 {
+            draw_belly_up_side(local, f, pen, sign, reach, sign * sway, sign * paddle);
+        }
+    }
 }
 
-fn draw_curved_paw(
-    anchor_pos: Vec2,
-    joint_pos: Vec2,
-    paw_tip: Vec2,
-    radius: f32,
-    fill_col: Color,
-    outline_col: Color,
-    pixmap: &mut PixmapMut,
+/// Hind and fore leg on one side (`sign` +1 left, -1 right) reaching up from a cat on its back.
+/// `sway` and `paddle` are already mirrored for that side.
+fn draw_belly_up_side(
+    local: &[Vec2; TOTAL_NODES],
+    f: &LegFrame,
+    pen: &mut LegPen,
+    sign: f32,
+    reach: f32,
+    sway: f32,
+    paddle: f32,
 ) {
-    let mut pb = PathBuilder::new();
-    pb.move_to(anchor_pos.x, anchor_pos.y);
-    pb.quad_to(joint_pos.x, joint_pos.y, paw_tip.x, paw_tip.y);
-    stroke_limb(pb, radius, fill_col, outline_col, pixmap);
+    let s = f.s;
+    let side = f.side * sign;
+    let hip_side = f.hip_side * sign;
+
+    let hip = local[4] + hip_side * (4.6 * s) + f.hip_fwd * (0.4 * s);
+    let knee = local[4] + hip_side * ((4.8 + 4.0 * reach + sway * 0.5) * s)
+        - f.hip_fwd * (1.0 * reach * s);
+    let hind_tip = local[4] + hip_side * ((5.2 + 5.6 * reach + sway) * s)
+        - f.hip_fwd * ((3.6 * reach - paddle * 0.8) * s);
+    pen.curved(hip, knee, hind_tip, 2.4 * s);
+
+    let shoulder = local[2] + side * (4.6 * s) - f.fwd * (0.3 * s);
+    let elbow =
+        local[2] + side * ((4.8 + 4.4 * reach + sway * 0.5) * s) + f.fwd * (0.9 * reach * s);
+    let fore_tip = local[2]
+        + side * ((5.0 + 3.5 * reach + sway) * s)
+        + f.fwd * ((4.0 * reach + paddle * 0.9) * s);
+    pen.curved(shoulder, elbow, fore_tip, 2.25 * s);
+
+    let bean_s = ((reach - 0.35) / 0.65).clamp(0.0, 1.0) * s;
+    if bean_s > 0.15 {
+        draw_paw_beans(
+            hind_tip,
+            (hind_tip - knee).normalize_or_zero(),
+            bean_s,
+            pen.pixmap,
+        );
+        draw_paw_beans(
+            fore_tip,
+            (fore_tip - elbow).normalize_or_zero(),
+            bean_s,
+            pen.pixmap,
+        );
+    }
+}
+
+/// Legs follow the simulated paws in every gait. Walking and trotting only show the parts that
+/// reach past the chest or haunches. Galloping draws every leg: the body covers what is
+/// underneath, and swinging hind legs flare out past the flanks (in a rotary gallop the hind
+/// feet pass outside the forefeet).
+fn draw_gait_legs(
+    cat: &CatSim,
+    local: &[Vec2; TOTAL_NODES],
+    f: &LegFrame,
+    window_origin: Vec2,
+    pen: &mut LegPen,
+) {
+    let (s, fwd, side, hip_fwd, hip_side) = (f.s, f.fwd, f.side, f.hip_fwd, f.hip_side);
+    let galloping = matches!(cat.activity, Activity::Walking | Activity::Zoomies { .. })
+        && cat.gait == Gait::Gallop;
+    // Forepaws (LF=0, RF=1) reach out ahead of the chest/collar during protraction & early stance
+    let fore_anchors = [
+        local[1] - fwd * (1.2 * s) + side * (4.8 * s),
+        local[1] - fwd * (1.2 * s) - side * (4.8 * s),
+    ];
+    for (i, &anchor) in fore_anchors.iter().enumerate() {
+        let paw_local = cat.paws[i].world_pos - window_origin;
+        if galloping || (paw_local - local[2]).dot(fwd) > 6.5 * s {
+            pen.straight(anchor, paw_local, 2.2 * s);
+        }
+    }
+
+    // Hindpaws (LH=2, RH=3) extend backward behind the haunches during late stance push-off.
+    // The visible part is the lower leg coming out from under the back of the haunch, so it
+    // is anchored there rather than at the hip, where it would run along the narrowing rump.
+    let hind_anchors = [
+        local[4] - hip_fwd * (4.5 * s) + hip_side * (3.2 * s),
+        local[4] - hip_fwd * (4.5 * s) - hip_side * (3.2 * s),
+    ];
+    for (i, &anchor) in hind_anchors.iter().enumerate() {
+        let mut paw_local = cat.paws[i + 2].world_pos - window_origin;
+        if galloping {
+            let outward = if i == 0 { hip_side } else { -hip_side };
+            let flare = (cat.paws[i + 2].swing_progress * std::f32::consts::PI).sin();
+            paw_local += outward * (4.0 * flare * cat.gallop_weight * s);
+        }
+        if galloping || (paw_local - local[4]).dot(hip_fwd) < -6.0 * s {
+            pen.straight(anchor, paw_local, 2.15 * s);
+        }
+    }
 }
 
 /// Strokes a limb path as a round-capped outline with a narrower fill on top
@@ -801,43 +673,28 @@ fn stroke_limb(
     let Some(path) = pb.finish() else {
         return;
     };
-    let mut paint = Paint::default();
-    let mut stroke = Stroke {
-        width: radius * 2.05,
-        line_cap: LineCap::Round,
-        line_join: LineJoin::Round,
-        ..Default::default()
-    };
-    paint.set_color(outline_col);
-    pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+    let mut stroke = round_stroke(radius * 2.05);
+    stroke_solid(pixmap, &path, outline_col, &stroke);
 
     stroke.width = radius * 1.5;
-    paint.set_color(fill_col);
-    pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+    stroke_solid(pixmap, &path, fill_col, &stroke);
 }
 
 fn draw_paw_beans(paw_tip: Vec2, dir: Vec2, s: f32, pixmap: &mut PixmapMut) {
     let perp = Vec2::new(-dir.y, dir.x);
-    let mut paint = Paint::default();
-    paint.set_color(rgba(234, 146, 162, 242));
+    let bean_col = rgba(234, 146, 162, 242);
 
     let pad_center = paw_tip - dir * (0.35 * s);
     if let Some(main_pad) =
         PathBuilder::from_circle(pad_center.x, pad_center.y, (0.92 * s).max(0.7))
     {
-        pixmap.fill_path(
-            &main_pad,
-            &paint,
-            FillRule::Winding,
-            Transform::identity(),
-            None,
-        );
+        fill_solid(pixmap, &main_pad, bean_col);
     }
 
     for &(fwd_off, side_off) in &[(0.72, -0.78), (0.92, 0.0), (0.72, 0.78)] {
         let bean = paw_tip + dir * (fwd_off * s) + perp * (side_off * s);
         if let Some(toe) = PathBuilder::from_circle(bean.x, bean.y, (0.45 * s).max(0.4)) {
-            pixmap.fill_path(&toe, &paint, FillRule::Winding, Transform::identity(), None);
+            fill_solid(pixmap, &toe, bean_col);
         }
     }
 }
@@ -859,29 +716,19 @@ fn draw_tail(cat: &CatSim, local: &[Vec2; TOTAL_NODES], pal: &Palette, pixmap: &
         return;
     };
 
-    let mut paint = Paint::default();
-
     let (tail_base_col, tail_shade_col) = match cat.coat {
         CoatStyle::Calico => (rgba(220, 124, 54, 255), rgba(182, 92, 32, 255)),
         _ => (pal.base, pal.flank_shade),
     };
 
-    let mut stroke = Stroke {
-        width: 5.2 * s,
-        line_cap: LineCap::Round,
-        line_join: LineJoin::Round,
-        ..Default::default()
-    };
-    paint.set_color(pal.outline);
-    pixmap.stroke_path(&tail_path, &paint, &stroke, Transform::identity(), None);
+    let mut stroke = round_stroke(5.2 * s);
+    stroke_solid(pixmap, &tail_path, pal.outline, &stroke);
 
     stroke.width = 3.7 * s;
-    paint.set_color(tail_shade_col);
-    pixmap.stroke_path(&tail_path, &paint, &stroke, Transform::identity(), None);
+    stroke_solid(pixmap, &tail_path, tail_shade_col, &stroke);
 
     stroke.width = 2.4 * s;
-    paint.set_color(tail_base_col);
-    pixmap.stroke_path(&tail_path, &paint, &stroke, Transform::identity(), None);
+    stroke_solid(pixmap, &tail_path, tail_base_col, &stroke);
 
     if cat.coat == CoatStyle::Calico {
         stroke.width = 3.4 * s;
@@ -892,8 +739,7 @@ fn draw_tail(cat: &CatSim, local: &[Vec2; TOTAL_NODES], pal: &Palette, pixmap: &
             ring_pb.move_to(p0.x, p0.y);
             ring_pb.line_to(p1.x, p1.y);
             if let Some(rp) = ring_pb.finish() {
-                paint.set_color(rgba(178, 82, 24, 235));
-                pixmap.stroke_path(&rp, &paint, &stroke, Transform::identity(), None);
+                stroke_solid(pixmap, &rp, rgba(178, 82, 24, 235), &stroke);
             }
         }
     }
@@ -1000,16 +846,7 @@ fn draw_body(
         return;
     };
 
-    let mut paint = Paint::default();
-
-    paint.set_color(pal.flank_shade);
-    pixmap.fill_path(
-        &outer_path,
-        &paint,
-        FillRule::Winding,
-        Transform::identity(),
-        None,
-    );
+    fill_solid(pixmap, &outer_path, pal.flank_shade);
 
     if let Some(inner_path) = build_torso_contour(
         local,
@@ -1021,14 +858,7 @@ fn draw_body(
         hip_shift * 0.8,
         cat.curl_amount,
     ) {
-        paint.set_color(pal.base);
-        pixmap.fill_path(
-            &inner_path,
-            &paint,
-            FillRule::Winding,
-            Transform::identity(),
-            None,
-        );
+        fill_solid(pixmap, &inner_path, pal.base);
     }
 
     clip_mask.clear();
@@ -1057,14 +887,8 @@ fn draw_body(
             cat, local, tangents, normals, &widths, pal, clip_mask, pixmap,
         );
     }
-    let stroke = Stroke {
-        width: 1.15 * s,
-        line_cap: LineCap::Round,
-        line_join: LineJoin::Round,
-        ..Default::default()
-    };
-    paint.set_color(pal.outline);
-    pixmap.stroke_path(&outer_path, &paint, &stroke, Transform::identity(), None);
+    let stroke = round_stroke(1.15 * s);
+    stroke_solid(pixmap, &outer_path, pal.outline, &stroke);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1145,15 +969,7 @@ fn draw_blob_patch(pts: &[Vec2], color: Color, mask: &Mask, pixmap: &mut PixmapM
     pb.close();
 
     if let Some(path) = pb.finish() {
-        let mut paint = Paint::default();
-        paint.set_color(color);
-        pixmap.fill_path(
-            &path,
-            &paint,
-            FillRule::Winding,
-            Transform::identity(),
-            Some(mask),
-        );
+        fill_solid_masked(pixmap, &path, color, mask);
     }
 }
 
@@ -1174,15 +990,9 @@ fn draw_muscle_creases(
     let dorsal_fade = (1.0 - cat.belly_roll / 0.65).clamp(0.0, 1.0);
     let (left_curl_mult, right_curl_mult) = torso_curl_multipliers(cat.curl_amount);
 
-    let mut paint = Paint::default();
-    paint.set_color(scale_alpha(pal.crease, dorsal_fade));
+    let crease_col = scale_alpha(pal.crease, dorsal_fade);
 
-    let stroke = Stroke {
-        width: 0.9 * s,
-        line_cap: LineCap::Round,
-        line_join: LineJoin::Round,
-        ..Default::default()
-    };
+    let stroke = round_stroke(0.9 * s);
 
     for sign in [-1.0f32, 1.0f32] {
         let side_mult = if sign >= 0.0 {
@@ -1196,17 +1006,8 @@ fn draw_muscle_creases(
         let p0 = sh_base + tangents[2] * (2.4 * s) + normals[2] * (sign * w2 * 0.74);
         let p1 = sh_base + normals[2] * (sign * w2 * 0.56);
         let p2 = sh_base - tangents[2] * (2.8 * s) + normals[2] * (sign * w2 * 0.68);
-        let mut pb = PathBuilder::new();
-        pb.move_to(p0.x, p0.y);
-        pb.quad_to(p1.x, p1.y, p2.x, p2.y);
-        if let Some(path) = pb.finish() {
-            pixmap.stroke_path(
-                &path,
-                &paint,
-                &stroke,
-                Transform::identity(),
-                Some(body_mask),
-            );
+        if let Some(path) = quad_curve(p0, p1, p2) {
+            stroke_solid_masked(pixmap, &path, crease_col, &stroke, body_mask);
         }
     }
 
@@ -1222,17 +1023,8 @@ fn draw_muscle_creases(
         let p0 = hip_base + tangents[4] * (2.4 * s) + normals[4] * (sign * w4 * 0.72);
         let p1 = hip_base + normals[4] * (sign * w4 * 0.54);
         let p2 = hip_base - tangents[4] * (2.4 * s) + normals[4] * (sign * w4 * 0.62);
-        let mut pb = PathBuilder::new();
-        pb.move_to(p0.x, p0.y);
-        pb.quad_to(p1.x, p1.y, p2.x, p2.y);
-        if let Some(path) = pb.finish() {
-            pixmap.stroke_path(
-                &path,
-                &paint,
-                &stroke,
-                Transform::identity(),
-                Some(body_mask),
-            );
+        if let Some(path) = quad_curve(p0, p1, p2) {
+            stroke_solid_masked(pixmap, &path, crease_col, &stroke, body_mask);
         }
     }
     // When curled up asleep, draw a soft inner curl fold line where the hind leg tucks against the waist
@@ -1246,24 +1038,9 @@ fn draw_muscle_creases(
         let c0 = local[2] + normals[2] * (cs * widths[2] * inner_mult * 0.68);
         let c1 = local[3] + normals[3] * (cs * widths[3] * inner_mult * 0.42);
         let c2 = local[4] + normals[4] * (cs * widths[4] * inner_mult * 0.72);
-        let mut cpb = PathBuilder::new();
-        cpb.move_to(c0.x, c0.y);
-        cpb.quad_to(c1.x, c1.y, c2.x, c2.y);
-        if let Some(cpath) = cpb.finish() {
-            let fold_stroke = Stroke {
-                width: 1.05 * s,
-                line_cap: LineCap::Round,
-                line_join: LineJoin::Round,
-                ..Default::default()
-            };
-            paint.set_color(pal.outline);
-            pixmap.stroke_path(
-                &cpath,
-                &paint,
-                &fold_stroke,
-                Transform::identity(),
-                Some(body_mask),
-            );
+        if let Some(cpath) = quad_curve(c0, c1, c2) {
+            let fold_stroke = round_stroke(1.05 * s);
+            stroke_solid_masked(pixmap, &cpath, pal.outline, &fold_stroke, body_mask);
         }
     }
 }
@@ -1334,14 +1111,8 @@ fn draw_exposed_belly(
     // Fluffy chest tuft & belly fur wisps along the left and right edges of the tummy
     if roll > 0.30 {
         let wisp_t = smoothstep((roll - 0.30) / 0.70);
-        let mut paint = Paint::default();
-        paint.set_color(scale_alpha(pal.crease, wisp_t));
-        let stroke = Stroke {
-            width: 0.9 * s,
-            line_cap: LineCap::Round,
-            line_join: LineJoin::Round,
-            ..Default::default()
-        };
+        let wisp_col = scale_alpha(pal.crease, wisp_t);
+        let stroke = round_stroke(0.9 * s);
         for sign in [-1.0f32, 1.0f32] {
             for node_idx in [2usize, 3usize, 4usize] {
                 let base = local[node_idx] + normals[node_idx] * (widths[node_idx] * shift_factor);
@@ -1351,21 +1122,23 @@ fn draw_exposed_belly(
                 let p1 = base + normals[node_idx] * (sign * widths[node_idx] * 0.46 * width_scale);
                 let p2 = base - tangents[node_idx] * (2.0 * s)
                     + normals[node_idx] * (sign * widths[node_idx] * 0.60 * width_scale);
-                let mut pb = PathBuilder::new();
-                pb.move_to(p0.x, p0.y);
-                pb.quad_to(p1.x, p1.y, p2.x, p2.y);
-                if let Some(path) = pb.finish() {
-                    pixmap.stroke_path(
-                        &path,
-                        &paint,
-                        &stroke,
-                        Transform::identity(),
-                        Some(body_mask),
-                    );
+                if let Some(path) = quad_curve(p0, p1, p2) {
+                    stroke_solid_masked(pixmap, &path, wisp_col, &stroke, body_mask);
                 }
             }
         }
     }
+}
+
+/// Head position and axes: `fwd` points out of the snout, `side` to the cat's left. `roll` is
+/// the eased belly roll (0 upright, 1 on its back).
+struct HeadFrame {
+    center: Vec2,
+    angle: f32,
+    fwd: Vec2,
+    side: Vec2,
+    s: f32,
+    roll: f32,
 }
 
 fn draw_head_and_ears(
@@ -1378,281 +1151,243 @@ fn draw_head_and_ears(
     pixmap: &mut PixmapMut,
 ) {
     let fwd = Vec2::from_angle(head_angle);
-    let side = Vec2::new(-fwd.y, fwd.x);
-
-    let mut paint = Paint::default();
-
-    let roll = smoothstep(cat.belly_roll);
-    let belly_up = roll > 0.45;
-    let ear_bias = if cat.activity == Activity::Sleeping {
-        -0.14
-    } else {
-        -0.22 * roll
+    let h = HeadFrame {
+        center: head_center,
+        angle: head_angle,
+        fwd,
+        side: Vec2::new(-fwd.y, fwd.x),
+        s,
+        roll: smoothstep(cat.belly_roll),
     };
-    let ear_head_center = head_center + fwd * (1.4 * roll * s);
+    let side = h.side;
+    let roll = h.roll;
 
     // When lying on its back, the ears rest against the floor at the crown (+fwd) underneath the head silhouette
+    let belly_up = roll > 0.45;
     if belly_up {
-        draw_ear(
-            ear_head_center,
-            head_angle,
-            1.0,
-            cat.ear_left_twitch + ear_bias,
-            s,
-            pal,
-            pixmap,
-        );
-        draw_ear(
-            ear_head_center,
-            head_angle,
-            -1.0,
-            cat.ear_right_twitch + ear_bias,
-            s,
-            pal,
-            pixmap,
-        );
+        draw_ears(cat, &h, pal, pixmap);
     }
 
     let neck_shadow_center = head_center - fwd * (1.8 * s);
     if let Some(shadow_path) = build_head_path_rolled(neck_shadow_center, fwd, side, s * 1.03, roll)
     {
-        paint.set_color(rgba(0, 0, 0, 32));
-        pixmap.fill_path(
-            &shadow_path,
-            &paint,
-            FillRule::Winding,
-            Transform::identity(),
-            None,
-        );
+        fill_solid(pixmap, &shadow_path, rgba(0, 0, 0, 32));
     }
 
     let Some(outer_head) = build_head_path_rolled(head_center, fwd, side, s, roll) else {
         return;
     };
-    paint.set_color(pal.flank_shade);
-    pixmap.fill_path(
-        &outer_head,
-        &paint,
-        FillRule::Winding,
-        Transform::identity(),
-        None,
-    );
+    fill_solid(pixmap, &outer_head, pal.flank_shade);
 
     let inner_offset = fwd * (0.35 * (1.0 - 2.0 * roll) * s);
     if let Some(inner_head) =
         build_head_path_rolled(head_center + inner_offset, fwd, side, s * 0.84, roll)
     {
-        paint.set_color(pal.base);
-        pixmap.fill_path(
-            &inner_head,
-            &paint,
-            FillRule::Winding,
-            Transform::identity(),
-            None,
-        );
+        fill_solid(pixmap, &inner_head, pal.base);
     }
 
     if let Some(patch_col) = pal.patch_primary {
         clip_mask.clear();
         clip_mask.fill_path(&outer_head, FillRule::Winding, true, Transform::identity());
-        match cat.coat {
-            CoatStyle::Calico => {
+        draw_head_patches(cat.coat, &h, patch_col, clip_mask, pixmap);
+    }
+
+    // The snout pitches back as the cat rolls over: the upright face fades out while the
+    // upside-down one facing the body fades in
+    if roll < 0.50 {
+        draw_upright_face(cat, &h, pal, pixmap);
+    }
+    if roll > 0.20 {
+        clip_mask.clear();
+        clip_mask.fill_path(&outer_head, FillRule::Winding, true, Transform::identity());
+        draw_upturned_face(cat, &h, pal, clip_mask, pixmap);
+    }
+
+    stroke_solid(pixmap, &outer_head, pal.outline, &round_stroke(1.1 * s));
+
+    if !belly_up {
+        draw_ears(cat, &h, pal, pixmap);
+    }
+}
+
+fn draw_ears(cat: &CatSim, h: &HeadFrame, pal: &Palette, pixmap: &mut PixmapMut) {
+    let ear_bias = if cat.activity == Activity::Sleeping {
+        -0.14
+    } else {
+        -0.22 * h.roll
+    };
+    let ear_head_center = h.center + h.fwd * (1.4 * h.roll * h.s);
+    for (side_sign, twitch) in [(1.0, cat.ear_left_twitch), (-1.0, cat.ear_right_twitch)] {
+        draw_ear(
+            ear_head_center,
+            h.angle,
+            side_sign,
+            twitch + ear_bias,
+            h.s,
+            pal,
+            pixmap,
+        );
+    }
+}
+
+/// Coat patches on top of the head, clipped to the head silhouette in `clip_mask`
+fn draw_head_patches(
+    coat: CoatStyle,
+    h: &HeadFrame,
+    patch_col: Color,
+    clip_mask: &Mask,
+    pixmap: &mut PixmapMut,
+) {
+    let (c, fwd, side, s) = (h.center, h.fwd, h.side, h.s);
+    match coat {
+        CoatStyle::Calico => {
+            draw_blob_patch(
+                &[
+                    c + fwd * (7.5 * s),
+                    c + fwd * (2.5 * s) - side * (8.5 * s),
+                    c - fwd * (6.5 * s) - side * (6.5 * s),
+                    c - fwd * (4.0 * s) + side * (2.2 * s),
+                    c + fwd * (2.0 * s) + side * (1.2 * s),
+                ],
+                patch_col,
+                clip_mask,
+                pixmap,
+            );
+        }
+        CoatStyle::Tuxedo => {
+            for sign in [-1.0f32, 1.0f32] {
                 draw_blob_patch(
                     &[
-                        head_center + fwd * (7.5 * s),
-                        head_center + fwd * (2.5 * s) - side * (8.5 * s),
-                        head_center - fwd * (6.5 * s) - side * (6.5 * s),
-                        head_center - fwd * (4.0 * s) + side * (2.2 * s),
-                        head_center + fwd * (2.0 * s) + side * (1.2 * s),
+                        c + fwd * (5.2 * s) + side * (sign * 1.5 * s),
+                        c + fwd * (2.0 * s) + side * (sign * 8.8 * s),
+                        c - fwd * (6.8 * s) + side * (sign * 6.8 * s),
+                        c - fwd * (5.8 * s) + side * (sign * 0.2 * s),
                     ],
                     patch_col,
                     clip_mask,
                     pixmap,
                 );
             }
-            CoatStyle::Tuxedo => {
-                for sign in [-1.0f32, 1.0f32] {
-                    draw_blob_patch(
-                        &[
-                            head_center + fwd * (5.2 * s) + side * (sign * 1.5 * s),
-                            head_center + fwd * (2.0 * s) + side * (sign * 8.8 * s),
-                            head_center - fwd * (6.8 * s) + side * (sign * 6.8 * s),
-                            head_center - fwd * (5.8 * s) + side * (sign * 0.2 * s),
-                        ],
-                        patch_col,
-                        clip_mask,
-                        pixmap,
-                    );
-                }
-            }
-            _ => {}
         }
+        _ => {}
+    }
+}
+
+/// Nose at the snout tip (+fwd), plus happy closed eyes while asleep or nibbling. Fades out
+/// over roll in [0.0, 0.50].
+fn draw_upright_face(cat: &CatSim, h: &HeadFrame, pal: &Palette, pixmap: &mut PixmapMut) {
+    let (c, fwd, side, s, roll) = (h.center, h.fwd, h.side, h.s, h.roll);
+    let dorsal_t = smoothstep(1.0 - roll / 0.50);
+    let tip_fwd = (7.9 - 1.4 * roll) * s;
+    let base_fwd = (6.5 - 1.2 * roll) * s;
+    let nose_tip = c + fwd * tip_fwd;
+    let nose_l = c + fwd * base_fwd + side * (1.5 * dorsal_t * s);
+    let nose_r = c + fwd * base_fwd - side * (1.5 * dorsal_t * s);
+    if let Some(nose_path) = quad_wedge(nose_l, nose_tip, nose_r) {
+        fill_solid(pixmap, &nose_path, scale_alpha(pal.nose, dorsal_t));
     }
 
-    // Smoothly fade out the dorsal nose (at +fwd) over roll in [0.0, 0.50] as the snout pitches back
-    if roll < 0.50 {
-        let dorsal_t = smoothstep(1.0 - roll / 0.50);
-        let tip_fwd = (7.9 - 1.4 * roll) * s;
-        let base_fwd = (6.5 - 1.2 * roll) * s;
-        let nose_tip = head_center + fwd * tip_fwd;
-        let nose_l = head_center + fwd * base_fwd + side * (1.5 * dorsal_t * s);
-        let nose_r = head_center + fwd * base_fwd - side * (1.5 * dorsal_t * s);
-        let mut nose_pb = PathBuilder::new();
-        nose_pb.move_to(nose_l.x, nose_l.y);
-        nose_pb.quad_to(nose_tip.x, nose_tip.y, nose_r.x, nose_r.y);
-        nose_pb.close();
-        if let Some(nose_path) = nose_pb.finish() {
-            paint.set_color(scale_alpha(pal.nose, dorsal_t));
-            pixmap.fill_path(
-                &nose_path,
-                &paint,
-                FillRule::Winding,
-                Transform::identity(),
-                None,
-            );
-        }
-
-        let happy_closed_eyes = cat.activity == Activity::Sleeping
-            || matches!(cat.activity, Activity::Eating { elapsed, .. } if (elapsed % 16.0) < 13.2);
-        if happy_closed_eyes {
-            let eye_stroke = Stroke {
-                width: (0.95 * s).max(0.8),
-                line_cap: LineCap::Round,
-                line_join: LineJoin::Round,
-                ..Default::default()
-            };
-            paint.set_color(scale_alpha(pal.outline, dorsal_t));
-            for sign in [-1.0f32, 1.0f32] {
-                let eye_c = head_center + fwd * (2.8 * s) + side * (sign * 3.1 * s);
-                let e_inner = eye_c - side * (sign * 1.25 * s) + fwd * (0.25 * s);
-                let e_outer = eye_c + side * (sign * 1.25 * s) - fwd * (0.15 * s);
-                let ctrl = eye_c + fwd * (0.95 * s);
-                let mut epb = PathBuilder::new();
-                epb.move_to(e_inner.x, e_inner.y);
-                epb.quad_to(ctrl.x, ctrl.y, e_outer.x, e_outer.y);
-                if let Some(ep) = epb.finish() {
-                    pixmap.stroke_path(&ep, &paint, &eye_stroke, Transform::identity(), None);
-                }
-            }
-        }
-    }
-
-    // Smoothly fade in and rotate the ventral face (facing the body, -fwd) over roll in [0.20, 1.0]
-    if roll > 0.20 {
-        let face_t = smoothstep((roll - 0.20) / 0.80);
-        let w_t = 0.35 + 0.65 * face_t;
-        let lat_shift = side * (cat.belly_roll_side * (1.0 - face_t) * 2.2 * s);
-        let fc = head_center + lat_shift;
-
-        let chin_col = match cat.coat {
-            CoatStyle::Calico | CoatStyle::Tuxedo | CoatStyle::Silver => rgba(246, 245, 242, 245),
-            CoatStyle::Brown => rgba(216, 186, 154, 240),
-            CoatStyle::Charcoal => rgba(102, 102, 110, 235),
-        };
-        clip_mask.clear();
-        clip_mask.fill_path(&outer_head, FillRule::Winding, true, Transform::identity());
-        draw_blob_patch(
-            &[
-                fc - fwd * (2.0 * s),
-                fc - fwd * (4.2 * s) + side * (3.6 * w_t * s),
-                fc - fwd * (6.8 * s),
-                fc - fwd * (4.2 * s) - side * (3.6 * w_t * s),
-            ],
-            scale_alpha(chin_col, face_t),
-            clip_mask,
-            pixmap,
-        );
-
-        // Pink nose pointing toward the body (-fwd)
-        let nose_tip = fc - fwd * (4.5 * s);
-        let nose_l = fc - fwd * (3.2 * s) + side * (1.45 * w_t * s);
-        let nose_r = fc - fwd * (3.2 * s) - side * (1.45 * w_t * s);
-        let mut nose_pb = PathBuilder::new();
-        nose_pb.move_to(nose_l.x, nose_l.y);
-        nose_pb.quad_to(nose_tip.x, nose_tip.y, nose_r.x, nose_r.y);
-        nose_pb.close();
-        if let Some(nose_path) = nose_pb.finish() {
-            paint.set_color(scale_alpha(rgba(226, 134, 150, 255), face_t));
-            pixmap.fill_path(
-                &nose_path,
-                &paint,
-                FillRule::Winding,
-                Transform::identity(),
-                None,
-            );
-        }
-
-        let eye_stroke = Stroke {
-            width: (0.95 * s).max(0.8),
-            line_cap: LineCap::Round,
-            line_join: LineJoin::Round,
-            ..Default::default()
-        };
-        paint.set_color(scale_alpha(pal.outline, face_t));
-
-        // Happy closed eyes above the nose (between crown +fwd and nose -fwd), facing the body
+    let happy_closed_eyes = cat.activity == Activity::Sleeping
+        || matches!(cat.activity, Activity::Eating { elapsed, .. } if (elapsed % 16.0) < 13.2);
+    if happy_closed_eyes {
+        let eye_stroke = round_stroke((0.95 * s).max(0.8));
+        let eye_col = scale_alpha(pal.outline, dorsal_t);
         for sign in [-1.0f32, 1.0f32] {
-            let eye_c = fc - fwd * (0.4 * s) + side * (sign * 3.0 * w_t * s);
-            let e_inner = eye_c - side * (sign * 1.2 * w_t * s) - fwd * (0.15 * s);
-            let e_outer = eye_c + side * (sign * 1.2 * w_t * s) + fwd * (0.20 * s);
-            let ctrl = eye_c + fwd * (0.85 * s);
-            let mut epb = PathBuilder::new();
-            epb.move_to(e_inner.x, e_inner.y);
-            epb.quad_to(ctrl.x, ctrl.y, e_outer.x, e_outer.y);
-            if let Some(ep) = epb.finish() {
-                pixmap.stroke_path(&ep, &paint, &eye_stroke, Transform::identity(), None);
-            }
-        }
-
-        // Cute smiling 'w' mouth between the nose and the chin/body (-fwd)
-        let m_center = fc - fwd * (4.3 * s);
-        for sign in [-1.0f32, 1.0f32] {
-            let m_ctrl = fc - fwd * (5.3 * s) + side * (sign * 0.85 * w_t * s);
-            let m_end = fc - fwd * (4.2 * s) + side * (sign * 1.75 * w_t * s);
-            let mut mpb = PathBuilder::new();
-            mpb.move_to(m_center.x, m_center.y);
-            mpb.quad_to(m_ctrl.x, m_ctrl.y, m_end.x, m_end.y);
-            if let Some(mp) = mpb.finish() {
-                pixmap.stroke_path(&mp, &paint, &eye_stroke, Transform::identity(), None);
+            let eye_c = c + fwd * (2.8 * s) + side * (sign * 3.1 * s);
+            let e_inner = eye_c - side * (sign * 1.25 * s) + fwd * (0.25 * s);
+            let e_outer = eye_c + side * (sign * 1.25 * s) - fwd * (0.15 * s);
+            let ctrl = eye_c + fwd * (0.95 * s);
+            if let Some(ep) = quad_curve(e_inner, ctrl, e_outer) {
+                stroke_solid(pixmap, &ep, eye_col, &eye_stroke);
             }
         }
     }
+}
 
-    let head_stroke = Stroke {
-        width: 1.1 * s,
-        line_cap: LineCap::Round,
-        line_join: LineJoin::Round,
-        ..Default::default()
+/// Face of a cat lying on its back, looking toward the body (-fwd): chin, nose, happy closed
+/// eyes and a 'w' mouth. Fades in over roll in [0.20, 1.0]; the chin is clipped to `clip_mask`.
+fn draw_upturned_face(
+    cat: &CatSim,
+    h: &HeadFrame,
+    pal: &Palette,
+    clip_mask: &Mask,
+    pixmap: &mut PixmapMut,
+) {
+    let (fwd, side, s) = (h.fwd, h.side, h.s);
+    let face_t = smoothstep((h.roll - 0.20) / 0.80);
+    let w_t = 0.35 + 0.65 * face_t;
+    let lat_shift = side * (cat.belly_roll_side * (1.0 - face_t) * 2.2 * s);
+    let fc = h.center + lat_shift;
+
+    let chin_col = match cat.coat {
+        CoatStyle::Calico | CoatStyle::Tuxedo | CoatStyle::Silver => rgba(246, 245, 242, 245),
+        CoatStyle::Brown => rgba(216, 186, 154, 240),
+        CoatStyle::Charcoal => rgba(102, 102, 110, 235),
     };
-    paint.set_color(pal.outline);
-    pixmap.stroke_path(
-        &outer_head,
-        &paint,
-        &head_stroke,
-        Transform::identity(),
-        None,
+    draw_blob_patch(
+        &[
+            fc - fwd * (2.0 * s),
+            fc - fwd * (4.2 * s) + side * (3.6 * w_t * s),
+            fc - fwd * (6.8 * s),
+            fc - fwd * (4.2 * s) - side * (3.6 * w_t * s),
+        ],
+        scale_alpha(chin_col, face_t),
+        clip_mask,
+        pixmap,
     );
 
-    if !belly_up {
-        draw_ear(
-            ear_head_center,
-            head_angle,
-            1.0,
-            cat.ear_left_twitch + ear_bias,
-            s,
-            pal,
+    // Pink nose pointing toward the body (-fwd)
+    let nose_tip = fc - fwd * (4.5 * s);
+    let nose_l = fc - fwd * (3.2 * s) + side * (1.45 * w_t * s);
+    let nose_r = fc - fwd * (3.2 * s) - side * (1.45 * w_t * s);
+    if let Some(nose_path) = quad_wedge(nose_l, nose_tip, nose_r) {
+        fill_solid(
             pixmap,
-        );
-        draw_ear(
-            ear_head_center,
-            head_angle,
-            -1.0,
-            cat.ear_right_twitch + ear_bias,
-            s,
-            pal,
-            pixmap,
+            &nose_path,
+            scale_alpha(rgba(226, 134, 150, 255), face_t),
         );
     }
+
+    let eye_stroke = round_stroke((0.95 * s).max(0.8));
+    let line_col = scale_alpha(pal.outline, face_t);
+
+    // Happy closed eyes above the nose (between crown +fwd and nose -fwd), facing the body
+    for sign in [-1.0f32, 1.0f32] {
+        let eye_c = fc - fwd * (0.4 * s) + side * (sign * 3.0 * w_t * s);
+        let e_inner = eye_c - side * (sign * 1.2 * w_t * s) - fwd * (0.15 * s);
+        let e_outer = eye_c + side * (sign * 1.2 * w_t * s) + fwd * (0.20 * s);
+        let ctrl = eye_c + fwd * (0.85 * s);
+        if let Some(ep) = quad_curve(e_inner, ctrl, e_outer) {
+            stroke_solid(pixmap, &ep, line_col, &eye_stroke);
+        }
+    }
+
+    // Cute smiling 'w' mouth between the nose and the chin/body (-fwd)
+    let m_center = fc - fwd * (4.3 * s);
+    for sign in [-1.0f32, 1.0f32] {
+        let m_ctrl = fc - fwd * (5.3 * s) + side * (sign * 0.85 * w_t * s);
+        let m_end = fc - fwd * (4.2 * s) + side * (sign * 1.75 * w_t * s);
+        if let Some(mp) = quad_curve(m_center, m_ctrl, m_end) {
+            stroke_solid(pixmap, &mp, line_col, &eye_stroke);
+        }
+    }
+}
+
+/// An open quadratic curve from `from` to `to`
+fn quad_curve(from: Vec2, ctrl: Vec2, to: Vec2) -> Option<Path> {
+    let mut pb = PathBuilder::new();
+    pb.move_to(from.x, from.y);
+    pb.quad_to(ctrl.x, ctrl.y, to.x, to.y);
+    pb.finish()
+}
+
+/// A quadratic curve closed back to its start by a straight edge
+fn quad_wedge(from: Vec2, ctrl: Vec2, to: Vec2) -> Option<Path> {
+    let mut pb = PathBuilder::new();
+    pb.move_to(from.x, from.y);
+    pb.quad_to(ctrl.x, ctrl.y, to.x, to.y);
+    pb.close();
+    pb.finish()
 }
 
 fn build_head_path_rolled(
@@ -1739,27 +1474,30 @@ fn draw_ear(
     let base_back = ear_anchor - fwd * (2.8 * s) + side * (1.9 * s);
     let tip = ear_anchor + ear_dir * (6.8 * s) + ear_perp * (0.4 * s);
 
-    let mut fill_pb = PathBuilder::new();
-    fill_pb.move_to(base_front.x, base_front.y);
-    fill_pb.quad_to(
-        (base_front.x + tip.x) * 0.5 - ear_perp.x * (0.7 * s),
-        (base_front.y + tip.y) * 0.5 - ear_perp.y * (0.7 * s),
-        tip.x,
-        tip.y,
-    );
-    fill_pb.quad_to(
-        (tip.x + base_back.x) * 0.5 + ear_perp.x * (1.0 * s),
-        (tip.y + base_back.y) * 0.5 + ear_perp.y * (1.0 * s),
-        base_back.x,
-        base_back.y,
-    );
-    fill_pb.close();
+    // Front edge bowing in, back edge bowing out; filled closed, outlined open at the base
+    let ear_edge = || {
+        let mut pb = PathBuilder::new();
+        pb.move_to(base_front.x, base_front.y);
+        pb.quad_to(
+            (base_front.x + tip.x) * 0.5 - ear_perp.x * (0.7 * s),
+            (base_front.y + tip.y) * 0.5 - ear_perp.y * (0.7 * s),
+            tip.x,
+            tip.y,
+        );
+        pb.quad_to(
+            (tip.x + base_back.x) * 0.5 + ear_perp.x * (1.0 * s),
+            (tip.y + base_back.y) * 0.5 + ear_perp.y * (1.0 * s),
+            base_back.x,
+            base_back.y,
+        );
+        pb
+    };
 
+    let mut fill_pb = ear_edge();
+    fill_pb.close();
     let Some(outer_ear_fill) = fill_pb.finish() else {
         return;
     };
-
-    let mut paint = Paint::default();
 
     let (outer_col, inner_col) = if pal.patch_primary.is_some() && side_sign > 0.0 {
         (pal.base, pal.flank_shade)
@@ -1767,14 +1505,7 @@ fn draw_ear(
         (pal.ear_outer, pal.ear_inner)
     };
 
-    paint.set_color(outer_col);
-    pixmap.fill_path(
-        &outer_ear_fill,
-        &paint,
-        FillRule::Winding,
-        Transform::identity(),
-        None,
-    );
+    fill_solid(pixmap, &outer_ear_fill, outer_col);
 
     let in_front = base_front.lerp(base_back, 0.22) + ear_dir * (0.8 * s);
     let in_back = base_back.lerp(base_front, 0.18) + ear_dir * (0.6 * s);
@@ -1785,39 +1516,11 @@ fn draw_ear(
     in_pb.line_to(in_back.x, in_back.y);
     in_pb.close();
     if let Some(inner_ear) = in_pb.finish() {
-        paint.set_color(inner_col);
-        pixmap.fill_path(
-            &inner_ear,
-            &paint,
-            FillRule::Winding,
-            Transform::identity(),
-            None,
-        );
+        fill_solid(pixmap, &inner_ear, inner_col);
     }
 
-    let mut stroke_pb = PathBuilder::new();
-    stroke_pb.move_to(base_front.x, base_front.y);
-    stroke_pb.quad_to(
-        (base_front.x + tip.x) * 0.5 - ear_perp.x * (0.7 * s),
-        (base_front.y + tip.y) * 0.5 - ear_perp.y * (0.7 * s),
-        tip.x,
-        tip.y,
-    );
-    stroke_pb.quad_to(
-        (tip.x + base_back.x) * 0.5 + ear_perp.x * (1.0 * s),
-        (tip.y + base_back.y) * 0.5 + ear_perp.y * (1.0 * s),
-        base_back.x,
-        base_back.y,
-    );
-    if let Some(ear_outline) = stroke_pb.finish() {
-        let stroke = Stroke {
-            width: 1.05 * s,
-            line_cap: LineCap::Round,
-            line_join: LineJoin::Round,
-            ..Default::default()
-        };
-        paint.set_color(pal.outline);
-        pixmap.stroke_path(&ear_outline, &paint, &stroke, Transform::identity(), None);
+    if let Some(ear_outline) = ear_edge().finish() {
+        stroke_solid(pixmap, &ear_outline, pal.outline, &round_stroke(1.05 * s));
     }
 }
 
@@ -1937,26 +1640,10 @@ pub fn render_tray_icon(
         return;
     };
 
-    let mut paint = Paint::default();
-
-    paint.set_color(shade);
-    pixmap.fill_path(
-        &head_path,
-        &paint,
-        FillRule::Winding,
-        Transform::identity(),
-        None,
-    );
+    fill_solid(pixmap, &head_path, shade);
 
     if let Some(inner_path) = build_tray_head_path(cx, cy + r * 0.02, r * 0.88, droop) {
-        paint.set_color(base);
-        pixmap.fill_path(
-            &inner_path,
-            &paint,
-            FillRule::Winding,
-            Transform::identity(),
-            None,
-        );
+        fill_solid(pixmap, &inner_path, base);
     }
 
     if matches!(coat, CoatStyle::Calico | CoatStyle::Tuxedo)
@@ -1968,25 +1655,11 @@ pub fn render_tray_icon(
                 if let Some(orange) =
                     PathBuilder::from_circle(cx - r * 0.48, cy - r * 0.42, r * 0.62)
                 {
-                    paint.set_color(rgba(226, 132, 60, 255));
-                    pixmap.fill_path(
-                        &orange,
-                        &paint,
-                        FillRule::Winding,
-                        Transform::identity(),
-                        Some(&mask),
-                    );
+                    fill_solid_masked(pixmap, &orange, rgba(226, 132, 60, 255), &mask);
                 }
                 if let Some(dark) = PathBuilder::from_circle(cx + r * 0.56, cy - r * 0.52, r * 0.44)
                 {
-                    paint.set_color(rgba(62, 64, 72, 255));
-                    pixmap.fill_path(
-                        &dark,
-                        &paint,
-                        FillRule::Winding,
-                        Transform::identity(),
-                        Some(&mask),
-                    );
+                    fill_solid_masked(pixmap, &dark, rgba(62, 64, 72, 255), &mask);
                 }
             }
             CoatStyle::Tuxedo => {
@@ -1994,14 +1667,7 @@ pub fn render_tray_icon(
                     if let Some(hood) =
                         PathBuilder::from_circle(cx + sign * r * 0.56, cy - r * 0.50, r * 0.50)
                     {
-                        paint.set_color(rgba(46, 48, 56, 255));
-                        pixmap.fill_path(
-                            &hood,
-                            &paint,
-                            FillRule::Winding,
-                            Transform::identity(),
-                            Some(&mask),
-                        );
+                        fill_solid_masked(pixmap, &hood, rgba(46, 48, 56, 255), &mask);
                     }
                 }
             }
@@ -2012,46 +1678,39 @@ pub fn render_tray_icon(
     let tip_x = r * (0.76 + 0.08 * droop);
     let tip_y = r * (0.98 - 0.16 * droop);
     for sign in [-1.0f32, 1.0f32] {
-        if coat == CoatStyle::Calico && sign < 0.0 {
-            paint.set_color(rgba(186, 96, 40, 255));
+        let ear_col = if coat == CoatStyle::Calico && sign < 0.0 {
+            rgba(186, 96, 40, 255)
         } else {
-            paint.set_color(ear_in);
-        }
+            ear_in
+        };
         let mut epb = PathBuilder::new();
         epb.move_to(cx + sign * (r * 0.40), cy - r * 0.42);
         epb.line_to(cx + sign * (tip_x * 0.88), cy - tip_y * 0.84);
         epb.line_to(cx + sign * (r * 0.66), cy - r * 0.18);
         epb.close();
         if let Some(ep) = epb.finish() {
-            pixmap.fill_path(&ep, &paint, FillRule::Winding, Transform::identity(), None);
+            fill_solid(pixmap, &ep, ear_col);
         }
     }
 
     let eye_y = cy + r * 0.02;
     let eye_dx = r * 0.33;
     if sleeping {
-        let eye_stroke = Stroke {
-            width: (r * 0.13).clamp(1.1, 2.0),
-            line_cap: LineCap::Round,
-            line_join: LineJoin::Round,
-            ..Default::default()
-        };
-        paint.set_color(eye_col);
+        let eye_stroke = round_stroke((r * 0.13).clamp(1.1, 2.0));
         for sign in [-1.0f32, 1.0f32] {
             let ex = cx + sign * eye_dx;
             let mut pb = PathBuilder::new();
             pb.move_to(ex - r * 0.14, eye_y - r * 0.02);
             pb.quad_to(ex, eye_y + r * 0.14, ex + r * 0.14, eye_y - r * 0.02);
             if let Some(p) = pb.finish() {
-                pixmap.stroke_path(&p, &paint, &eye_stroke, Transform::identity(), None);
+                stroke_solid(pixmap, &p, eye_col, &eye_stroke);
             }
         }
     } else {
-        paint.set_color(eye_col);
         let er = (r * 0.135).max(1.25);
         for sign in [-1.0f32, 1.0f32] {
             if let Some(eye) = PathBuilder::from_circle(cx + sign * eye_dx, eye_y, er) {
-                pixmap.fill_path(&eye, &paint, FillRule::Winding, Transform::identity(), None);
+                fill_solid(pixmap, &eye, eye_col);
             }
         }
     }
@@ -2063,24 +1722,11 @@ pub fn render_tray_icon(
     npb.line_to(cx, ny + r * 0.16);
     npb.close();
     if let Some(np) = npb.finish() {
-        paint.set_color(nose_col);
-        pixmap.fill_path(&np, &paint, FillRule::Winding, Transform::identity(), None);
+        fill_solid(pixmap, &np, nose_col);
     }
 
-    let head_stroke = Stroke {
-        width: (r * 0.13).clamp(1.1, 2.0),
-        line_cap: LineCap::Round,
-        line_join: LineJoin::Round,
-        ..Default::default()
-    };
-    paint.set_color(outline);
-    pixmap.stroke_path(
-        &head_path,
-        &paint,
-        &head_stroke,
-        Transform::identity(),
-        None,
-    );
+    let head_stroke = round_stroke((r * 0.13).clamp(1.1, 2.0));
+    stroke_solid(pixmap, &head_path, outline, &head_stroke);
 
     if hidden {
         if opaque_bg {
