@@ -6,8 +6,8 @@ use crate::render::{
     bowl_window_dim, cat_window_dim, render_bowl_overlay, render_cat, render_tray_icon,
 };
 use crate::tray::{
-    ABOUT_URL, HitEntry, MENU_WIDTH, TrayAction, TrayState, build_rows, compute_layout,
-    hit_test_entries, normalize_tray_action, render_menu_pixmap, rgba_to_bgra,
+    ABOUT_URL, HitEntry, MENU_WIDTH, TrayAction, TrayState, apply_shared_action, build_rows,
+    compute_layout, hit_test_entries, render_menu_pixmap, rgba_to_bgra,
 };
 use core::cell::RefCell;
 use core::ffi::c_void;
@@ -867,23 +867,10 @@ pub fn run(args: &Args, prefs: UserPrefs) -> Result<(), Box<dyn std::error::Erro
 
         let mut needs_raise = false;
         while let Some(action) = tray.as_mut().and_then(|t| t.pop_action()) {
-            match normalize_tray_action(action, cat.feeding_preset()) {
-                TrayAction::SetCoat(coat) => {
-                    cat.coat = coat;
-                    UserPrefs::from_cat(&cat).save();
-                }
-                TrayAction::SetTemperament(temp) => {
-                    cat.behaviors.temperament = temp;
-                    UserPrefs::from_cat(&cat).save();
-                }
-                TrayAction::ToggleFollowCursor => {
-                    cat.behaviors.follow_cursor = !cat.behaviors.follow_cursor;
-                    UserPrefs::from_cat(&cat).save();
-                }
-                TrayAction::TogglePlayfulQuirks => {
-                    cat.behaviors.playful_quirks = !cat.behaviors.playful_quirks;
-                    UserPrefs::from_cat(&cat).save();
-                }
+            let Some(action) = apply_shared_action(action, &mut cat, &mut start_on_login) else {
+                continue;
+            };
+            match action {
                 TrayAction::StopFeeding => {
                     cat.stop_feeding();
                     bowl_click_armed = false;
@@ -936,12 +923,12 @@ pub fn run(args: &Args, prefs: UserPrefs) -> Result<(), Box<dyn std::error::Erro
                         }
                     }
                 }
-                TrayAction::ToggleStartOnLogin => {
-                    if let Err(e) = autostart::set_enabled(!start_on_login) {
-                        eprintln!("catsor: failed to update start on login: {e}");
-                    }
-                    start_on_login = autostart::is_enabled();
-                }
+                // Handled by `apply_shared_action`
+                TrayAction::SetCoat(_)
+                | TrayAction::SetTemperament(_)
+                | TrayAction::ToggleFollowCursor
+                | TrayAction::TogglePlayfulQuirks
+                | TrayAction::ToggleStartOnLogin => {}
                 TrayAction::OpenAbout => {
                     let verb = to_wide_null("open");
                     let url = to_wide_null(ABOUT_URL);

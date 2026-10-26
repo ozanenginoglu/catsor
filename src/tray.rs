@@ -1,4 +1,6 @@
+use crate::autostart;
 use crate::cat::{Activity, BehaviorConfig, CatSim, CoatStyle, FeedPreset, Temperament};
+use crate::prefs::UserPrefs;
 use crate::render::coat_swatch_colors;
 #[cfg(not(any(target_os = "windows", windows_check)))]
 use crate::render::render_tray_icon;
@@ -82,6 +84,36 @@ pub(crate) fn normalize_tray_action(action: TrayAction, active: Option<FeedPrese
         TrayAction::SelectFeedPreset(p) if active == Some(p) => TrayAction::StopFeeding,
         a => a,
     }
+}
+
+/// Applies the tray actions that work the same on every platform (they only touch the
+/// simulation, saved prefs or autostart). Returns the normalized action when the platform
+/// backend still has to handle it.
+pub(crate) fn apply_shared_action(
+    action: TrayAction,
+    cat: &mut CatSim,
+    start_on_login: &mut bool,
+) -> Option<TrayAction> {
+    match normalize_tray_action(action, cat.feeding_preset()) {
+        TrayAction::SetCoat(coat) => cat.coat = coat,
+        TrayAction::SetTemperament(temp) => cat.behaviors.temperament = temp,
+        TrayAction::ToggleFollowCursor => {
+            cat.behaviors.follow_cursor = !cat.behaviors.follow_cursor;
+        }
+        TrayAction::TogglePlayfulQuirks => {
+            cat.behaviors.playful_quirks = !cat.behaviors.playful_quirks;
+        }
+        TrayAction::ToggleStartOnLogin => {
+            if let Err(e) = autostart::set_enabled(!*start_on_login) {
+                eprintln!("catsor: failed to update start on login: {e}");
+            }
+            *start_on_login = autostart::is_enabled();
+            return None;
+        }
+        other => return Some(other),
+    }
+    UserPrefs::from_cat(cat).save();
+    None
 }
 
 #[derive(Debug, Clone)]

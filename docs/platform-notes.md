@@ -17,7 +17,7 @@ loop {
 
 The cat window is a square of `max(64, 108 × scale)` px, and the bowl window is `max(22, 26 × scale)` px. The window moves around the screen and the cat is drawn *relative to the window*. The window is centred on `cat.window_center()`, a stable torso point, not on the head, so tail sway and posture changes don't make the window shake. Rounding to whole pixels happens only at the window position, never inside the pixmap.
 
-## X11 (`run_x11` in `main.rs`)
+## X11 (`x11.rs`)
 
 ### The overlay window
 
