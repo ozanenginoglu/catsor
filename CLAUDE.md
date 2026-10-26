@@ -46,7 +46,7 @@ There are three layers. Simulation and rendering are platform-independent. All O
 ### Conventions that span files
 
 - Platform gating always uses `#[cfg(not(any(target_os = "windows", windows_check)))]` for X11 and `#[cfg(any(target_os = "windows", windows_check))]` for Win32. Keep this exact pattern, so that `--cfg windows_check` keeps type-checking the Win32 path on Linux. Use `tray.rs` for anything both backends need.
-- New tray options need changes in several places: a `TrayAction` variant, a `TrayState` field if the menu shows it, `build_rows` in `tray.rs`, `apply_shared_action` in `tray.rs` if the action is platform-independent, otherwise the action handlers in **both** `x11.rs` (`X11App::handle_tray_action`) and `win32.rs`, and `UserPrefs` and its TOML (de)serialization if the option should persist. The tray tests check that the menu layout covers every action.
+- New tray options need changes in several places: a `TrayAction` variant, a `TrayState` field if the menu shows it, `build_rows` in `tray.rs`, `apply_shared_action` in `tray.rs` if the action is platform-independent, otherwise the action handlers in **both** `x11.rs` (`X11App::handle_tray_action`) and `win32.rs` (`WinApp::handle_tray_actions`), and `UserPrefs` and its TOML (de)serialization if the option should persist. The tray tests check that the menu layout covers every action.
 - Every distance or threshold in `CatSim` is multiplied by `self.scale`. Keep new tunables scale-relative.
 - Tests are behavioral simulations: they drive `CatSim::update` with synthetic cursor paths at a fixed `dt` and assert on activity, positions or smoothness. Follow that style when you change behavior.
 - Commit messages use Conventional Commits (`feat:`, `fix:`).

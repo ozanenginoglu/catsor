@@ -43,14 +43,14 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyIcon,
     DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetSystemMetrics,
-    GetWindowLongPtrW, HICON, HWND_TOPMOST, ICONINFO, IDC_ARROW, LoadCursorW, MSG, PM_REMOVE,
-    PeekMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SM_CXSCREEN,
-    SM_CXSMICON, SM_CYSCREEN, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TranslateMessage, ULW_ALPHA, UpdateLayeredWindow, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CLOSE,
-    WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_QUIT, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_POPUP,
+    GetWindowLongPtrW, HCURSOR, HICON, HWND_TOPMOST, ICONINFO, IDC_ARROW, LoadCursorW, MSG,
+    PM_REMOVE, PeekMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
+    SM_CXSCREEN, SM_CXSMICON, SM_CYSCREEN, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SW_SHOWNORMAL,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow, WA_INACTIVE, WM_ACTIVATE, WM_APP,
+    WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_QUIT,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 const WM_TRAYICON: u32 = WM_APP + 1;
@@ -717,19 +717,18 @@ pub fn attach_parent_console() {
     }
 }
 
-pub fn run(args: &Args, prefs: UserPrefs) -> Result<(), Box<dyn std::error::Error>> {
-    unsafe {
-        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    }
+type BoxResult<T> = Result<T, Box<dyn std::error::Error>>;
 
-    let hinstance: HINSTANCE = unsafe { GetModuleHandleW(null()) };
-    let cursor = unsafe { LoadCursorW(null_mut(), IDC_ARROW) };
-
-    let overlay_class_name = to_wide_null("catsor_overlay_cls");
-    let overlay_wc = WNDCLASSEXW {
+fn register_window_class(
+    hinstance: HINSTANCE,
+    class_name: &[u16],
+    wnd_proc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+    cursor: HCURSOR,
+) {
+    let wc = WNDCLASSEXW {
         cbSize: size_of::<WNDCLASSEXW>() as u32,
         style: CS_HREDRAW | CS_VREDRAW,
-        lpfnWndProc: Some(overlay_wnd_proc),
+        lpfnWndProc: Some(wnd_proc),
         cbClsExtra: 0,
         cbWndExtra: 0,
         hInstance: hinstance,
@@ -737,109 +736,113 @@ pub fn run(args: &Args, prefs: UserPrefs) -> Result<(), Box<dyn std::error::Erro
         hCursor: cursor,
         hbrBackground: null_mut(),
         lpszMenuName: null(),
-        lpszClassName: overlay_class_name.as_ptr(),
+        lpszClassName: class_name.as_ptr(),
         hIconSm: null_mut(),
     };
     unsafe {
-        RegisterClassExW(&overlay_wc);
+        RegisterClassExW(&wc);
+    }
+}
+
+/// A topmost, click-through layered window plus the buffers its frames are drawn into
+struct LayeredWindow {
+    hwnd: HWND,
+    dim: u16,
+    pixmap: Pixmap,
+    mask: Mask,
+    dib: DibSurface,
+}
+
+impl LayeredWindow {
+    /// Creates the (hidden) window; returns `None` if Win32 refuses to create it
+    fn create(
+        hinstance: HINSTANCE,
+        class_name: &[u16],
+        title: &[u16],
+        dim: u16,
+        x: i32,
+        y: i32,
+    ) -> BoxResult<Option<Self>> {
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_LAYERED
+                    | WS_EX_TRANSPARENT
+                    | WS_EX_TOPMOST
+                    | WS_EX_TOOLWINDOW
+                    | WS_EX_NOACTIVATE,
+                class_name.as_ptr(),
+                title.as_ptr(),
+                WS_POPUP,
+                x,
+                y,
+                dim as i32,
+                dim as i32,
+                null_mut(),
+                null_mut(),
+                hinstance,
+                null(),
+            )
+        };
+        if hwnd.is_null() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            hwnd,
+            dim,
+            pixmap: Pixmap::new(dim as u32, dim as u32).ok_or("Failed to allocate Pixmap")?,
+            mask: Mask::new(dim as u32, dim as u32).ok_or("Failed to allocate Mask")?,
+            dib: DibSurface::new(dim as u32, dim as u32)?,
+        }))
     }
 
-    let menu_class_name = to_wide_null("catsor_menu_cls");
-    let menu_wc = WNDCLASSEXW {
-        cbSize: size_of::<WNDCLASSEXW>() as u32,
-        style: CS_HREDRAW | CS_VREDRAW,
-        lpfnWndProc: Some(menu_wnd_proc),
-        cbClsExtra: 0,
-        cbWndExtra: 0,
-        hInstance: hinstance,
-        hIcon: null_mut(),
-        hCursor: cursor,
-        hbrBackground: null_mut(),
-        lpszMenuName: null(),
-        lpszClassName: menu_class_name.as_ptr(),
-        hIconSm: null_mut(),
-    };
-    unsafe {
-        RegisterClassExW(&menu_wc);
+    /// Reallocates the buffers for `dim`; returns whether the size changed. `UpdateLayeredWindow`
+    /// resizes the window itself on the next present.
+    fn resize(&mut self, dim: u16) -> BoxResult<bool> {
+        if dim == self.dim {
+            return Ok(false);
+        }
+        self.dim = dim;
+        self.pixmap = Pixmap::new(dim as u32, dim as u32).ok_or("Failed to reallocate Pixmap")?;
+        self.mask = Mask::new(dim as u32, dim as u32).ok_or("Failed to reallocate Mask")?;
+        self.dib = DibSurface::new(dim as u32, dim as u32)?;
+        Ok(true)
     }
 
-    let mut win_dim = cat_window_dim(prefs.scale);
-
-    let mut init_pt = POINT { x: 400, y: 400 };
-    unsafe {
-        GetCursorPos(&mut init_pt);
-    }
-    let start_cursor = Vec2::new(init_pt.x as f32, init_pt.y as f32);
-
-    let mut cat = CatSim::new(start_cursor, prefs.scale, prefs.coat);
-    cat.behaviors = prefs.behaviors;
-    let init_center = cat.window_center();
-    let mut win_x = (init_center.x - (win_dim as f32) * 0.5).round() as i32;
-    let mut win_y = (init_center.y - (win_dim as f32) * 0.5).round() as i32;
-
-    let overlay_title = to_wide_null("Catsor");
-    let cat_hwnd = unsafe {
-        CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-            overlay_class_name.as_ptr(),
-            overlay_title.as_ptr(),
-            WS_POPUP,
-            win_x,
-            win_y,
-            win_dim as i32,
-            win_dim as i32,
-            null_mut(),
-            null_mut(),
-            hinstance,
-            null(),
-        )
-    };
-    if cat_hwnd.is_null() {
-        return Err("Failed to create Win32 layered overlay window".into());
+    /// Uploads the drawn pixmap and moves the window to (`x`, `y`)
+    fn present(&mut self, x: i32, y: i32) {
+        self.dib.write_pixmap(&self.pixmap);
+        self.dib.present_layered(self.hwnd, x, y);
     }
 
-    unsafe {
-        ShowWindow(cat_hwnd, SW_SHOWNOACTIVATE);
+    fn show(&self, visible: bool) {
+        unsafe {
+            ShowWindow(self.hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
+        }
     }
-    let mut bowl_dim = bowl_window_dim(prefs.scale);
-    let bowl_hwnd = unsafe {
-        CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-            overlay_class_name.as_ptr(),
-            overlay_title.as_ptr(),
-            WS_POPUP,
-            win_x,
-            win_y,
-            bowl_dim as i32,
-            bowl_dim as i32,
-            null_mut(),
-            null_mut(),
-            hinstance,
-            null(),
-        )
-    };
-    let mut bowl_visible = false;
-    let mut bowl_click_armed = false;
-    let mut bowl_pixmap =
-        Pixmap::new(bowl_dim as u32, bowl_dim as u32).ok_or("Failed to allocate bowl Pixmap")?;
-    let mut bowl_dib = DibSurface::new(bowl_dim as u32, bowl_dim as u32)?;
+}
 
-    let mut cat_hidden = false;
-    let mut start_on_login = autostart::is_enabled();
-    let mut keep_awake = WinKeepAwake::new();
-    let mut tray = if args.no_tray {
-        None
-    } else {
-        let initial_state = TrayState::from_cat(&cat, cat_hidden, start_on_login);
-        WinTrayController::new(hinstance, &menu_class_name, initial_state).ok()
-    };
+enum Flow {
+    Continue { needs_raise: bool },
+    Quit,
+}
 
-    let mut pixmap =
-        Pixmap::new(win_dim as u32, win_dim as u32).ok_or("Failed to allocate Pixmap")?;
-    let mut clip_mask =
-        Mask::new(win_dim as u32, win_dim as u32).ok_or("Failed to allocate Mask")?;
-    let mut dib = DibSurface::new(win_dim as u32, win_dim as u32)?;
+struct WinApp {
+    cat: CatSim,
+    cat_win: LayeredWindow,
+    /// Standalone bowl window shown while carrying or walking to the placed bowl
+    bowl_win: Option<LayeredWindow>,
+    bowl_visible: bool,
+    /// Set once the left button is up while carrying the bowl, so the click that picked the
+    /// feed preset from the menu doesn't also place the bowl
+    bowl_click_armed: bool,
+    cat_hidden: bool,
+    start_on_login: bool,
+    keep_awake: WinKeepAwake,
+    tray: Option<WinTrayController>,
+}
 
+pub fn run(args: &Args, prefs: UserPrefs) -> BoxResult<()> {
+    let mut app = WinApp::new(args, prefs)?;
     let frame_duration = Duration::from_secs_f64(1.0 / (args.fps.max(15) as f64));
     let mut last_tick = Instant::now();
     let mut raise_counter = 0u32;
@@ -849,199 +852,290 @@ pub fn run(args: &Args, prefs: UserPrefs) -> Result<(), Box<dyn std::error::Erro
         let dt = now.duration_since(last_tick).as_secs_f32();
         last_tick = now;
 
-        // Pump pending Win32 messages
-        unsafe {
-            let mut msg: MSG = zeroed();
-            while PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) != 0 {
-                if msg.message == WM_QUIT {
-                    if let Some(tray_ctrl) = &mut tray {
-                        tray_ctrl.close_menu();
-                    }
-                    DestroyWindow(cat_hwnd);
-                    return Ok(());
-                }
-                TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
+        if app.pump_messages() {
+            app.shutdown();
+            return Ok(());
         }
-
-        let mut needs_raise = false;
-        while let Some(action) = tray.as_mut().and_then(|t| t.pop_action()) {
-            let Some(action) = apply_shared_action(action, &mut cat, &mut start_on_login) else {
-                continue;
-            };
-            match action {
-                TrayAction::StopFeeding => {
-                    cat.stop_feeding();
-                    bowl_click_armed = false;
-                    keep_awake.set_active(false);
-                }
-                TrayAction::SelectFeedPreset(preset) => {
-                    if cat_hidden {
-                        cat_hidden = false;
-                        unsafe {
-                            ShowWindow(cat_hwnd, SW_SHOWNOACTIVATE);
-                        }
-                        needs_raise = true;
-                    }
-                    let mut pt = POINT { x: 0, y: 0 };
-                    unsafe {
-                        GetCursorPos(&mut pt);
-                    }
-                    cat.begin_bowl_placement(preset, Vec2::new(pt.x as f32, pt.y as f32));
-                    bowl_click_armed = false;
-                }
-                TrayAction::SetScale(new_scale) => {
-                    cat.set_scale(new_scale);
-                    UserPrefs::from_cat(&cat).save();
-                    let new_dim = cat_window_dim(cat.scale);
-                    if new_dim != win_dim {
-                        win_dim = new_dim;
-                        pixmap = Pixmap::new(win_dim as u32, win_dim as u32)
-                            .ok_or("Failed to reallocate Pixmap")?;
-                        clip_mask = Mask::new(win_dim as u32, win_dim as u32)
-                            .ok_or("Failed to reallocate Mask")?;
-                        dib = DibSurface::new(win_dim as u32, win_dim as u32)?;
-                        needs_raise = true;
-                    }
-                    let new_bowl_dim = bowl_window_dim(cat.scale);
-                    if new_bowl_dim != bowl_dim {
-                        bowl_dim = new_bowl_dim;
-                        bowl_pixmap = Pixmap::new(bowl_dim as u32, bowl_dim as u32)
-                            .ok_or("Failed to reallocate bowl Pixmap")?;
-                        bowl_dib = DibSurface::new(bowl_dim as u32, bowl_dim as u32)?;
-                    }
-                }
-                TrayAction::ToggleHidden => {
-                    cat_hidden = !cat_hidden;
-                    unsafe {
-                        if cat_hidden {
-                            ShowWindow(cat_hwnd, SW_HIDE);
-                        } else {
-                            ShowWindow(cat_hwnd, SW_SHOWNOACTIVATE);
-                            needs_raise = true;
-                        }
-                    }
-                }
-                // Handled by `apply_shared_action`
-                TrayAction::SetCoat(_)
-                | TrayAction::SetTemperament(_)
-                | TrayAction::ToggleFollowCursor
-                | TrayAction::TogglePlayfulQuirks
-                | TrayAction::ToggleStartOnLogin => {}
-                TrayAction::OpenAbout => {
-                    let verb = to_wide_null("open");
-                    let url = to_wide_null(ABOUT_URL);
-                    unsafe {
-                        ShellExecuteW(
-                            null_mut(),
-                            verb.as_ptr(),
-                            url.as_ptr(),
-                            null(),
-                            null(),
-                            SW_SHOWNORMAL,
-                        );
-                    }
-                }
-                TrayAction::Quit => {
-                    if let Some(tray_ctrl) = &mut tray {
-                        tray_ctrl.close_menu();
-                    }
-                    unsafe {
-                        if !bowl_hwnd.is_null() {
-                            DestroyWindow(bowl_hwnd);
-                        }
-                        DestroyWindow(cat_hwnd);
-                    }
-                    return Ok(());
-                }
+        let mut needs_raise = match app.handle_tray_actions()? {
+            Flow::Continue { needs_raise } => needs_raise,
+            Flow::Quit => {
+                app.shutdown();
+                return Ok(());
             }
-        }
-
-        if !cat_hidden || cat.feeding_preset().is_some() {
-            let mut pt = POINT { x: 0, y: 0 };
-            if unsafe { GetCursorPos(&mut pt) } != 0 {
-                let cursor_pos = Vec2::new(pt.x as f32, pt.y as f32);
-                if cat.is_carrying_bowl() {
-                    if !is_key_down(VK_LBUTTON) {
-                        bowl_click_armed = true;
-                    } else if bowl_click_armed {
-                        bowl_click_armed = false;
-                        cat.place_bowl(cursor_pos);
-                    }
-                    if is_key_down(VK_RBUTTON) || is_key_down(VK_ESCAPE) {
-                        bowl_click_armed = false;
-                        cat.stop_feeding();
-                    }
-                }
-                cat.update(cursor_pos, dt);
-                keep_awake.tick(cat.keeps_awake());
-            }
-        } else {
-            keep_awake.set_active(false);
-        }
+        };
+        app.step_cat(dt);
 
         raise_counter = raise_counter.wrapping_add(1);
         if raise_counter.is_multiple_of(120) {
             needs_raise = true;
         }
-
-        if let Some(tray_ctrl) = &mut tray {
-            tray_ctrl.sync_state(TrayState::from_cat(&cat, cat_hidden, start_on_login));
+        if let Some(tray_ctrl) = &mut app.tray {
+            tray_ctrl.sync_state(TrayState::from_cat(
+                &app.cat,
+                app.cat_hidden,
+                app.start_on_login,
+            ));
         }
 
-        if !bowl_hwnd.is_null() {
-            if let Some(detached_pos) = cat.detached_bowl_pos() {
-                render_bowl_overlay(cat.scale, &mut bowl_pixmap.as_mut());
-                bowl_dib.write_pixmap(&bowl_pixmap);
-                let bx = (detached_pos.x - (bowl_dim as f32) * 0.5).round() as i32;
-                let by = (detached_pos.y - (bowl_dim as f32) * 0.5).round() as i32;
-                bowl_dib.present_layered(bowl_hwnd, bx, by);
-                if !bowl_visible {
-                    unsafe {
-                        ShowWindow(bowl_hwnd, SW_SHOWNOACTIVATE);
-                    }
-                    bowl_visible = true;
-                }
-            } else if bowl_visible {
-                unsafe {
-                    ShowWindow(bowl_hwnd, SW_HIDE);
-                }
-                bowl_visible = false;
-            }
-        }
-        if !cat_hidden {
-            let center = cat.window_center();
-            let origin = center - Vec2::splat((win_dim as f32) * 0.5);
-            win_x = origin.x.round() as i32;
-            win_y = origin.y.round() as i32;
-
-            if needs_raise {
-                let insert_after = tray
-                    .as_ref()
-                    .and_then(|t| t.open_menu_window())
-                    .unwrap_or(HWND_TOPMOST);
-                unsafe {
-                    SetWindowPos(
-                        cat_hwnd,
-                        insert_after,
-                        0,
-                        0,
-                        0,
-                        0,
-                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                    );
-                }
-            }
-
-            render_cat(&cat, &mut pixmap.as_mut(), &mut clip_mask, origin);
-            dib.write_pixmap(&pixmap);
-            dib.present_layered(cat_hwnd, win_x, win_y);
+        app.draw_bowl();
+        if !app.cat_hidden {
+            app.draw_cat(needs_raise);
         }
 
         let elapsed = now.elapsed();
         if elapsed < frame_duration {
             std::thread::sleep(frame_duration - elapsed);
         }
+    }
+}
+
+impl WinApp {
+    fn new(args: &Args, prefs: UserPrefs) -> BoxResult<Self> {
+        unsafe {
+            let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        }
+
+        let hinstance: HINSTANCE = unsafe { GetModuleHandleW(null()) };
+        let cursor = unsafe { LoadCursorW(null_mut(), IDC_ARROW) };
+        let overlay_class_name = to_wide_null("catsor_overlay_cls");
+        register_window_class(hinstance, &overlay_class_name, overlay_wnd_proc, cursor);
+        let menu_class_name = to_wide_null("catsor_menu_cls");
+        register_window_class(hinstance, &menu_class_name, menu_wnd_proc, cursor);
+
+        let mut init_pt = POINT { x: 400, y: 400 };
+        unsafe {
+            GetCursorPos(&mut init_pt);
+        }
+        let start_cursor = Vec2::new(init_pt.x as f32, init_pt.y as f32);
+        let mut cat = CatSim::new(start_cursor, prefs.scale, prefs.coat);
+        cat.behaviors = prefs.behaviors;
+
+        let win_dim = cat_window_dim(prefs.scale);
+        let init_center = cat.window_center();
+        let win_x = (init_center.x - (win_dim as f32) * 0.5).round() as i32;
+        let win_y = (init_center.y - (win_dim as f32) * 0.5).round() as i32;
+
+        let overlay_title = to_wide_null("Catsor");
+        let cat_win = LayeredWindow::create(
+            hinstance,
+            &overlay_class_name,
+            &overlay_title,
+            win_dim,
+            win_x,
+            win_y,
+        )?
+        .ok_or("Failed to create Win32 layered overlay window")?;
+        cat_win.show(true);
+        let bowl_win = LayeredWindow::create(
+            hinstance,
+            &overlay_class_name,
+            &overlay_title,
+            bowl_window_dim(prefs.scale),
+            win_x,
+            win_y,
+        )?;
+
+        let cat_hidden = false;
+        let start_on_login = autostart::is_enabled();
+        let tray = if args.no_tray {
+            None
+        } else {
+            let initial_state = TrayState::from_cat(&cat, cat_hidden, start_on_login);
+            WinTrayController::new(hinstance, &menu_class_name, initial_state).ok()
+        };
+
+        Ok(Self {
+            cat,
+            cat_win,
+            bowl_win,
+            bowl_visible: false,
+            bowl_click_armed: false,
+            cat_hidden,
+            start_on_login,
+            keep_awake: WinKeepAwake::new(),
+            tray,
+        })
+    }
+
+    /// Dispatches pending Win32 messages; returns true once `WM_QUIT` arrives
+    fn pump_messages(&mut self) -> bool {
+        unsafe {
+            let mut msg: MSG = zeroed();
+            while PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                if msg.message == WM_QUIT {
+                    return true;
+                }
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        false
+    }
+
+    fn handle_tray_actions(&mut self) -> BoxResult<Flow> {
+        let mut needs_raise = false;
+        while let Some(action) = self.tray.as_mut().and_then(|t| t.pop_action()) {
+            let Some(action) = apply_shared_action(action, &mut self.cat, &mut self.start_on_login)
+            else {
+                continue;
+            };
+            match action {
+                TrayAction::StopFeeding => {
+                    self.cat.stop_feeding();
+                    self.bowl_click_armed = false;
+                    self.keep_awake.set_active(false);
+                }
+                TrayAction::SelectFeedPreset(preset) => {
+                    if self.cat_hidden {
+                        self.cat_hidden = false;
+                        self.cat_win.show(true);
+                        needs_raise = true;
+                    }
+                    let mut pt = POINT { x: 0, y: 0 };
+                    unsafe {
+                        GetCursorPos(&mut pt);
+                    }
+                    self.cat
+                        .begin_bowl_placement(preset, Vec2::new(pt.x as f32, pt.y as f32));
+                    self.bowl_click_armed = false;
+                }
+                TrayAction::SetScale(new_scale) => {
+                    self.cat.set_scale(new_scale);
+                    UserPrefs::from_cat(&self.cat).save();
+                    if self.cat_win.resize(cat_window_dim(self.cat.scale))? {
+                        needs_raise = true;
+                    }
+                    if let Some(bowl_win) = &mut self.bowl_win {
+                        bowl_win.resize(bowl_window_dim(self.cat.scale))?;
+                    }
+                }
+                TrayAction::ToggleHidden => {
+                    self.cat_hidden = !self.cat_hidden;
+                    self.cat_win.show(!self.cat_hidden);
+                    if !self.cat_hidden {
+                        needs_raise = true;
+                    }
+                }
+                TrayAction::OpenAbout => open_about_page(),
+                TrayAction::Quit => return Ok(Flow::Quit),
+                // Handled by `apply_shared_action`
+                TrayAction::SetCoat(_)
+                | TrayAction::SetTemperament(_)
+                | TrayAction::ToggleFollowCursor
+                | TrayAction::TogglePlayfulQuirks
+                | TrayAction::ToggleStartOnLogin => {}
+            }
+        }
+        Ok(Flow::Continue { needs_raise })
+    }
+
+    /// Advances the simulation from the cursor and handles bowl placement clicks (left places
+    /// it, right or Escape cancels). A hidden cat stays paused unless it is feeding.
+    fn step_cat(&mut self, dt: f32) {
+        if self.cat_hidden && self.cat.feeding_preset().is_none() {
+            self.keep_awake.set_active(false);
+            return;
+        }
+        let mut pt = POINT { x: 0, y: 0 };
+        if unsafe { GetCursorPos(&mut pt) } == 0 {
+            return;
+        }
+        let cursor_pos = Vec2::new(pt.x as f32, pt.y as f32);
+        if self.cat.is_carrying_bowl() {
+            if !is_key_down(VK_LBUTTON) {
+                self.bowl_click_armed = true;
+            } else if self.bowl_click_armed {
+                self.bowl_click_armed = false;
+                self.cat.place_bowl(cursor_pos);
+            }
+            if is_key_down(VK_RBUTTON) || is_key_down(VK_ESCAPE) {
+                self.bowl_click_armed = false;
+                self.cat.stop_feeding();
+            }
+        }
+        self.cat.update(cursor_pos, dt);
+        self.keep_awake.tick(self.cat.keeps_awake());
+    }
+
+    /// Shows the bowl window at the detached bowl while there is one, and hides it otherwise
+    fn draw_bowl(&mut self) {
+        let Some(bowl_win) = &mut self.bowl_win else {
+            return;
+        };
+        if let Some(detached_pos) = self.cat.detached_bowl_pos() {
+            render_bowl_overlay(self.cat.scale, &mut bowl_win.pixmap.as_mut());
+            let bx = (detached_pos.x - (bowl_win.dim as f32) * 0.5).round() as i32;
+            let by = (detached_pos.y - (bowl_win.dim as f32) * 0.5).round() as i32;
+            bowl_win.present(bx, by);
+            if !self.bowl_visible {
+                bowl_win.show(true);
+                self.bowl_visible = true;
+            }
+        } else if self.bowl_visible {
+            bowl_win.show(false);
+            self.bowl_visible = false;
+        }
+    }
+
+    /// Renders the cat and moves its window to follow it, re-raising it when needed (kept just
+    /// below an open tray menu)
+    fn draw_cat(&mut self, needs_raise: bool) {
+        let cat_win = &mut self.cat_win;
+        let center = self.cat.window_center();
+        let origin = center - Vec2::splat((cat_win.dim as f32) * 0.5);
+
+        if needs_raise {
+            let insert_after = self
+                .tray
+                .as_ref()
+                .and_then(|t| t.open_menu_window())
+                .unwrap_or(HWND_TOPMOST);
+            unsafe {
+                SetWindowPos(
+                    cat_win.hwnd,
+                    insert_after,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+        }
+
+        render_cat(
+            &self.cat,
+            &mut cat_win.pixmap.as_mut(),
+            &mut cat_win.mask,
+            origin,
+        );
+        cat_win.present(origin.x.round() as i32, origin.y.round() as i32);
+    }
+
+    fn shutdown(&mut self) {
+        if let Some(tray_ctrl) = &mut self.tray {
+            tray_ctrl.close_menu();
+        }
+        unsafe {
+            if let Some(bowl_win) = &self.bowl_win {
+                DestroyWindow(bowl_win.hwnd);
+            }
+            DestroyWindow(self.cat_win.hwnd);
+        }
+    }
+}
+
+fn open_about_page() {
+    let verb = to_wide_null("open");
+    let url = to_wide_null(ABOUT_URL);
+    unsafe {
+        ShellExecuteW(
+            null_mut(),
+            verb.as_ptr(),
+            url.as_ptr(),
+            null(),
+            null(),
+            SW_SHOWNORMAL,
+        );
     }
 }
