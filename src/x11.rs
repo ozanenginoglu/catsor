@@ -2,11 +2,11 @@ use crate::Args;
 use crate::autostart;
 use crate::bonds::Bonds;
 use crate::cat::FeedPreset;
-use crate::cat::clowder::Clowder;
+use crate::cat::clowder::{Clowder, unix_now};
 use crate::coat::{Coat, CoatLibrary};
 use crate::designer::{DESIGNER_H, DESIGNER_TITLE, DESIGNER_W, Designer, DesignerInput};
 use crate::prefs::UserPrefs;
-use crate::render::{bowl_window_dim, cat_window_dim, render_bowl_overlay, render_cat};
+use crate::render::{bowl_window_dim, cat_window_dim, render_bowl_overlay, render_cats};
 use crate::tray::{
     ABOUT_URL, TrayAction, TrayController, TrayState, apply_shared_action, rgba_to_bgra,
 };
@@ -1067,6 +1067,7 @@ impl X11App {
             | TrayAction::SetTemperament(..)
             | TrayAction::AddCat
             | TrayAction::AddKitten(_)
+            | TrayAction::ToggleGrowsUp(_)
             | TrayAction::RemoveCat(_)
             | TrayAction::SetScale(_)
             | TrayAction::ToggleFollowCursor
@@ -1144,6 +1145,9 @@ impl X11App {
             let cursor_pos = Vec2::new(reply.root_x as f32, reply.root_y as f32);
             self.clowder.update(cursor_pos, dt);
             self.clowder.save_bonds_if_due();
+            if self.clowder.grow(unix_now()) {
+                UserPrefs::from_clowder(&self.clowder).save();
+            }
             self.keep_awake.tick(&self.conn, self.clowder.keeps_awake());
         } else {
             self.keep_awake.set_active(&self.conn, false);
@@ -1220,13 +1224,18 @@ impl X11App {
                 cfg.stack_mode(StackMode::ABOVE)
             }
         };
-        for (cat, cw) in self.clowder.cats().zip(&mut self.cat_wins) {
+        for (i, (cat, cw)) in self.clowder.cats().zip(&mut self.cat_wins).enumerate() {
             let cat_win = &mut cw.overlay;
             // Render relative to the continuous window anchor so the cat's torso never shifts
             // inside the pixmap when integer window coordinates round or when the tail sways
             let center = cat.window_center();
             let origin = center - Vec2::splat((cat_win.dim as f32) * 0.5);
-            render_cat(cat, &mut cat_win.pixmap.as_mut(), &mut cat_win.mask, origin);
+            render_cats(
+                self.clowder.drawn_in(i),
+                &mut cat_win.pixmap.as_mut(),
+                &mut cat_win.mask,
+                origin,
+            );
 
             let new_x = origin.x.round() as i16;
             let new_y = origin.y.round() as i16;

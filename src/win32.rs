@@ -2,12 +2,12 @@ use crate::Args;
 use crate::autostart;
 use crate::bonds::Bonds;
 use crate::cat::CatSim;
-use crate::cat::clowder::Clowder;
+use crate::cat::clowder::{Clowder, unix_now};
 use crate::coat::{Coat, CoatLibrary};
 use crate::designer::{DESIGNER_H, DESIGNER_TITLE, DESIGNER_W, Designer, DesignerInput};
 use crate::prefs::UserPrefs;
 use crate::render::{
-    bowl_window_dim, cat_window_dim, render_bowl_overlay, render_cat, render_tray_icon,
+    bowl_window_dim, cat_window_dim, render_bowl_overlay, render_cats, render_tray_icon,
 };
 use crate::tray::{
     ABOUT_URL, HitEntry, MENU_WIDTH, MenuPage, TrayAction, TrayState, apply_shared_action,
@@ -1368,6 +1368,7 @@ impl WinApp {
                 | TrayAction::SetTemperament(..)
                 | TrayAction::AddCat
                 | TrayAction::AddKitten(_)
+                | TrayAction::ToggleGrowsUp(_)
                 | TrayAction::RemoveCat(_)
                 | TrayAction::SetScale(_)
                 | TrayAction::ToggleFollowCursor
@@ -1464,6 +1465,9 @@ impl WinApp {
         }
         self.clowder.update(cursor_pos, dt);
         self.clowder.save_bonds_if_due();
+        if self.clowder.grow(unix_now()) {
+            UserPrefs::from_clowder(&self.clowder).save();
+        }
         self.keep_awake.tick(self.clowder.keeps_awake());
     }
 
@@ -1499,7 +1503,7 @@ impl WinApp {
             .as_ref()
             .and_then(|t| t.open_menu_window())
             .unwrap_or(HWND_TOPMOST);
-        for (cat, cw) in self.clowder.cats().zip(&mut self.cat_wins) {
+        for (i, (cat, cw)) in self.clowder.cats().zip(&mut self.cat_wins).enumerate() {
             let cat_win = &mut cw.layered;
             let center = cat.window_center();
             let origin = center - Vec2::splat((cat_win.dim as f32) * 0.5);
@@ -1518,7 +1522,12 @@ impl WinApp {
                 }
             }
 
-            render_cat(cat, &mut cat_win.pixmap.as_mut(), &mut cat_win.mask, origin);
+            render_cats(
+                self.clowder.drawn_in(i),
+                &mut cat_win.pixmap.as_mut(),
+                &mut cat_win.mask,
+                origin,
+            );
             cat_win.present(origin.x.round() as i32, origin.y.round() as i32);
         }
     }

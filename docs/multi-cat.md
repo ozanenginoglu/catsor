@@ -1,6 +1,6 @@
 # Multiple cats (design)
 
-Status: **phases 1–4 are implemented** (multiple cats, slots, shared bowl, per-cat tray pages; awareness, kitten tuning, the leash, fetching and bonds; greetings, grooming each other, sleeping together and nursing; play and friction; see `behavior.md` → "Several cats", "Sharing the bowl", "Kittens", "Doing things together", "Playing and squabbling" and "Bonds"). Phase 5 is still a proposal. When a phase lands, move what it settles into `behavior.md` / `animation.md` / `platform-notes.md` and trim it from here.
+Status: **all five phases are implemented** (multiple cats, slots, shared bowl, per-cat tray pages; awareness, kitten tuning, the leash, fetching and bonds; greetings, grooming each other, sleeping together and nursing; play and friction; coat inheritance, growing up and carrying by the scruff; see `behavior.md` → "Several cats", "Sharing the bowl", "Kittens", "Doing things together", "Playing and squabbling" and "Bonds"). What's left here is the original proposal, with notes where the result differs. When a phase lands, move what it settles into `behavior.md` / `animation.md` / `platform-notes.md` and trim it from here.
 
 Catsor today runs exactly one `CatSim` in one overlay window. This design covers two things: running several cats at once, and making them aware of each other: greeting, grooming, playing, squabbling, and mother cats raising kittens.
 
@@ -40,7 +40,7 @@ mother = "Luna"        # must name another, non-kitten cat
 - `size` (optional, per cat) multiplies the global scale. Kittens default to `0.6`, adults to `1.0`. Every `CatSim` distance is already `× self.scale`, so a kitten is mostly a smaller cat plus different tuning.
 - Migration: the old top-level `coat` / `temperament` keys become `cats[0]`, named "Luna". An invalid `mother` (missing, a kitten, or itself) is ignored, like other invalid entries.
 - CLI `--coat/--temperament` apply to the first cat. A cap of **6 cats** keeps the per-cat window and render cost small.
-- **Coat inheritance:** "Add kitten" rolls a coat from the mother's (`Coat::inherit(&mother, seed)`). Kittens share her base colours, pattern and markings with random variation; a calico mother can have calico, tortie-ish or solid kittens. This is optional and only applies when the tray creates the kitten; a hand-written `coat` always wins.
+- **Coat inheritance:** "Add kitten" rolls a coat from the mother's (`Coat::inherit(&mother, seed)`). Kittens share her base colours, pattern and markings with random variation; a calico mother can have calico, tortie-ish or solid kittens. This is optional and only applies when the tray creates the kitten; a hand-written `coat` always wins. *(Done. The kitten's coat is stored as `litter:<seed>:<mother's coat id>`, so it follows a later change to a custom mother coat. Dilute (greyed) kittens turn up now and then.)*
 - Newly added cats walk in from the nearest screen edge rather than appearing in place.
 
 ## Kittens
@@ -50,7 +50,7 @@ Kitten tuning (on top of temperament, which they still have; default Playful):
 - Higher play drive, shorter attention span, frequent short naps (sleeps more often but wakes sooner).
 - Clumsier: pounces sometimes overshoot or end in a tumble (a brief BellyUp); faster cadence and a bouncier trot.
 - Tail held up more often; more curious about the other cats than adults are.
-- **Growing up** (opt-in, `grows_up = true`): size and tuning ease toward adult over real days (persisted birth date), and `kitten` turns off at the end. The mother bond stays.
+- **Growing up** (opt-in, `grows_up = true`): size and tuning ease toward adult over real days (persisted birth date), and `kitten` turns off at the end. The mother bond stays. *(Done over 30 days, toggled from the kitten's tray page. A kitten grows to the size of a grown cat, or stays at its `size` if that is already bigger.)*
 
 ## Following the cursor
 
@@ -106,7 +106,7 @@ These are in roughly ascending cost. Each is a new `Activity` variant (or a role
 
 - **Leash:** the kitten follows the cursor but stays within a leash radius of its mother. If she's too far, it trots over to her first, tail up.
 - **Watching over:** the mother tracks her kitten with her head while resting. If it strays past a larger radius, she gets up and fetches it (walks to it, nose boop, walks back with it following). *(Done without the nose boop, which comes with the greetings in phase 3.)*
-- **Carrying by the scruff** (stretch goal): if the kitten is very far, or asleep away from her, she picks it up by the scruff and carries it back. The kitten hangs limp from her mouth, with its chain anchored to her head node. This needs special handling for the render order and windows.
+- **Carrying by the scruff** (stretch goal): if the kitten is very far, or asleep away from her, she picks it up by the scruff and carries it back. The kitten hangs limp from her mouth, with its chain anchored to her head node. This needs special handling for the render order and windows. *(Done for a kitten asleep more than 1.3 leashes away, and for 35% of fetches of an awake roaming kitten. The kitten is anchored at her mouth rather than her head node. It is drawn in her window, under her, instead of restacking windows. She puts it down when she stops at her spot, or when a sprint, food, play or being shaken off interrupts.)*
 - **Grooming:** the mother grooms her kitten much more often than adults groom each other. The kitten squirms and escapes after a while (mild friction that costs no affection). *(The squirming isn't done.)*
 - **Nursing / naps:** when the mother lies on her side (DramaticFlop pose), her kittens curl into the curve of her belly. Awake kittens there knead (front paws alternating). *(Done for the mother lying down in any pose or asleep: the kitten kneads 6–12 s against her side, then naps there.)*
 - **Tail lure:** the mother flicks her tail on purpose to get the kitten to play. She tolerates tail pounces far longer than other adults do, and ends it with a gentle head boop. *(Done, the boop as a nose boop.)*
@@ -142,4 +142,4 @@ The Realistic temperament keeps the rule from `behavior.md`: social interactions
 2. **Awareness and kittens (done):** head tracking, tail-up, copying, startle; kitten tuning; the leash and the mother watching over her kitten; bonds with persistence.
 3. **Paired interactions (done):** nose boop, head bunt, sniff circle, grooming each other, sleeping together, nursing/kneading.
 4. **Play and friction (done):** tail stalk, chase, wrestle, zoomies spreading, laser competition, play escalation and puffing up, pestering, bowl friction, tail lure.
-5. **Stretch:** carrying by the scruff, growing up, coat inheritance.
+5. **Stretch (done):** carrying by the scruff, growing up, coat inheritance.

@@ -93,6 +93,12 @@ impl UserPrefs {
             if let Some(mother) = &cat.mother {
                 out.push_str(&format!("mother = \"{mother}\"\n"));
             }
+            if cat.grows_up {
+                out.push_str("grows_up = true\n");
+            }
+            if let Some(born) = cat.born {
+                out.push_str(&format!("born = {born}\n"));
+            }
         }
         out
     }
@@ -189,6 +195,16 @@ fn parse_cat_key(cat: &mut CatProfile, key: &str, val: &str) {
             }
         }
         "mother" => cat.mother = Some(val.to_string()).filter(|m| !m.is_empty()),
+        "grows_up" => {
+            if let Some(b) = parse_bool(val) {
+                cat.grows_up = b;
+            }
+        }
+        "born" => {
+            if let Ok(secs) = val.parse::<u64>() {
+                cat.born = Some(secs);
+            }
+        }
         _ => {}
     }
 }
@@ -351,6 +367,11 @@ mod tests {
                     Temperament::Aloof,
                 ),
                 kitten("Pip", "Luna"),
+                CatProfile {
+                    grows_up: true,
+                    born: Some(1_761_500_000),
+                    ..kitten("Nori", "Luna")
+                },
             ],
             scale: 1.35,
             follow_cursor: false,

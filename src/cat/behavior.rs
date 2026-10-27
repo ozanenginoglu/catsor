@@ -1,6 +1,6 @@
 use super::{
-    Activity, BODY_NODES, CatSim, FeedPreset, FeedingPhase, SocialKind, SocialRole, Temperament,
-    dist_to_segment, pounce_stretch, pounce_travel, smoothstep, wrap_angle,
+    Activity, BODY_NODES, CatSim, FeedPreset, FeedingPhase, Pose, SocialKind, SocialRole,
+    Temperament, dist_to_segment, pounce_stretch, pounce_travel, smoothstep, wrap_angle,
 };
 use glam::Vec2;
 
@@ -157,7 +157,7 @@ impl CatSim {
         self.update_paws(dt);
     }
 
-    fn advance_breathing(&mut self, dt: f32) {
+    pub(super) fn advance_breathing(&mut self, dt: f32) {
         // ~18 breaths/min asleep, ~18 on the back, ~22 resting awake
         let breath_freq = if self.activity == Activity::Sleeping {
             1.9
@@ -574,7 +574,10 @@ impl CatSim {
             || self.wake_anchor.is_some()
             || matches!(
                 self.activity,
-                Activity::StalkWiggle { .. } | Activity::Pouncing { .. } | Activity::Eating { .. }
+                Activity::StalkWiggle { .. }
+                    | Activity::Pouncing { .. }
+                    | Activity::Eating { .. }
+                    | Activity::Carried { .. }
             )
         {
             return None;
@@ -618,8 +621,10 @@ impl CatSim {
             _ => (104.0 * speed_mult, 152.0 * speed_mult),
         };
         // Kittens nap often but wake easily, and scamper along a little quicker for their size
+        // (less so as they grow up)
         let (nap_mult, light_sleep, scamper) = if self.kitten {
-            (0.6, 0.85, 1.08)
+            let y = self.youth;
+            (1.0 - 0.4 * y, 1.0 - 0.15 * y, 1.0 + 0.08 * y)
         } else {
             (1.0, 1.0, 1.0)
         };
@@ -1224,6 +1229,8 @@ impl CatSim {
                     self.activity = Activity::StandingIdle { timer: 0.0 };
                 }
             }
+            // Placed by `hang_from` instead of updated
+            Activity::Carried { .. } => {}
         }
     }
 
@@ -1472,7 +1479,7 @@ impl CatSim {
 
         if progress >= 1.0 {
             self.speed = 25.0 * self.scale;
-            if self.kitten && self.rand_f32() < 0.3 {
+            if self.kitten && self.rand_f32() < 0.3 * self.youth {
                 // Overshot it and tumbled over: a moment on its back before getting up
                 let side = self.rand_side();
                 self.curl_side = side;
@@ -1600,7 +1607,7 @@ impl CatSim {
         }
     }
 
-    fn blend_sleep_and_belly_roll(&mut self, dt: f32) {
+    pub(super) fn blend_sleep_and_belly_roll(&mut self, dt: f32) {
         let target_sleep_blend = if self.activity == Activity::Sleeping {
             1.0
         } else {
@@ -1680,7 +1687,7 @@ impl CatSim {
                 .neighbors
                 .iter()
                 .enumerate()
-                .filter(|&(i, _)| Some(i) != partner)
+                .filter(|&(i, n)| Some(i) != partner && n.pose != Pose::Carried)
             {
                 for p in [n.head, n.center] {
                     let away = head - p;
@@ -1833,6 +1840,7 @@ impl CatSim {
             Activity::Sniffing { dir, .. } => (1.45, 0.22 * dir),
             // Back arched (a little shorter seen from above), body bowed toward the other cat
             Activity::Standoff { .. } => (1.42, 0.16 * self.curl_side),
+            Activity::Carried { .. } => (1.30, 0.0),
             Activity::StandingUp { .. }
             | Activity::Walking
             | Activity::StandingIdle { .. }
@@ -1903,7 +1911,11 @@ impl CatSim {
             Temperament::Lazy => 0.55,
             Temperament::Aloof => 0.75,
             Temperament::Realistic => 0.45,
-        } * if self.kitten { 1.5 } else { 1.0 };
+        } * if self.kitten {
+            1.0 + 0.5 * self.youth
+        } else {
+            1.0
+        };
         self.next_quirk_timer -= dt * quirk_rate;
         if self.next_quirk_timer <= 0.0 {
             let roll = self.rand_f32();

@@ -134,8 +134,24 @@ pub fn bowl_window_dim(scale: f32) -> u16 {
 
 /// Renders the cat into `pixmap` where `window_origin` is the top-left screen coordinate of the window.
 pub fn render_cat(cat: &CatSim, pixmap: &mut PixmapMut, clip_mask: &mut Mask, window_origin: Vec2) {
-    pixmap.fill(Color::TRANSPARENT);
+    render_cats([cat], pixmap, clip_mask, window_origin);
+}
 
+/// Renders several cats into one window, each over the ones before it (a mother over the
+/// kitten she carries)
+pub fn render_cats<'a>(
+    cats: impl IntoIterator<Item = &'a CatSim>,
+    pixmap: &mut PixmapMut,
+    clip_mask: &mut Mask,
+    window_origin: Vec2,
+) {
+    pixmap.fill(Color::TRANSPARENT);
+    for cat in cats {
+        draw_cat(cat, pixmap, clip_mask, window_origin);
+    }
+}
+
+fn draw_cat(cat: &CatSim, pixmap: &mut PixmapMut, clip_mask: &mut Mask, window_origin: Vec2) {
     let s = cat.scale;
     let pal = Palette::for_coat(&cat.coat);
 

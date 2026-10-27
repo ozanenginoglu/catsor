@@ -768,9 +768,11 @@ impl CatSim {
 
     /// Eyes shut in contentment: kneading, or being groomed
     pub fn blissful(&self) -> bool {
-        matches!(self.activity, Activity::Kneading { .. })
-            || self.social.is_some_and(|e| {
-                e.kind == SocialKind::Groom && e.role == SocialRole::Passive && e.acting
-            })
+        matches!(
+            self.activity,
+            Activity::Kneading { .. } | Activity::Carried { .. }
+        ) || self.social.is_some_and(|e| {
+            e.kind == SocialKind::Groom && e.role == SocialRole::Passive && e.acting
+        })
     }
 }

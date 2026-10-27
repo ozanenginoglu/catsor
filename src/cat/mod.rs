@@ -176,6 +176,8 @@ pub enum Pose {
     Sleeping,
     /// Busy with something that holds its attention (eating, hunting, chasing its tail)
     Busy,
+    /// Hanging from its mother's mouth
+    Carried,
 }
 
 impl Pose {
@@ -203,6 +205,7 @@ impl Pose {
             | Activity::GroomingOther { .. }
             | Activity::Standoff { .. } => Self::Busy,
             Activity::Kneading { .. } => Self::Lying,
+            Activity::Carried { .. } => Self::Carried,
         }
     }
 
@@ -405,6 +408,12 @@ pub enum Activity {
     Standoff {
         timer: f32,
         duration: f32,
+    },
+    /// A kitten hanging limp by the scruff from its mother's mouth, eyes shut. `side` is the
+    /// side of her its body hangs to; `asleep` is whether it was asleep when she picked it up
+    Carried {
+        side: f32,
+        asleep: bool,
     },
 }
 
@@ -740,12 +749,20 @@ pub struct CatSim {
     /// Another cat has the laser dot: this one only watches it, tail twitching. Set by
     /// `Clowder`
     pub(crate) laser_rival: bool,
+    /// For a kitten, how much of a kitten's ways it still has (1, easing to 0 as it grows up)
+    pub(crate) youth: f32,
+    /// A mother with her kitten in her mouth: she holds her head straight. Set by `Clowder`
+    pub(crate) carrying: bool,
+    /// Where the mother's mouth was last tick, while this kitten is `Carried`
+    hang_mouth: Vec2,
 }
 
 impl CatSim {
     /// Rest lengths between consecutive body nodes (0..5) in unscaled standing pose.
     /// Total body length (head center to tail base) is ~38px at scale 1.0.
     const STANDING_BODY_LENGTHS: [f32; BODY_NODES - 1] = [6.2, 7.6, 8.8, 8.2, 6.8];
+    /// How far (unscaled px) ahead of the head's centre the mouth is
+    const MOUTH_REACH: f32 = 7.0;
     /// Distance from the waist node to the food bowl centre in the eating pose (unscaled)
     pub const BOWL_REACH: f32 = 27.2;
     /// How far (unscaled px) from the shared bowl a cat waiting for its turn sits
@@ -910,6 +927,9 @@ impl CatSim {
             retreat: None,
             swat_return: None,
             laser_rival: false,
+            youth: 1.0,
+            carrying: false,
+            hang_mouth: Vec2::ZERO,
         }
     }
 

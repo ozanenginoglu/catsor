@@ -1,5 +1,5 @@
 use crate::autostart;
-use crate::cat::clowder::Clowder;
+use crate::cat::clowder::{Clowder, unix_now};
 use crate::cat::{Activity, FeedPreset, Temperament};
 use crate::coat::{Coat, CoatId, CoatLibrary, fresh_seed};
 use crate::prefs::UserPrefs;
@@ -40,6 +40,8 @@ pub struct TrayCat {
     pub coat: Coat,
     pub temperament: Temperament,
     pub kitten: bool,
+    /// For a kitten that grows up, the days left until it's grown
+    pub days_to_grow: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -70,6 +72,7 @@ impl TrayState {
                     coat: m.cat.coat.clone(),
                     temperament: m.cat.behaviors.temperament,
                     kitten: m.kitten,
+                    days_to_grow: m.days_to_grow(),
                 })
                 .collect(),
             can_add: clowder.can_add(),
@@ -148,6 +151,8 @@ pub enum TrayAction {
     AddCat,
     /// Add a kitten to a grown cat
     AddKitten(usize),
+    /// Let a kitten grow up, or stop it growing
+    ToggleGrowsUp(usize),
     RemoveCat(usize),
     ToggleFollowCursor,
     TogglePlayfulQuirks,
@@ -203,6 +208,11 @@ pub(crate) fn apply_shared_action(
         TrayAction::AddKitten(mother) => {
             clowder.add_kitten(mother);
         }
+        TrayAction::ToggleGrowsUp(i) if valid(i) => {
+            let on = clowder.members()[i].days_to_grow().is_none();
+            clowder.set_grows_up(i, on);
+            clowder.grow(unix_now());
+        }
         TrayAction::RemoveCat(i) => {
             clowder.remove(i);
         }
@@ -218,7 +228,8 @@ pub(crate) fn apply_shared_action(
         | TrayAction::ShowMain
         | TrayAction::NextCoat(_)
         | TrayAction::RandomCoat(_)
-        | TrayAction::SetTemperament(..) => return None,
+        | TrayAction::SetTemperament(..)
+        | TrayAction::ToggleGrowsUp(_) => return None,
         TrayAction::ToggleStartOnLogin => {
             if let Err(e) = autostart::set_enabled(!*start_on_login) {
                 eprintln!("catsor: failed to update start on login: {e}");
@@ -1050,6 +1061,19 @@ fn cat_rows(state: &TrayState, i: usize) -> Vec<MenuRow> {
         indicator: Indicator::Cycle(None),
         close_on_click: false,
     });
+    if cat.kitten {
+        let label = match cat.days_to_grow {
+            Some(1) => Cow::Borrowed("Grows Up (1 day left)"),
+            Some(days) => Cow::Owned(format!("Grows Up ({days} days left)")),
+            None => Cow::Borrowed("Grows Up"),
+        };
+        rows.push(MenuRow::Item {
+            label,
+            action: TrayAction::ToggleGrowsUp(i),
+            indicator: Indicator::Checkbox(cat.days_to_grow.is_some()),
+            close_on_click: false,
+        });
+    }
     if !cat.kitten && state.can_add {
         rows.push(MenuRow::Item {
             label: Cow::Borrowed("Add Kitten"),
@@ -1850,6 +1874,7 @@ mod tests {
             coat,
             temperament: Temperament::Balanced,
             kitten,
+            days_to_grow: None,
         }
     }
 
@@ -1964,6 +1989,7 @@ mod tests {
                     | TrayAction::SetTemperament(..)
                     | TrayAction::AddCat
                     | TrayAction::AddKitten(_)
+                    | TrayAction::ToggleGrowsUp(_)
                     | TrayAction::RemoveCat(_)
                     | TrayAction::ToggleHidden
                     | TrayAction::ToggleStartOnLogin
@@ -1995,6 +2021,14 @@ mod tests {
         let kitten_page = actions(&state, MenuPage::Cat(1));
         assert!(!kitten_page.contains(&TrayAction::AddKitten(1)));
         assert!(kitten_page.contains(&TrayAction::RemoveCat(1)));
+        // Only a kitten can grow up; its page says how long it has left
+        assert!(kitten_page.contains(&TrayAction::ToggleGrowsUp(1)));
+        assert!(!actions(&state, MenuPage::Cat(0)).contains(&TrayAction::ToggleGrowsUp(0)));
+        state.cats[1].days_to_grow = Some(12);
+        assert_eq!(
+            label_of(&state, MenuPage::Cat(1), TrayAction::ToggleGrowsUp(1)),
+            "Grows Up (12 days left)"
+        );
         assert!(label_of(&state, MenuPage::Main, TrayAction::OpenCat(1)).contains("kitten"));
         state.can_add = false;
         assert!(!actions(&state, MenuPage::Main).contains(&TrayAction::AddCat));

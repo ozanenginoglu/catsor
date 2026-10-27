@@ -27,6 +27,8 @@ impl CatSim {
             self.ear_right_twitch = self.ear_right_twitch.min(flat);
         }
         let desired_yaw = match self.activity {
+            // Holding her kitten up off the ground, head straight
+            _ if self.carrying => 0.0,
             Activity::Sleeping => self.curl_side * 2.38 + (self.time * 1.2).sin() * 0.02,
             Activity::BellyUp { side, timer } => -side * 0.22 + (timer * 1.6).sin() * 0.12,
             Activity::Grooming { side, timer, .. } => {
@@ -376,6 +378,8 @@ impl CatSim {
             ),
             Activity::StandingUp { .. } | Activity::StandingIdle { .. } => (0.12, 1.35, 0.0),
             Activity::Standoff { .. } => (0.08, 1.0, 0.0),
+            // Hanging limp, swinging a little
+            Activity::Carried { side, .. } => (0.06, 0.7, side * 0.25),
         };
         // Lashing: wide, quick sweeps (and out from round the paws, for a kitten to pounce on)
         let (sway_amp, sway_speed) = if self.tail_lash > 0.0 {
@@ -502,12 +506,9 @@ impl CatSim {
         self.swing_fraction += (target_swing - self.swing_fraction).clamp(-max_shift, max_shift);
     }
 
-    /// Updates 4 world-planted paws following the current `Gait` pattern: 4-beat walk
-    /// (`LH -> LF -> RH -> RF`), 2-beat diagonal trot (`LF+RH` vs `RF+LH`), or rotary gallop.
-    pub(super) fn update_paws(&mut self, dt: f32) {
+    /// The shoulder and hip sockets `[LF, RF, LH, RH]`, and the forward direction of each
+    fn paw_sockets(&self) -> ([Vec2; 4], [Vec2; 4]) {
         let s = self.scale;
-        self.update_gait_pattern();
-
         let shoulder_pos = self.nodes[2];
         let hip_pos = self.nodes[4];
         let fwd_sh = (self.nodes[1] - self.nodes[2]).normalize_or_zero();
@@ -525,7 +526,123 @@ impl CatSim {
             hip_pos + fwd_hip * (Self::HIND_SOCKET_FWD * s) + side_hip * (Self::HIND_TRACK * s),
             hip_pos + fwd_hip * (Self::HIND_SOCKET_FWD * s) - side_hip * (Self::HIND_TRACK * s),
         ];
-        let forwards = [fwd_sh, fwd_sh, fwd_hip, fwd_hip];
+        (sockets, [fwd_sh, fwd_sh, fwd_hip, fwd_hip])
+    }
+
+    /// Where a cat holds something in its mouth (a kitten by the scruff), and which way it faces
+    pub(crate) fn mouth(&self) -> (Vec2, f32) {
+        let facing = self.body_angle + self.head_yaw;
+        (
+            self.nodes[0] + Vec2::from_angle(facing) * (Self::MOUTH_REACH * self.scale),
+            facing,
+        )
+    }
+
+    /// Picked up by the scruff in a mother's mouth at `mouth`, the body hanging to `side` of
+    /// her. Whatever the kitten was doing stops, roaming included.
+    pub(crate) fn pick_up(&mut self, mouth: Vec2, side: f32) {
+        let asleep = self.activity == Activity::Sleeping;
+        self.reset_sprint();
+        self.roaming = false;
+        self.roam_going = false;
+        self.leashed = false;
+        self.wake_anchor = None;
+        self.retreat = None;
+        self.swat_return = None;
+        self.speed = 0.0;
+        self.angular_vel = 0.0;
+        self.gallop_weight = 0.0;
+        self.hang_mouth = mouth;
+        self.activity = Activity::Carried { side, asleep };
+    }
+
+    /// Hangs limp from the mouth at `mouth` of a mother facing `facing`: scruff in her mouth,
+    /// head dangling out in front of it, body and tail down along her side, paws hanging.
+    /// Stands in for `update` while carried.
+    pub(crate) fn hang_from(&mut self, mouth: Vec2, facing: f32, cursor: Vec2, dt: f32) {
+        let Activity::Carried { side, .. } = self.activity else {
+            return;
+        };
+        let dt = dt.clamp(0.001, 0.05);
+        self.time += dt;
+        self.advance_breathing(dt);
+        self.raw_cursor = cursor;
+        self.smooth_cursor = cursor;
+        self.cursor_speed = 0.0;
+
+        // Carried along with the mouth, then eased into the hanging shape (lifted, at first)
+        let moved = mouth - self.hang_mouth;
+        self.hang_mouth = mouth;
+        for node in &mut self.nodes {
+            *node += moved;
+        }
+        let s = self.scale;
+        let swing = (self.time * 2.6).sin() * 0.08;
+        // The body hangs out to her side, the head droops forward past her nose
+        let hang = facing + std::f32::consts::PI - side * 1.55 + swing;
+        let mut target = [mouth; BODY_NODES];
+        target[0] = mouth
+            + Vec2::from_angle(facing + side * 0.3 + swing) * (Self::STANDING_BODY_LENGTHS[0] * s);
+        for i in 2..BODY_NODES {
+            // Limp, the hind end curling a little forward
+            let angle = hang - side * 0.18 * (i - 1) as f32;
+            target[i] = target[i - 1]
+                + Vec2::from_angle(angle) * (Self::STANDING_BODY_LENGTHS[i - 1] * 0.9 * s);
+        }
+        let rate = 1.0 - (-dt * 12.0).exp();
+        for (node, target) in self.nodes.iter_mut().zip(target) {
+            *node = node.lerp(target, rate);
+        }
+
+        let back = self.nodes[1] - self.nodes[2];
+        self.body_angle = back.y.atan2(back.x);
+        let neck = self.nodes[0] - self.nodes[1];
+        let yaw = wrap_angle(neck.y.atan2(neck.x) - self.body_angle)
+            .clamp(-Self::MAX_HEAD_YAW, Self::MAX_HEAD_YAW);
+        self.head_yaw += wrap_angle(yaw - self.head_yaw) * rate;
+        self.carrier_nodes
+            .copy_from_slice(&self.nodes[..BODY_NODES]);
+        self.window_anchor = self.nodes[3];
+        self.prev_head_offset = Vec2::ZERO;
+        self.blend_sleep_and_belly_roll(dt);
+        self.solve_tail(dt, 0.0);
+
+        // Legs dangling straight down: seen from above, each paw is under its socket
+        let (sockets, _) = self.paw_sockets();
+        for (paw, socket) in self.paws.iter_mut().zip(sockets) {
+            paw.world_pos = socket;
+            paw.swing_progress = 0.0;
+            paw.limb_phase = -1.0;
+            paw.prev_socket = socket;
+            paw.socket_vel = Vec2::ZERO;
+        }
+    }
+
+    /// Set down by its mother where it hangs: asleep if it was, otherwise sitting up
+    pub(crate) fn put_down(&mut self) {
+        let Activity::Carried { asleep, .. } = self.activity else {
+            return;
+        };
+        self.activity = if asleep {
+            Activity::Sleeping
+        } else {
+            Activity::Sitting
+        };
+        let chord = self.nodes[0] - self.nodes[3];
+        self.body_angle = chord.y.atan2(chord.x);
+        self.carrier_nodes
+            .copy_from_slice(&self.nodes[..BODY_NODES]);
+        self.window_anchor = self.nodes[3];
+        self.idle_time = 0.0;
+    }
+
+    /// Updates 4 world-planted paws following the current `Gait` pattern: 4-beat walk
+    /// (`LH -> LF -> RH -> RF`), 2-beat diagonal trot (`LF+RH` vs `RF+LH`), or rotary gallop.
+    pub(super) fn update_paws(&mut self, dt: f32) {
+        let s = self.scale;
+        self.update_gait_pattern();
+
+        let (sockets, forwards) = self.paw_sockets();
 
         let swing_window = self.swing_fraction;
         // While a paw is planted the body travels `stance fraction × stride` over it, so landing half

@@ -193,10 +193,16 @@ pub enum CoatId {
     /// A coat from `coats.toml`, by name
     Custom(Arc<str>),
     Random(u32),
+    /// A kitten's coat rolled from its mother's (`parent`) with `seed`, see [`Coat::inherit`]
+    Litter {
+        seed: u32,
+        parent: Box<CoatId>,
+    },
 }
 
 impl CoatId {
-    /// `calico`, a custom coat's name, `random:<8 hex digits>`, or `random` for a fresh roll
+    /// `calico`, a custom coat's name, `random:<8 hex digits>`, `random` for a fresh roll, or
+    /// `litter:<8 hex digits>:<the mother's coat>`
     pub fn parse(s: &str) -> Option<Self> {
         let s = s.trim();
         if s.is_empty() {
@@ -213,6 +219,14 @@ impl CoatId {
         {
             return u32::from_str_radix(hex.trim(), 16).ok().map(CoatId::Random);
         }
+        if let Some((prefix, rest)) = s.split_once(':')
+            && prefix.eq_ignore_ascii_case("litter")
+        {
+            let (hex, parent) = rest.split_once(':')?;
+            let seed = u32::from_str_radix(hex.trim(), 16).ok()?;
+            let parent = Box::new(CoatId::parse(parent)?);
+            return Some(CoatId::Litter { seed, parent });
+        }
         Some(CoatId::Custom(s.into()))
     }
 
@@ -221,6 +235,9 @@ impl CoatId {
             CoatId::Builtin(style) => style.as_config_str().to_string(),
             CoatId::Custom(name) => name.to_string(),
             CoatId::Random(seed) => format!("random:{seed:08x}"),
+            CoatId::Litter { seed, parent } => {
+                format!("litter:{seed:08x}:{}", parent.to_config_string())
+            }
         }
     }
 }
@@ -680,6 +697,98 @@ impl Coat {
             coat.tail_rings = Some(tabby_base.scale(0.78).with_alpha(235));
         } else if pattern == Pattern::Calico {
             // Bicolors keep a plain tail in their colour
+            coat.tail_rings = None;
+        }
+        coat
+    }
+
+    /// A kitten's coat, rolled from its mother's with `seed`. Like `random`, it follows
+    /// simplified cat colour genetics: the kitten gets her colours (orange, a dark colour, or
+    /// both as a tortoiseshell; now and then their dilute, paler versions) and about as much
+    /// white as she has. So a calico mother can have calico, tortie or solid kittens, and a
+    /// tuxedo mother tuxedo, solid or bicolor ones. Every colour varies a little
+    pub fn inherit(mother: &Coat, seed: u32) -> Self {
+        let mut rng = SeedRng::new(seed ^ 0x1177_e500);
+        let whiteish = |c: Rgba8| c.luma() > 0.75;
+        // Her pigments (orange, dark) and amount of white spotting (0 none, 1 tuxedo, 2 bicolor)
+        let (orange, dark, white, spotting): (Option<Rgba8>, Option<Rgba8>, Option<Rgba8>, u8) =
+            match mother.pattern {
+                Pattern::Solid if whiteish(mother.base) => (None, None, Some(mother.base), 0),
+                Pattern::Solid if mother.tail_rings.is_some() => (Some(mother.base), None, None, 0),
+                Pattern::Solid => (None, Some(mother.base), None, 0),
+                Pattern::Tuxedo => {
+                    let orange = (mother.spot != mother.patch.mix(WHITE, 0.15)
+                        && mother.spot.r > mother.spot.b.saturating_add(40))
+                    .then_some(mother.spot);
+                    (orange, Some(mother.patch), Some(mother.base), 1)
+                }
+                Pattern::Calico if whiteish(mother.base) => {
+                    let ringed = mother.tail_rings.is_some();
+                    let two = mother.spot.luma() < mother.patch.luma() - 0.15;
+                    match (ringed, two) {
+                        (_, true) => (Some(mother.patch), Some(mother.spot), Some(mother.base), 2),
+                        (true, false) => (Some(mother.patch), None, Some(mother.base), 2),
+                        (false, false) => (None, Some(mother.patch), Some(mother.base), 2),
+                    }
+                }
+                // A tortie: dark with orange, no white
+                Pattern::Calico => (Some(mother.patch), Some(mother.base), None, 0),
+            };
+        let white = rng.jitter_light(white.unwrap_or(rgb(240, 238, 234)));
+        let dilute = rng.chance(0.12);
+        let pale = |c: Rgba8| {
+            if dilute {
+                c.mix(rgb(200, 196, 196), 0.45)
+            } else {
+                c
+            }
+        };
+        let orange = orange.map(|c| rng.jitter(pale(c)));
+        let dark = dark.map(|c| rng.jitter(pale(c)));
+        // A tortoiseshell mother passes on both colours, or one of them
+        let (orange, dark) = match (orange, dark) {
+            (Some(o), Some(d)) => match rng.unit() {
+                u if u < 0.45 => (Some(o), Some(d)),
+                u if u < 0.75 => (Some(o), None),
+                _ => (None, Some(d)),
+            },
+            pair => pair,
+        };
+        // About as much white as she has, sometimes more or less
+        let spotting = match rng.unit() {
+            u if u < 0.5 => spotting,
+            u if u < 0.7 => (spotting + 1).min(2),
+            u if u < 0.88 => spotting.saturating_sub(1),
+            _ => spotting.saturating_sub(2),
+        };
+        let (pattern, base, patch, spot) = match (orange, dark, spotting) {
+            (None, None, _) => (Pattern::Solid, white, None, None),
+            (Some(o), Some(d), 0) => (Pattern::Calico, d, Some(o), Some(o.mix(d, 0.5))),
+            (Some(o), Some(d), 1) => (Pattern::Tuxedo, white, Some(d), Some(o)),
+            (Some(o), Some(d), _) => (Pattern::Calico, white, Some(o), Some(d)),
+            (Some(c), None, 0) | (None, Some(c), 0) => (Pattern::Solid, c, None, None),
+            (Some(c), None, 1) | (None, Some(c), 1) => (Pattern::Tuxedo, white, Some(c), None),
+            (Some(c), None, _) | (None, Some(c), _) => {
+                (Pattern::Calico, white, Some(c), Some(c.scale(0.9)))
+            }
+        };
+        let mut coat = Coat::derived(
+            CoatId::Litter {
+                seed,
+                parent: Box::new(mother.id.clone()),
+            },
+            format!("{} kitten", mother.name).into(),
+            pattern,
+            base,
+            patch,
+            spot,
+        );
+        // Orange fur always carries tabby rings on the tail; bicolors keep a plain one
+        if let Some(o) = orange
+            && (coat.tail == o || pattern == Pattern::Solid)
+        {
+            coat.tail_rings = Some(o.scale(0.78).with_alpha(235));
+        } else if pattern == Pattern::Calico && base == white {
             coat.tail_rings = None;
         }
         coat
@@ -1215,6 +1324,7 @@ impl CoatLibrary {
         match id {
             CoatId::Builtin(style) => Some(Coat::builtin(*style)),
             CoatId::Random(seed) => Some(Coat::random(*seed)),
+            CoatId::Litter { seed, parent } => Some(Coat::inherit(&self.find(parent)?, *seed)),
             CoatId::Custom(name) => self
                 .custom
                 .iter()
@@ -1509,11 +1619,55 @@ mod tests {
     }
 
     #[test]
+    fn kittens_take_after_their_mother() {
+        let litter = |mother: &Coat| -> Vec<Coat> {
+            (0..300).map(|seed| Coat::inherit(mother, seed)).collect()
+        };
+        let patterns = |kittens: &[Coat]| {
+            Pattern::ALL.map(|p| kittens.iter().filter(|k| k.pattern == p).count())
+        };
+        // A calico can have calico (and tortie), tuxedo and solid kittens; mostly patterned
+        let calico = litter(&Coat::builtin(CoatStyle::Calico));
+        let [solid, calicos, tuxedos] = patterns(&calico);
+        assert!(
+            solid > 10 && calicos > 100 && tuxedos > 20,
+            "{solid} {calicos} {tuxedos}"
+        );
+        // A solid brown mother has brown kittens, some with white
+        let brown = Coat::builtin(CoatStyle::Brown);
+        let kittens = litter(&brown);
+        assert!(kittens.iter().all(|k| {
+            let main = if k.pattern == Pattern::Solid {
+                k.base
+            } else {
+                k.patch
+            };
+            let d = |a: u8, b: u8| (a as i32 - b as i32).abs();
+            // Within reach of her brown, or its dilute
+            d(main.r, brown.base.r) < 70 && d(main.b, brown.base.b) < 70
+        }));
+        assert!(patterns(&kittens)[0] > 150);
+        // The same seed gives the same kitten, which remembers whose it is
+        let kitten = Coat::inherit(&brown, 42);
+        assert_eq!(kitten, Coat::inherit(&brown, 42));
+        let lib = CoatLibrary::from_toml("");
+        assert_eq!(lib.find(&kitten.id), Some(kitten.clone()));
+        assert_eq!(kitten.name.as_ref(), "Brown kitten");
+    }
+
+    #[test]
     fn coat_ids_roundtrip_through_config_strings() {
         for id in [
             CoatId::Builtin(CoatStyle::Tuxedo),
             CoatId::Custom("Marmalade".into()),
             CoatId::Random(0x0012_abcd),
+            CoatId::Litter {
+                seed: 0x00be_ef01,
+                parent: Box::new(CoatId::Litter {
+                    seed: 7,
+                    parent: Box::new(CoatId::Custom("Marmalade".into())),
+                }),
+            },
         ] {
             assert_eq!(CoatId::parse(&id.to_config_string()), Some(id));
         }

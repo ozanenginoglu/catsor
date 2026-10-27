@@ -88,7 +88,8 @@ A cat's page (**Back** returns to the main page):
 | **Random Coat** | Rolls a new random coat (see below) |
 | **Design Coat...** | Opens the [coat designer](#coat-designer) for this cat |
 | **Temperament** | Click to cycle Balanced → Playful → Lazy → Aloof → Realistic (see [behavior.md](docs/behavior.md#temperaments)) |
-| **Add Kitten** | Grown cats only: adds a smaller, Playful kitten with this cat as its mother. It walks in behind her |
+| **Add Kitten** | Grown cats only: adds a smaller, Playful kitten with this cat as its mother, with a coat that takes after hers. It walks in behind her |
+| **Grows Up** | Kittens only: the kitten grows into a grown cat over 30 days (shows how many are left). Off by default |
 | **Remove** | Sends the cat away (shown while there's more than one cat) |
 
 ### Things to try
@@ -98,7 +99,7 @@ A cat's page (**Back** returns to the main page):
 - **Shake the mouse right over the cat** to shoo it off. It goes its own way: it wanders around the screen, naps, and keeps away from the cursor. Shake the mouse again (anywhere) to call it back. It gallops over and goes back to following you.
 - **Turn off Follow Cursor** in the tray menu and the cat roams the same way, until you turn it back on.
 - **Leave it alone.** It sits, then lies down, then curls up and sleeps.
-- **Add a second cat** (or a kitten). Each cat finds its own spot round the cursor, and they keep out of each other's way. They watch each other, hold their tails up for friends, and grow fond of each other the more time they spend together. Shake a kitten off and watch its mother fetch it back. Leave them be and they greet each other (strangers sniff each other round in a circle; friends rub against each other), groom each other, curl up together to sleep, and a kitten comes to knead and nap against its mother.
+- **Add a second cat** (or a kitten). Each cat finds its own spot round the cursor, and they keep out of each other's way. They watch each other, hold their tails up for friends, and grow fond of each other the more time they spend together. Shake a kitten off and watch its mother fetch it back, sometimes carrying it by the scruff. Let a kitten fall asleep, then lead its mother far away: she goes back for it and carries it over, limp in her mouth. Leave them be and they greet each other (strangers sniff each other round in a circle; friends rub against each other), groom each other, curl up together to sleep, and a kitten comes to knead and nap against its mother.
 - **Let them play** (with Playful Hunting on). Kittens and Playful cats chase each other round the cursor, wrestle, and pounce on each other's tails; a mother twitches her tail for her kitten to pounce on. A grown cat pestered by a kitten soon swats it or walks off, play that gets too rough ends with one puffed up in a short standoff before both groom it off, and one cat's zoomies set off its friends. Wiggle the laser dot at several cats and only one gets to hunt it; the others twitch their tails, and a kitten may go for the winner's tail instead. At the bowl, a pushy cat may push in beside the one eating, which gives way or swats it.
 
 ### Feeding mode (keep-awake)
@@ -134,20 +135,22 @@ temperament = "balanced"
 
 [[cat]]
 name = "Pip"
-coat = "random:00c0ffee"
+coat = "litter:00c0ffee:calico"
 temperament = "playful"
 size = 0.60
 kitten = true
 mother = "Luna"
+grows_up = true
+born = 1793099157
 ```
 
 Lines that are unknown or invalid are skipped, and the default is used for those settings. Feeding sessions and hide/show are not saved; they reset when Catsor restarts.
 
-Each `[[cat]]` table is one cat, up to 6. `name` identifies the cat and must be unique. `size` (optional, 0.4–1.5) multiplies `scale`; kittens added from the tray get 0.6. `mother` must name another cat that isn't a kitten, otherwise it's ignored. A kitten's mother lets it eat first. Kittens nap often but briefly, play more, and stay close to their mother; if one wanders off, its mother goes and fetches it. A config from an older version, with `coat` and `temperament` at the top level, is read as a single cat named Luna.
+Each `[[cat]]` table is one cat, up to 6. `name` identifies the cat and must be unique. `size` (optional, 0.4–1.5) multiplies `scale`; kittens added from the tray get 0.6. `mother` must name another cat that isn't a kitten, otherwise it's ignored. A kitten's mother lets it eat first. Kittens nap often but briefly, play more, and stay close to their mother; if one wanders off, its mother goes and fetches it. With `grows_up = true` a kitten grows into a grown cat over 30 days from `born` (Unix seconds, filled in for you), and then stops being a kitten but keeps its mother. A config from an older version, with `coat` and `temperament` at the top level, is read as a single cat named Luna.
 
 How well the cats know and like each other is kept in `bonds.toml` in the same directory, so friendships carry across restarts.
 
-`coat` is a built-in coat, the name of a custom coat, or `random:<seed>` for a random coat, so the same random cat comes back after a restart.
+`coat` is a built-in coat, the name of a custom coat, or `random:<seed>` for a random coat, so the same random cat comes back after a restart. A kitten added from the tray gets `litter:<seed>:<mother's coat>`, a coat rolled from its mother's: her colours, about as much white as she has, and now and then a diluted, greyer kitten.
 
 ### Random coats
 

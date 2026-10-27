@@ -1,6 +1,7 @@
 //! Several cats at once (a group of cats is a "clowder"). `Clowder` owns every `CatSim`, tells
 //! each one where the others are and what they are to it, keeps track of how well each pair
-//! gets on (`Bonds`), sends a mother to fetch a kitten that wandered off, and runs the shared
+//! gets on (`Bonds`), sends a mother to fetch a kitten that wandered off (and sometimes carry it
+//! back by the scruff), and runs the shared
 //! food bowl: one cat eats at a time while the rest sit nearby and wait their turn, kittens
 //! first.
 
@@ -22,6 +23,17 @@ const TURN_SECS: f32 = 150.0;
 /// How far (unscaled px, times the mother's scale) a kitten that wandered off can get before
 /// its mother goes and fetches it
 const FETCH_RADIUS: f32 = 240.0;
+/// How far from her (times the leash) a kitten asleep on its own can be before its mother goes
+/// and carries it back
+const STRANDED_LEASH: f32 = 1.3;
+/// How likely a mother who reaches her kitten that is awake carries it back rather than calling
+/// it along
+const CARRY_CHANCE: f32 = 0.35;
+/// Longest (seconds) a mother carries her kitten before putting it down
+const CARRY_SECS: f32 = 30.0;
+/// How long (seconds) lifting a kitten into the carrying hold takes; until then it is still
+/// drawn in its own window
+const LIFT_SECS: f32 = 0.4;
 /// How often (seconds) the bonds are written to disk
 const BONDS_SAVE_SECS: f32 = 300.0;
 /// How often (seconds) `Clowder` looks for two cats to do something together
@@ -33,6 +45,17 @@ const PLAY_REST: f32 = 25.0;
 const SQUABBLE_REST: f32 = 120.0;
 /// How long (seconds) the cat that got the laser dot keeps it after it last crouched or leapt
 const LASER_HOLD: f32 = 3.0;
+/// How many days a kitten that grows up takes to become a grown cat
+pub const GROW_UP_DAYS: f32 = 30.0;
+/// The size a kitten grows to (unless it was already bigger)
+const GROWN_SIZE: f32 = 1.0;
+
+/// Seconds since the Unix epoch, for kittens' birth dates
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
 
 /// Names handed to cats added from the tray, in order, skipping names already in use
 const NAMES: [&str; 12] = [
@@ -60,8 +83,14 @@ pub struct CatProfile {
     /// Size relative to the tray's Size (the global scale)
     pub size: f32,
     pub kitten: bool,
-    /// The name of this kitten's mother: another cat that isn't a kitten itself
+    /// The name of this cat's mother: another cat that isn't a kitten itself. A kitten that
+    /// grew up keeps her
     pub mother: Option<String>,
+    /// A kitten that grows into a grown cat over `GROW_UP_DAYS` from `born`
+    pub grows_up: bool,
+    /// When a growing kitten was born (seconds since the Unix epoch); set the first time it
+    /// grows
+    pub born: Option<u64>,
 }
 
 impl CatProfile {
@@ -73,6 +102,8 @@ impl CatProfile {
             size: 1.0,
             kitten: false,
             mother: None,
+            grows_up: false,
+            born: None,
         }
     }
 
@@ -93,11 +124,27 @@ pub struct Member {
     pub size: f32,
     pub kitten: bool,
     pub mother: Option<String>,
+    pub grows_up: bool,
+    pub born: Option<u64>,
+    /// How far a growing kitten has grown (0–1), easing its size from `size` toward grown
+    growth: f32,
     pub cat: CatSim,
     /// The kitten (index) this mother is on her way to fetch
     fetching: Option<usize>,
     /// The cat (index) this one is doing something with
     partner: Option<usize>,
+    /// The kitten this mother has in her mouth
+    carry: Option<Carry>,
+}
+
+/// A mother carrying her kitten back by the scruff
+#[derive(Debug, Clone, Copy)]
+struct Carry {
+    kitten: usize,
+    /// How long she has been carrying it
+    time: f32,
+    /// Whether she has set off with it yet
+    walked: bool,
 }
 
 impl Member {
@@ -109,7 +156,20 @@ impl Member {
             size: self.size,
             kitten: self.kitten,
             mother: self.mother.clone(),
+            grows_up: self.grows_up,
+            born: self.born,
         }
+    }
+
+    /// Its size now: `size`, or for a growing kitten, partway to grown
+    fn current_size(&self) -> f32 {
+        self.size + (self.size.max(GROWN_SIZE) - self.size) * self.growth
+    }
+
+    /// Days left before a growing kitten is grown
+    pub fn days_to_grow(&self) -> Option<u32> {
+        (self.kitten && self.grows_up)
+            .then(|| ((1.0 - self.growth) * GROW_UP_DAYS).ceil().max(0.0) as u32)
     }
 }
 
@@ -219,9 +279,13 @@ impl Clowder {
             size,
             kitten: profile.kitten,
             mother: profile.mother,
+            grows_up: profile.grows_up && profile.kitten,
+            born: profile.born,
+            growth: 0.0,
             cat,
             fetching: None,
             partner: None,
+            carry: None,
         });
         self.members.len() - 1
     }
@@ -235,7 +299,7 @@ impl Clowder {
             let valid = self
                 .index_of(&mother)
                 .is_some_and(|m| m != i && !self.members[m].kitten);
-            if !valid || !self.members[i].kitten {
+            if !valid {
                 self.members[i].mother = None;
             }
         }
@@ -298,8 +362,55 @@ impl Clowder {
     pub fn set_scale(&mut self, scale: f32) {
         self.scale = scale;
         for m in &mut self.members {
-            m.cat.set_scale(scale * m.size);
+            m.cat.set_scale(scale * m.current_size());
         }
+    }
+
+    /// Grows the kittens that grow up, at `now` (seconds since the Unix epoch): each eases
+    /// toward a grown cat's size and ways, and stops being a kitten once `GROW_UP_DAYS` have
+    /// passed since it was born. A growing kitten without a birth date is born now. Returns
+    /// whether the profiles changed and should be saved.
+    pub fn grow(&mut self, now: u64) -> bool {
+        let mut changed = false;
+        for m in &mut self.members {
+            if !(m.kitten && m.grows_up) {
+                continue;
+            }
+            let born = *m.born.get_or_insert_with(|| {
+                changed = true;
+                now
+            });
+            let days = now.saturating_sub(born) as f32 / 86_400.0;
+            m.growth = (days / GROW_UP_DAYS).clamp(0.0, 1.0);
+            if m.growth >= 1.0 {
+                // Grown: from now on a cat like any other, still her mother's
+                m.size = m.size.max(GROWN_SIZE);
+                m.growth = 0.0;
+                m.kitten = false;
+                m.grows_up = false;
+                m.born = None;
+                m.cat.kitten = false;
+                m.cat.leashed = false;
+                changed = true;
+            }
+            m.cat.youth = 1.0 - m.growth;
+            m.cat.set_scale(self.scale * m.current_size());
+        }
+        changed
+    }
+
+    /// Lets kitten `i` grow up (from now on), or stops it growing at the size it has reached
+    pub fn set_grows_up(&mut self, i: usize, on: bool) {
+        let Some(m) = self.members.get_mut(i).filter(|m| m.kitten) else {
+            return;
+        };
+        if !on {
+            m.size = m.current_size();
+            m.growth = 0.0;
+            m.born = None;
+            m.cat.youth = 1.0;
+        }
+        m.grows_up = on;
     }
 
     pub fn set_follow_cursor(&mut self, on: bool) {
@@ -341,24 +452,20 @@ impl Clowder {
         Some(i)
     }
 
-    /// Adds a playful kitten of the grown cat `mother`, next to her. Returns its index, or
-    /// `None` when the clowder is full or `mother` is a kitten.
+    /// Adds a playful kitten of the grown cat `mother`, next to her, with a coat rolled from
+    /// hers. Returns its index, or `None` when the clowder is full or `mother` is a kitten.
     pub fn add_kitten(&mut self, mother: usize) -> Option<usize> {
         if !self.can_add() || self.members.get(mother).is_none_or(|m| m.kitten) {
             return None;
         }
-        let seed = fresh_seed();
-        let mut profile = CatProfile::new(
-            self.fresh_name(),
-            CoatId::Random(seed),
-            Temperament::Playful,
-        );
+        let coat = Coat::inherit(&self.members[mother].cat.coat, fresh_seed());
+        let mut profile = CatProfile::new(self.fresh_name(), coat.id.clone(), Temperament::Playful);
         profile.size = KITTEN_SIZE;
         profile.kitten = true;
         profile.mother = Some(self.members[mother].name.clone());
         let mom = &self.members[mother].cat;
         let start = mom.window_center() - Vec2::from_angle(mom.body_angle) * (30.0 * mom.scale);
-        let i = self.push_member(profile, Coat::random(seed), start);
+        let i = self.push_member(profile, coat, start);
         self.join_feeding(i);
         Some(i)
     }
@@ -384,6 +491,9 @@ impl Clowder {
     pub fn remove(&mut self, i: usize) -> bool {
         if self.members.len() <= 1 || i >= self.members.len() {
             return false;
+        }
+        for m in 0..self.members.len() {
+            self.put_down(m);
         }
         let removed = self.members.remove(i);
         for m in &mut self.members {
@@ -420,14 +530,18 @@ impl Clowder {
     /// Advances every cat by `dt` toward the cursor, then the shared bowl and the bonds
     pub fn update(&mut self, cursor: Vec2, dt: f32) {
         self.share_neighbors();
+        self.tend_carries(dt);
         self.update_fetching();
         self.referee_laser(dt);
         self.tend_engagements();
         self.direct(dt);
         self.assign_slots();
         for m in &mut self.members {
-            m.cat.update(cursor, dt);
+            if Pose::of(&m.cat) != Pose::Carried {
+                m.cat.update(cursor, dt);
+            }
         }
+        self.hang_carried(cursor, dt);
         self.tick_feeding(dt);
         self.update_bonds(dt);
     }
@@ -536,25 +650,38 @@ impl Clowder {
             let Some(m) = self.members[k]
                 .mother
                 .as_deref()
+                .filter(|_| self.members[k].kitten)
                 .and_then(|name| self.index_of(name))
             else {
                 continue;
             };
             let (mother, kitten) = (&self.members[m].cat, &self.members[k].cat);
+            let fetching = self.members[m].fetching == Some(k);
+            let gap = mother.nodes[0].distance(kitten.nodes[0]);
+            // Asleep on its own, too far from her: she goes and carries it back
+            let stranded = kitten.activity == Activity::Sleeping
+                && kitten.social.is_none()
+                && (fetching || gap > STRANDED_LEASH * CatSim::KITTEN_LEASH * mother.scale);
             let able = self.follow_cursor
-                && kitten.roaming
+                && (kitten.roaming || stranded)
+                && self.members[m].carry.is_none()
                 && !mother.roaming
                 && mother.feeding_phase.is_none()
                 && kitten.feeding_phase.is_none()
                 && !matches!(Pose::of(mother), Pose::Busy | Pose::Racing);
-            let fetching = self.members[m].fetching == Some(k);
-            let gap = mother.nodes[0].distance(kitten.nodes[0]);
             let reached = gap < 1.6 * CatSim::PERSONAL_SPACE * (mother.scale + kitten.scale);
-            let far = gap > FETCH_RADIUS * mother.scale;
+            let far = gap > FETCH_RADIUS * mother.scale || stranded;
             if able && fetching && reached {
-                self.members[k].cat.call_back();
+                // A sleeping kitten is carried back; one awake now and then too, else it's called
+                let asleep = kitten.activity == Activity::Sleeping;
+                let carry = kitten.social.is_none() && (asleep || self.rand_f32() < CARRY_CHANCE);
                 self.members[m].fetching = None;
                 self.members[m].cat.fetch_target = None;
+                if carry {
+                    self.pick_up(m, k);
+                } else {
+                    self.members[k].cat.call_back();
+                }
             } else if able && (fetching || (far && self.members[m].fetching.is_none())) {
                 self.members[m].fetching = Some(k);
                 self.members[m].cat.fetch_target = Some(self.members[k].cat.nodes[0]);
@@ -563,6 +690,89 @@ impl Clowder {
                 self.members[m].cat.fetch_target = None;
             }
         }
+    }
+
+    /// Mother `m` picks her kitten `k` up by the scruff to carry it back
+    fn pick_up(&mut self, m: usize, k: usize) {
+        let side = if self.rand_f32() < 0.5 { 1.0 } else { -1.0 };
+        let (mouth, _) = self.members[m].cat.mouth();
+        self.members[k].cat.pick_up(mouth, side);
+        self.members[m].cat.carrying = true;
+        self.members[m].carry = Some(Carry {
+            kitten: k,
+            time: 0.0,
+            walked: false,
+        });
+    }
+
+    /// Mother `m` puts down the kitten she's carrying, if she is
+    fn put_down(&mut self, m: usize) {
+        if let Some(carry) = self.members[m].carry.take() {
+            self.members[carry.kitten].cat.put_down();
+        }
+        self.members[m].cat.carrying = false;
+    }
+
+    /// A mother carries her kitten back to her spot and puts it down once she has stopped there,
+    /// or straight away when something else comes up (a sprint, food, play, being shaken off)
+    fn tend_carries(&mut self, dt: f32) {
+        for m in 0..self.members.len() {
+            let Some(mut carry) = self.members[m].carry else {
+                continue;
+            };
+            let mother = &self.members[m].cat;
+            let kitten = &self.members[carry.kitten].cat;
+            carry.time += dt;
+            carry.walked |= mother.activity == Activity::Walking;
+            let on_the_way = match mother.activity {
+                Activity::Walking | Activity::StandingUp { .. } => true,
+                Activity::StandingIdle { .. } => !carry.walked,
+                _ => false,
+            };
+            let keep = on_the_way
+                && self.follow_cursor
+                && carry.time < CARRY_SECS
+                && !mother.roaming
+                && !mother.sprinting
+                && mother.social.is_none()
+                && mother.feeding_phase.is_none()
+                && kitten.feeding_phase.is_none();
+            if keep {
+                self.members[m].carry = Some(carry);
+            } else {
+                self.put_down(m);
+            }
+        }
+    }
+
+    /// Hangs each carried kitten from its mother's mouth where she is now
+    fn hang_carried(&mut self, cursor: Vec2, dt: f32) {
+        for m in 0..self.members.len() {
+            if let Some(carry) = self.members[m].carry {
+                let (mouth, facing) = self.members[m].cat.mouth();
+                self.members[carry.kitten]
+                    .cat
+                    .hang_from(mouth, facing, cursor, dt);
+            }
+        }
+    }
+
+    /// The cats drawn in cat `i`'s window, bottom first. Once lifted into her hold, a carried
+    /// kitten is drawn under its mother in her window (big enough for both), and its own
+    /// window is empty.
+    pub fn drawn_in(&self, i: usize) -> impl Iterator<Item = &CatSim> {
+        let held = |c: &Carry| c.time >= LIFT_SECS;
+        let carried = self.members[i]
+            .carry
+            .filter(held)
+            .map(|c| &self.members[c.kitten].cat);
+        let own = !self
+            .members
+            .iter()
+            .any(|m| m.carry.is_some_and(|c| c.kitten == i && held(&c)));
+        carried
+            .into_iter()
+            .chain(own.then_some(&self.members[i].cat))
     }
 
     /// Cats get to know each other over time, faster while near each other, and grow fond of
@@ -955,7 +1165,8 @@ impl Clowder {
             && (!c.roaming || c.roaming_by_menu)
             && !c.sprinting
             && c.fetch_target.is_none()
-            && !matches!(Pose::of(c), Pose::Busy | Pose::Racing)
+            && m.carry.is_none()
+            && !matches!(Pose::of(c), Pose::Busy | Pose::Racing | Pose::Carried)
     }
 
     /// How readily a cat of this temperament does things with other cats
@@ -1045,6 +1256,7 @@ impl Clowder {
                 }
                 // A kitten goes to knead and nap against its mother lying down
                 if kin == Kinship::Mother
+                    && mi.kitten
                     && awake(pi)
                     && matches!(pj, Pose::Lying | Pose::Sleeping)
                     && gap < 250.0 * s
@@ -1160,7 +1372,7 @@ impl Clowder {
                 let tolerance = Self::tolerance(mj);
 
                 if matches!(pj, Pose::Sitting | Pose::Lying | Pose::Grooming) {
-                    let (rate, limit) = if kin == Kinship::Mother {
+                    let (rate, limit) = if kin == Kinship::Mother && mi.kitten {
                         // She twitches her tail for it, and puts up with it a long while
                         (1.0 / 20.0, 3 + (self.rand_f32() * 3.0) as u8)
                     } else if mi.kitten && !mj.kitten {
@@ -1346,7 +1558,7 @@ impl Clowder {
         // spot (eating, hunting, resting where they settled) where they are now
         let mut taken: Vec<(Vec2, f32, usize)> = Vec::new();
         for (j, (cat, want)) in self.cats().zip(&wants).enumerate() {
-            if want.is_none() {
+            if want.is_none() && Pose::of(cat) != Pose::Carried {
                 let room = CatSim::PERSONAL_SPACE * cat.scale;
                 taken.push((cat.nodes[0], room, j));
                 taken.push((cat.body_point(), room, j));
@@ -1610,8 +1822,9 @@ fn name_seed(name: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cat::Activity;
+    use crate::cat::{Activity, TriggerKind};
     use crate::coat::CoatStyle;
+    use crate::render::cat_window_dim;
 
     const DT: f32 = 1.0 / 30.0;
 
@@ -1909,11 +2122,67 @@ mod tests {
         assert_eq!(loaded[2].mother, None, "a kitten isn't its own mother");
         assert_eq!(loaded[3].mother, None, "the mother must exist");
         assert_eq!(loaded[4].mother.as_deref(), Some("Luna"));
-        assert_eq!(loaded[5].mother, None, "only kittens have mothers");
+        assert_eq!(
+            loaded[5].mother.as_deref(),
+            Some("Luna"),
+            "a kitten that grew up keeps its mother"
+        );
+        let kittens = [kitten_of("Nori", "Luna"), kitten_of("Olive", "Nori")];
+        let group = clowder(&kittens, Vec2::new(600.0, 400.0));
+        assert_eq!(group.profiles()[1].mother, None, "kittens have no kittens");
 
         // Different cats make different choices
         let mut group = clowder(&[profile("Luna"), profile("Milo")], Vec2::new(600.0, 400.0));
         assert_ne!(group.cat_mut(0).rand_u32(), group.cat_mut(1).rand_u32());
+    }
+
+    #[test]
+    fn a_kitten_grows_up_over_the_days_and_stays_its_mothers() {
+        let day = 86_400;
+        let born = 1_761_500_000;
+        let profiles = [
+            profile("Luna"),
+            CatProfile {
+                grows_up: true,
+                ..kitten_of("Pip", "Luna")
+            },
+            kitten_of("Nori", "Luna"),
+        ];
+        let mut group = clowder(&profiles, Vec2::new(600.0, 400.0));
+        // Born the first time it grows: that needs saving
+        assert!(group.grow(born));
+        assert_eq!(group.profiles()[1].born, Some(born));
+        assert!((group.cat(1).scale - KITTEN_SIZE).abs() < 1e-3);
+        // Halfway: halfway to grown size, half its kitten ways left
+        let half = born + (GROW_UP_DAYS as u64 / 2) * day;
+        assert!(!group.grow(half));
+        let mid = 0.5 * (KITTEN_SIZE + 1.0);
+        assert!(
+            (group.cat(1).scale - mid).abs() < 0.01,
+            "{}",
+            group.cat(1).scale
+        );
+        assert!((group.cat(1).youth - 0.5).abs() < 0.01);
+        assert_eq!(group.members()[1].days_to_grow(), Some(15));
+        // A kitten that doesn't grow up stays one
+        assert!((group.cat(2).scale - KITTEN_SIZE).abs() < 1e-3);
+        // Grown: a grown cat now, and still its mother's
+        assert!(group.grow(born + GROW_UP_DAYS as u64 * day));
+        let pip = &group.profiles()[1];
+        assert!(!pip.kitten && !pip.grows_up && pip.born.is_none());
+        assert!((pip.size - 1.0).abs() < 1e-3 && (group.cat(1).scale - 1.0).abs() < 1e-3);
+        assert_eq!(group.kinship(1, 0), Kinship::Mother);
+        assert!(group.bond(0, 1).affection >= 0.8);
+        assert!(!group.grow(born + 40 * GROW_UP_DAYS as u64 * day));
+
+        // Stopping a kitten growing keeps the size it reached
+        let mut group = clowder(&profiles, Vec2::new(600.0, 400.0));
+        group.grow(born);
+        group.grow(half);
+        group.set_grows_up(1, false);
+        group.grow(half + 10 * day);
+        assert!((group.cat(1).scale - mid).abs() < 0.01);
+        assert!(group.profiles()[1].kitten);
     }
 
     #[test]
@@ -1943,6 +2212,92 @@ mod tests {
             widest < leash * 1.5,
             "the kitten got {widest} px from its mother"
         );
+    }
+
+    #[test]
+    fn a_mother_carries_her_kitten_asleep_on_its_own_back_by_the_scruff() {
+        let start = Vec2::new(700.0, 600.0);
+        let mut group = clowder(&[profile("Luna"), kitten_of("Pip", "Luna")], start);
+        run(&mut group, start, 8.0);
+        group.cat_mut(1).trigger(TriggerKind::Sleep);
+        // The cursor goes off; the mother follows it and the kitten sleeps on where it was
+        let cursor = start + Vec2::new(450.0, 0.0);
+        let (mut carried, mut worst_hold, mut worst_reach) = (0.0f32, 0.0f32, 0.0f32);
+        let half_window = f32::from(cat_window_dim(group.cat(0).scale)) * 0.5;
+        for _ in 0..(90.0 / DT) as usize {
+            group.update(cursor, DT);
+            let (mother, kitten) = (group.cat(0), group.cat(1));
+            if Pose::of(kitten) != Pose::Carried {
+                if carried > 0.0 {
+                    break;
+                }
+                continue;
+            }
+            carried += DT;
+            assert!(mother.carrying);
+            if carried > 0.5 {
+                assert_eq!(
+                    group.drawn_in(1).count(),
+                    0,
+                    "a carried kitten in its own window"
+                );
+                let drawn: Vec<_> = group.drawn_in(0).map(|c| c.nodes[0]).collect();
+                assert_eq!(
+                    drawn,
+                    [kitten.nodes[0], mother.nodes[0]],
+                    "she's drawn over it"
+                );
+                worst_hold = worst_hold.max(kitten.nodes[1].distance(mother.mouth().0));
+                for node in kitten.nodes {
+                    let off = (node - mother.window_center()).abs();
+                    worst_reach = worst_reach.max(off.x.max(off.y));
+                }
+            }
+        }
+        assert!(
+            carried > 1.0,
+            "the mother never carried her kitten ({carried} s)"
+        );
+        assert!(
+            worst_hold < 2.0,
+            "the scruff slipped {worst_hold} px from her mouth"
+        );
+        assert!(
+            worst_reach < half_window - 6.0,
+            "the kitten hung {worst_reach} px out, outside her {half_window} px window half"
+        );
+        // Put down still asleep by its mother's spot near the cursor, and nobody's carrying
+        let (mother, kitten) = (group.cat(0), group.cat(1));
+        assert_eq!(kitten.activity, Activity::Sleeping);
+        assert!(!mother.carrying);
+        assert!(group.members[0].carry.is_none());
+        assert!(mother.nodes[0].distance(cursor) < 120.0);
+        assert!(kitten.nodes[0].distance(mother.body_point()) < CatSim::KITTEN_LEASH * 0.5);
+        assert_eq!(group.drawn_in(1).count(), 1);
+        // Woken, it goes on as usual
+        run(&mut group, cursor, 5.0);
+        assert!(group.cat(1).nodes[0].is_finite());
+    }
+
+    #[test]
+    fn a_carried_kitten_is_put_down_when_its_mother_is_called_away() {
+        let start = Vec2::new(700.0, 600.0);
+        let mut group = clowder(&[profile("Luna"), kitten_of("Pip", "Luna")], start);
+        run(&mut group, start, 8.0);
+        run(&mut group, start + Vec2::new(300.0, 0.0), 1.5);
+        group.pick_up(0, 1);
+        run(&mut group, start + Vec2::new(300.0, 0.0), 1.0);
+        assert_eq!(Pose::of(group.cat(1)), Pose::Carried);
+        // Shaken off, she drops it and goes off on her own; it sits up where it was let go
+        group.cat_mut(0).shoo();
+        group.update(start, DT);
+        assert!(!group.cat(0).carrying);
+        assert_eq!(group.cat(1).activity, Activity::Sitting);
+        // Removing a mother mid-carry puts the kitten down too
+        group.pick_up(0, 1);
+        assert!(group.remove(0));
+        assert_ne!(Pose::of(group.cat(0)), Pose::Carried);
+        run(&mut group, start, 2.0);
     }
 
     #[test]

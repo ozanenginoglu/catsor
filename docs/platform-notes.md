@@ -61,6 +61,8 @@ Unlike the overlays, the designer is an **ordinary managed window**. It is not o
 
 Every cat has its own `OverlayWindow`, so each one is only as large as that cat's frame. `sync_cat_windows` runs every frame and matches the window list to the `Clowder`: it creates windows for new cats, resizes them when the scale changes, and maps or unmaps them. Windows are **never destroyed** while Catsor runs; a removed cat's window is unmapped and reused by the next cat. Win32 does the same (`CatWindow` in `win32.rs`) for a stronger reason: destroying an overlay window there runs the `WM_DESTROY` handler, which posts `WM_QUIT` and ends the app.
 
+What goes in a window comes from `Clowder::drawn_in(i)`, drawn with `render_cats`. A kitten carried by the scruff is drawn in its mother's window, under her, and its own window is drawn empty but stays mapped. Window stacking follows the member order, so a carried kitten (usually added after its mother) would otherwise be drawn over her. Her window, 108 px × her scale, is big enough for the kitten hanging from her mouth; a test checks this.
+
 The graphics context is shared by all overlays and created on the bowl window rather than the root window, because a GC can only draw on drawables of the depth it was created for, and the overlays are 32-bit while the root window usually isn't (drawing would fail with BadMatch).
 
 ### Bowl placement
@@ -114,6 +116,6 @@ Login registration is OS state, not a preference, so it is **not** stored in `co
 
 ## Preferences file
 
-`prefs.rs` writes `config.toml` **atomically**. It writes a uniquely named temp file in the same directory, then renames it over the old file, so a crash in the middle of a write can't leave a half-written config. A relative `$XDG_CONFIG_HOME` is ignored, as the XDG spec requires (there's a test for this). Every tray change that affects a saved setting calls `UserPrefs::from_clowder(&clowder).save()` straight away.
+`prefs.rs` writes `config.toml` **atomically**. It writes a uniquely named temp file in the same directory, then renames it over the old file, so a crash in the middle of a write can't leave a half-written config. A relative `$XDG_CONFIG_HOME` is ignored, as the XDG spec requires (there's a test for this). Every tray change that affects a saved setting calls `UserPrefs::from_clowder(&clowder).save()` straight away. Both backends also call `Clowder::grow(unix_now())` every frame and save the prefs when it reports a change: the first time a growing kitten gets its birth date, and when it finishes growing up.
 
 `bonds.toml` (`src/bonds.rs`) sits next to `config.toml` and is written the same atomic way. Each backend loads it at startup (`Clowder::with_bonds(Bonds::load())`), calls `save_bonds_if_due` every frame (it writes every 5 minutes of running time) and `save_bonds` on Quit (Win32: in `shutdown`). Killing the process loses at most the last 5 minutes. With a single cat there are no pairs and nothing is written.
