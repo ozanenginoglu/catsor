@@ -760,10 +760,15 @@ impl CatSim {
         None
     }
 
-    /// Whether the cursor has moved far enough since the cats began to break it up
+    /// Whether the cursor has moved far enough since the cats began to break it up. Only a cat
+    /// following the cursor minds: one roaming or busy at the bowl doesn't.
     pub(super) fn social_interrupted(&self, radius: f32) -> bool {
-        self.social
-            .is_some_and(|e| self.smooth_cursor.distance(e.anchor) > radius)
+        self.behaviors.follow_cursor
+            && !self.roaming
+            && self.feeding_phase.is_none()
+            && self
+                .social
+                .is_some_and(|e| self.smooth_cursor.distance(e.anchor) > radius)
     }
 
     /// Eyes shut in contentment: kneading, or being groomed

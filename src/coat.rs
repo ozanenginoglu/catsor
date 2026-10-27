@@ -1356,9 +1356,9 @@ impl CoatLibrary {
     }
 
     /// Reloads `coats.toml` when it changed on disk (checked at most once a second) and
-    /// re-applies the cat's coat, so edits to a custom coat show up live. Returns whether the
+    /// re-applies every cat's coat, so edits to a custom coat show up live. Returns whether any
     /// cat's coat changed
-    pub fn refresh(&mut self, cat: &mut CatSim) -> bool {
+    pub fn refresh<'a>(&mut self, cats: impl IntoIterator<Item = &'a mut CatSim>) -> bool {
         let now = Instant::now();
         if now < self.next_check {
             return false;
@@ -1371,12 +1371,15 @@ impl CoatLibrary {
             return false;
         }
         self.reload();
-        let updated = self.resolve(&cat.coat.id);
-        if updated == cat.coat {
-            return false;
+        let mut changed = false;
+        for cat in cats {
+            let updated = self.resolve(&cat.coat.id);
+            if updated != cat.coat {
+                cat.coat = updated;
+                changed = true;
+            }
         }
-        cat.coat = updated;
-        true
+        changed
     }
 }
 
@@ -1969,28 +1972,33 @@ base = "#333333"
         std::fs::write(&path, "[[coat]]\nname = \"Mochi\"\nbase = \"#eeeeee\"\n").unwrap();
 
         let mut lib = CoatLibrary::load_from(Some(path.clone()));
-        let mut cat = CatSim::new(
-            glam::Vec2::ZERO,
-            1.0,
-            lib.resolve(&CoatId::Custom("Mochi".into())),
-        );
+        let mochi = || {
+            CatSim::new(
+                glam::Vec2::ZERO,
+                1.0,
+                lib.resolve(&CoatId::Custom("Mochi".into())),
+            )
+        };
+        let (mut cat, mut twin) = (mochi(), mochi());
         assert_eq!(cat.coat.base, rgb(0xee, 0xee, 0xee));
 
         // Unchanged file: nothing to do, even once the check interval has passed
         lib.next_check = Instant::now();
-        assert!(!lib.refresh(&mut cat));
+        assert!(!lib.refresh([&mut cat]));
 
         std::fs::write(&path, "[[coat]]\nname = \"Mochi\"\nbase = \"#aa7744\"\n").unwrap();
         // Force a different mtime even on coarse-grained filesystems
         lib.modified = None;
         lib.next_check = Instant::now();
-        assert!(lib.refresh(&mut cat));
+        // Every cat wearing it is updated, not just the first one checked
+        assert!(lib.refresh([&mut cat, &mut twin]));
         assert_eq!(cat.coat.base, rgb(0xaa, 0x77, 0x44));
+        assert_eq!(twin.coat.base, rgb(0xaa, 0x77, 0x44));
 
         // Deleting the coat falls back to the default one
         std::fs::remove_file(&path).unwrap();
         lib.next_check = Instant::now();
-        assert!(lib.refresh(&mut cat));
+        assert!(lib.refresh([&mut cat]));
         assert_eq!(cat.coat.id, CoatId::Builtin(CoatStyle::Calico));
 
         let _ = std::fs::remove_dir_all(&dir);

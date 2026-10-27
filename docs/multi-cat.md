@@ -121,7 +121,7 @@ Every pair of cats has a bond:
 - `affection` (−1–1): goes up with positive interactions (greeting, grooming each other, sleeping together, play that ends well) and down with friction. Drifts back toward a baseline over time.
 - Baseline comes from temperaments (Playful+Playful high, Aloof+anyone low). **Mother↔kitten and siblings have a high fixed floor.** A newly added adult starts unfamiliar and a little wary: more sniffing, fewer greetings, more personal space.
 
-Bonds scale how likely each interaction is and how much personal space a pair keeps. They're stored in `bonds.toml` next to `config.toml`, keyed by cat names, and written atomically (like prefs) every few minutes and on exit. Removing a cat keeps its rows so re-adding the same name restores them. *(The rows are `a`/`b`/`familiarity`/`affection` tables. There's no renaming in the tray yet; when there is, it should carry the bonds over.)*
+Bonds scale how likely each interaction is and how much personal space a pair keeps. They're stored in `bonds.toml` next to `config.toml`, keyed by cat names, and written atomically (like prefs) every few minutes and on exit. Removing a cat keeps its rows so re-adding the same name restores them. *(Changed: removing a cat from the tray drops its rows, since Add Cat reuses names. The rows are `a`/`b`/`familiarity`/`affection` tables. There's no renaming in the tray yet; when there is, it should carry the bonds over.)*
 
 The Realistic temperament keeps the rule from `behavior.md`: social interactions there are rarer and slower, the other temperaments show them more often.
 

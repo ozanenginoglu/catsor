@@ -9,10 +9,10 @@ use super::{
     Activity, CatSim, FeedPreset, Kinship, Neighbor, Pose, Slot, SocialKind, SocialRole,
     TOTAL_NODES, Temperament, wrap_angle,
 };
-use crate::bonds::{Bond, Bonds};
+use crate::bonds::{Bond, Bonds, PairMap};
 use crate::coat::{Coat, CoatId, CoatLibrary, fresh_seed};
 use glam::Vec2;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 
 /// Most cats running at once
 pub const MAX_CATS: usize = 6;
@@ -197,7 +197,7 @@ pub struct Clowder {
     /// Seconds since the bonds were last saved
     bonds_unsaved: f32,
     /// Seconds each pair (by name) has been apart; a pair not listed hasn't met this session
-    apart: BTreeMap<(String, String), f32>,
+    apart: PairMap<f32>,
     /// Time until `Clowder` next looks for two cats to do something together
     director_timer: f32,
     /// `Clowder`'s own random choices, kept apart from each cat's so a lone cat is unaffected
@@ -209,7 +209,7 @@ pub struct Clowder {
     /// Time left before the hunter gives the dot up, having stopped hunting it
     hunter_hold: f32,
     /// Seconds each pair (by name) still rests from playing together
-    play_rest: BTreeMap<(String, String), f32>,
+    play_rest: PairMap<f32>,
 }
 
 impl Clowder {
@@ -232,13 +232,13 @@ impl Clowder {
             feeding: None,
             bonds: Bonds::default(),
             bonds_unsaved: 0.0,
-            apart: BTreeMap::new(),
+            apart: PairMap::default(),
             director_timer: DIRECTOR_TICK,
             rng_state: 0x2545_f491_4f6c_dd1d,
             social: true,
             hunter: None,
             hunter_hold: 0.0,
-            play_rest: BTreeMap::new(),
+            play_rest: PairMap::default(),
         };
         let default_profile = [CatProfile::default()];
         let profiles = if profiles.is_empty() {
@@ -246,10 +246,13 @@ impl Clowder {
         } else {
             profiles
         };
-        for profile in profiles.iter().take(MAX_CATS) {
+        let profiles = &profiles[..profiles.len().min(MAX_CATS)];
+        // A renamed duplicate mustn't take the name of a cat further down the list
+        let given: Vec<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
+        for profile in profiles {
             let mut profile = profile.clone();
             if profile.name.trim().is_empty() || clowder.index_of(&profile.name).is_some() {
-                profile.name = clowder.fresh_name();
+                profile.name = clowder.fresh_name_avoiding(&given);
             }
             let i = clowder.members.len();
             // Spread out a little so they don't all start in one heap
@@ -311,11 +314,16 @@ impl Clowder {
 
     /// The first name from `NAMES` nobody uses yet, or "Cat N"
     fn fresh_name(&self) -> String {
+        self.fresh_name_avoiding(&[])
+    }
+
+    /// A name no cat has, and not one of `reserved`
+    fn fresh_name_avoiding(&self, reserved: &[&str]) -> String {
         NAMES
             .iter()
             .map(|n| n.to_string())
             .chain((2..).map(|n| format!("Cat {n}")))
-            .find(|n| self.index_of(n).is_none())
+            .find(|n| self.index_of(n).is_none() && !reserved.contains(&n.as_str()))
             .unwrap_or_default()
     }
 
@@ -524,6 +532,13 @@ impl Clowder {
                 shift(e);
             }
         }
+        // A new cat given this name later starts out a stranger to the others. Saved now, as
+        // with one cat left nothing would be saved on quit.
+        self.bonds.forget(&removed.name);
+        self.apart.forget(&removed.name);
+        self.play_rest.forget(&removed.name);
+        self.save_bonds_now();
+        self.retime_turn();
         true
     }
 
@@ -598,10 +613,14 @@ impl Clowder {
     }
 
     pub fn save_bonds(&mut self) {
-        self.bonds_unsaved = 0.0;
         if self.members.len() > 1 {
-            self.bonds.save();
+            self.save_bonds_now();
         }
+    }
+
+    fn save_bonds_now(&mut self) {
+        self.bonds_unsaved = 0.0;
+        self.bonds.save();
     }
 
     /// Gives every cat a snapshot of the others as they were at the end of the last tick, with
@@ -800,8 +819,8 @@ impl Clowder {
                 let baseline = self.bond_baseline(i, j);
                 bond.affection += (baseline - bond.affection) * (dt / 7200.0).min(1.0);
                 let bond = bond.with_floor(self.kinship(i, j));
-                let (na, nb) = (self.members[i].name.clone(), self.members[j].name.clone());
-                self.bonds.set(&na, &nb, bond);
+                self.bonds
+                    .set(&self.members[i].name, &self.members[j].name, bond);
             }
         }
     }
@@ -813,15 +832,6 @@ impl Clowder {
         self.rng_state ^= self.rng_state >> 27;
         let x = self.rng_state.wrapping_mul(0x2545_f491_4f6c_dd1d);
         (x >> 40) as f32 / (1u64 << 24) as f32
-    }
-
-    fn pair_key(&self, i: usize, j: usize) -> (String, String) {
-        let (a, b) = (&self.members[i].name, &self.members[j].name);
-        if a <= b {
-            (a.clone(), b.clone())
-        } else {
-            (b.clone(), a.clone())
-        }
     }
 
     /// Ends what two cats were doing together once either is done with it (or was pulled
@@ -1101,19 +1111,19 @@ impl Clowder {
         let mut bond = self.bond(i, j);
         bond.affection = (bond.affection + delta).clamp(-1.0, 1.0);
         let bond = bond.with_floor(self.kinship(i, j));
-        let (a, b) = (self.members[i].name.clone(), self.members[j].name.clone());
-        self.bonds.set(&a, &b, bond);
+        self.bonds
+            .set(&self.members[i].name, &self.members[j].name, bond);
     }
 
     fn rest_from_play(&mut self, i: usize, j: usize, secs: f32) {
-        let key = self.pair_key(i, j);
-        let rest = self.play_rest.entry(key).or_insert(0.0);
+        let (a, b) = (&self.members[i].name, &self.members[j].name);
+        let rest = self.play_rest.get_or_insert(a, b, 0.0);
         *rest = rest.max(secs);
     }
 
     fn resting_from_play(&self, i: usize, j: usize) -> bool {
         self.play_rest
-            .get(&self.pair_key(i, j))
+            .get(&self.members[i].name, &self.members[j].name)
             .is_some_and(|&t| t > 0.0)
     }
 
@@ -1192,8 +1202,8 @@ impl Clowder {
             for j in (i + 1)..n {
                 let (a, b) = (&self.members[i].cat, &self.members[j].cat);
                 let far = a.nodes[0].distance(b.nodes[0]) > 250.0 * a.scale.max(b.scale);
-                let key = self.pair_key(i, j);
-                let apart = self.apart.entry(key).or_insert(GREET_AFTER);
+                let (na, nb) = (&self.members[i].name, &self.members[j].name);
+                let apart = self.apart.get_or_insert(na, nb, GREET_AFTER);
                 if far {
                     *apart += dt;
                 }
@@ -1226,7 +1236,7 @@ impl Clowder {
                 let s = mi.cat.scale.max(mj.cat.scale);
                 let kin = self.kinship(i, j);
                 let bond = self.bond(i, j);
-                let friends = kin.is_family() || (bond.affection > 0.3 && bond.familiarity > 0.3);
+                let friends = bond.friends(kin);
                 let warm = Self::sociability(mi) * Self::sociability(mj);
                 let awake = |p: Pose| {
                     matches!(
@@ -1237,7 +1247,7 @@ impl Clowder {
                 let resting_awake = |p: Pose| matches!(p, Pose::Sitting | Pose::Lying);
 
                 // Greetings, asked once per pair (i < j); who leads is settled below
-                let apart = self.apart.get(&self.pair_key(i, j)).copied().unwrap_or(0.0);
+                let apart = self.apart.get(&mi.name, &mj.name).copied().unwrap_or(0.0);
                 if i < j && apart >= GREET_AFTER && gap < 160.0 * s && awake(pi) && awake(pj) {
                     let kind = if bond.familiarity < 0.3 && !kin.is_family() {
                         SocialKind::SniffCircle
@@ -1366,7 +1376,7 @@ impl Clowder {
                 }
                 let kin = self.kinship(i, j);
                 let bond = self.bond(i, j);
-                let friends = kin.is_family() || (bond.affection > 0.3 && bond.familiarity > 0.3);
+                let friends = bond.friends(kin);
                 let pals = friends || (mi.kitten && mj.kitten);
                 let (fi, fj) = (Self::playfulness(mi), Self::playfulness(mj));
                 let tolerance = Self::tolerance(mj);
@@ -1439,8 +1449,7 @@ impl Clowder {
                 let m = &self.members[j];
                 let keen = m.kitten || m.cat.behaviors.temperament == Temperament::Playful;
                 let bond = self.bond(i, j);
-                let friends = self.kinship(i, j).is_family()
-                    || (bond.affection > 0.3 && bond.familiarity > 0.3);
+                let friends = bond.friends(self.kinship(i, j));
                 let (a, b) = (&self.members[i].cat, &m.cat);
                 let near = a.nodes[0].distance(b.nodes[0]) < 220.0 * a.scale.max(b.scale);
                 if keen && friends && near && Pose::of(b) != Pose::Sleeping && self.rand_f32() < 0.6
@@ -1535,8 +1544,8 @@ impl Clowder {
             kind,
             SocialKind::NoseBoop | SocialKind::HeadBunt | SocialKind::SniffCircle
         ) {
-            let key = self.pair_key(active, passive);
-            self.apart.insert(key, 0.0);
+            let (a, b) = (&self.members[active].name, &self.members[passive].name);
+            self.apart.insert(a, b, 0.0);
         }
     }
 
@@ -1689,6 +1698,31 @@ impl Clowder {
                 cat.wait_for_bowl(session.preset, bowl_pos);
             }
         }
+        self.retime_turn();
+    }
+
+    /// How long a turn at the bowl lasts: capped at `TURN_SECS` when cats share it, otherwise
+    /// what's left of the preset
+    fn turn_secs(&self, session: &FeedSession) -> Option<f32> {
+        let remaining = Self::remaining(session);
+        if self.members.len() > 1 {
+            Some(remaining.map_or(TURN_SECS, |r| r.min(TURN_SECS)))
+        } else {
+            remaining
+        }
+    }
+
+    /// Fits the current eater's turn to the cats there are now: a lone eater gets the rest of
+    /// the preset, and one that has company gets at most a shared turn from now
+    fn retime_turn(&mut self) {
+        let Some(session) = &self.feeding else {
+            return;
+        };
+        let Some(e) = session.eater else {
+            return;
+        };
+        let turn = self.turn_secs(session);
+        self.members[e].cat.retime_eat_turn(turn);
     }
 
     pub fn stop_feeding(&mut self) {
@@ -1709,7 +1743,9 @@ impl Clowder {
     /// Gives the bowl to the next cat in the queue, for a turn of at most `TURN_SECS` when
     /// others are waiting
     fn next_turn(&mut self) {
-        let shared = self.members.len() > 1;
+        let Some(turn) = self.feeding.as_ref().map(|s| self.turn_secs(s)) else {
+            return;
+        };
         let Some(session) = &mut self.feeding else {
             return;
         };
@@ -1718,12 +1754,6 @@ impl Clowder {
         };
         let Some(next) = session.queue.pop_front() else {
             return;
-        };
-        let remaining = Self::remaining(session);
-        let turn = if shared {
-            Some(remaining.map_or(TURN_SECS, |r| r.min(TURN_SECS)))
-        } else {
-            remaining
         };
         session.eater = Some(next);
         self.members[next].cat.place_bowl_for_turn(bowl_pos, turn);
@@ -2046,6 +2076,75 @@ mod tests {
         assert!(!group.cat(0).is_feeding());
     }
 
+    /// Seconds left in the eating cat's turn
+    fn turn_left(group: &Clowder) -> Option<f32> {
+        let e = group.feeding.as_ref()?.eater?;
+        match group.cat(e).activity {
+            Activity::Eating {
+                elapsed,
+                duration: Some(d),
+                ..
+            } => Some(d - elapsed),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn turns_at_the_bowl_change_as_cats_join_and_leave() {
+        let start = Vec2::new(600.0, 400.0);
+        let bowl = Vec2::new(700.0, 420.0);
+        let mut group = clowder(&[profile("Luna"), profile("Milo")], start);
+        group.begin_bowl_placement(FeedPreset::Mins30, bowl);
+        group.place_bowl(bowl);
+        run(&mut group, bowl, 20.0);
+        let left = turn_left(&group).expect("someone eats");
+        assert!(left <= TURN_SECS, "a shared turn: {left}");
+
+        // With the other cat gone, the one eating has the rest of the preset
+        let eater = group.feeding.as_ref().and_then(|s| s.eater).unwrap();
+        assert!(group.remove(1 - eater));
+        let left = turn_left(&group).unwrap();
+        assert!(left > 1700.0, "the lone cat's turn is still capped: {left}");
+        run(&mut group, bowl, 200.0);
+        assert!(
+            group.cat(0).is_feeding(),
+            "feeding stopped after a shared turn"
+        );
+
+        // A newcomer shares again: the eater's turn shrinks, and the newcomer gets one
+        let pip = group.add_cat().unwrap();
+        assert!(turn_left(&group).unwrap() < TURN_SECS + 0.01);
+        let mut newcomer_ate = false;
+        for _ in 0..(200.0 / DT) as usize {
+            group.update(bowl, DT);
+            newcomer_ate |= group.cat(pip).is_feeding();
+        }
+        assert!(newcomer_ate, "the new cat never got a turn");
+    }
+
+    #[test]
+    fn a_cat_joining_an_unlimited_meal_gets_a_turn() {
+        let start = Vec2::new(600.0, 400.0);
+        let bowl = Vec2::new(700.0, 420.0);
+        let mut group = clowder(&[profile("Luna")], start);
+        group.begin_bowl_placement(FeedPreset::Indefinite, bowl);
+        group.place_bowl(bowl);
+        run(&mut group, bowl, 10.0);
+        assert_eq!(
+            turn_left(&group),
+            None,
+            "a lone cat eats as long as it likes"
+        );
+        let kitten = group.add_kitten(0).unwrap();
+        assert!(turn_left(&group).is_some_and(|t| t < TURN_SECS + 0.01));
+        let mut kitten_ate = false;
+        for _ in 0..(200.0 / DT) as usize {
+            group.update(bowl, DT);
+            kitten_ate |= group.cat(kitten).is_feeding();
+        }
+        assert!(kitten_ate, "the kitten never got a turn");
+    }
+
     #[test]
     fn stopping_feeding_lets_every_cat_go() {
         let mut group = clowder(&[profile("Luna"), profile("Milo")], Vec2::new(600.0, 400.0));
@@ -2100,6 +2199,37 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn a_new_cat_with_a_removed_cats_name_is_a_stranger() {
+        let start = Vec2::new(600.0, 400.0);
+        let mut group = clowder(&[profile("Luna"), profile("Milo")], start);
+        let close = Bond {
+            familiarity: 0.9,
+            affection: 0.8,
+        };
+        group.set_bond(0, 1, close);
+        assert!(group.remove(1));
+        let newcomer = group.add_cat().unwrap();
+        assert_eq!(group.members()[newcomer].name, "Milo");
+        assert!(group.bond(0, newcomer).familiarity < 0.1);
+    }
+
+    #[test]
+    fn a_duplicate_name_is_not_renamed_onto_a_later_cat() {
+        let profiles = [
+            profile("Luna"),
+            profile("Luna"),
+            profile("Milo"),
+            kitten_of("Pip", "Milo"),
+        ];
+        let group = clowder(&profiles, Vec2::new(600.0, 400.0));
+        let names: Vec<_> = group.members().iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names[0], "Luna");
+        assert!(!["Luna", "Milo", "Pip"].contains(&names[1]), "{names:?}");
+        assert_eq!(names[2..], ["Milo", "Pip"]);
+        assert_eq!(group.members()[3].mother.as_deref(), Some("Milo"));
     }
 
     #[test]
@@ -2747,6 +2877,27 @@ mod tests {
     }
 
     #[test]
+    fn only_cats_following_the_cursor_are_pulled_apart_by_it() {
+        let cursor = Vec2::new(600.0, 400.0);
+        let away = cursor + Vec2::new(400.0, 250.0);
+        for follow in [true, false] {
+            let mut group = pair(Some(FRIENDS), Temperament::Balanced).without_social();
+            run(&mut group, cursor, 12.0);
+            group.set_follow_cursor(follow);
+            group.engage(0, 1, SocialKind::Groom);
+            run(&mut group, cursor, 0.5);
+            assert!(group.cat(0).social.is_some());
+            run(&mut group, away, 1.0);
+            assert_eq!(
+                group.cat(0).social.is_some(),
+                !follow,
+                "follow cursor {follow}: grooming went on {}",
+                group.cat(0).social.is_some()
+            );
+        }
+    }
+
+    #[test]
     fn a_squabble_puffs_one_up_then_both_back_off_and_groom() {
         let cursor = Vec2::new(600.0, 400.0);
         let mut group = pair(Some(FRIENDS), Temperament::Playful).without_social();
@@ -2832,8 +2983,11 @@ mod tests {
         group.begin_bowl_placement(FeedPreset::Indefinite, bowl);
         group.place_bowl(bowl);
         let (mut pushed, mut outcome) = (false, None);
-        for _ in 0..(400.0 / DT) as usize {
-            group.update(bowl, DT);
+        for frame in 0..(400.0 / DT) as usize {
+            // The cursor goes on with its work: the cats at the bowl don't mind it
+            let t = frame as f32 * DT;
+            let cursor = bowl + Vec2::new(300.0 + 200.0 * (t * 0.7).sin(), 150.0 * t.cos());
+            group.update(cursor, DT);
             let milo = group.cat(1);
             pushed |= milo
                 .social

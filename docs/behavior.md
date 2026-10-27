@@ -199,6 +199,7 @@ With more than one cat, `Clowder` runs one feeding session (`FeedSession`) for o
 - While the bowl is being placed, every cat is in Carrying and follows it, each on a slot round it. On the click, the queue is built: **kittens first, then grown cats, each group nearest first**. The first cat gets `place_bowl_for_turn`; the others get `wait_for_bowl` and enter a fourth phase, **Waiting**, in which they sit `BOWL_WAIT_RADIUS` (50 px) from the bowl on slots of their own (see below), and don't pounce, gallop or start zoomies.
 - A turn lasts `min(150 s, time left in the preset)`. When it ends, the eater gets up and waits again at the back of the queue, and the next cat walks in. The bowl level (`bowl_fill`) is shared, so it keeps draining across turns.
 - The session ends when less than 1 s of the preset is left, or on Stop Feeding. A lone cat eats the whole preset in one turn, exactly as above.
+- Cats joining or leaving mid-meal re-time the current turn (`retime_turn`): a cat left eating alone gets the rest of the preset, and one that gains company (Add Cat or Add Kitten, even during an unlimited meal) has at most 150 s left, so the newcomer gets its turn.
 
 ## Several cats
 
@@ -269,7 +270,7 @@ Each `Neighbor` also carries the other cat's scale, speed and `Pose` (Moving, Ra
 
 While engaged, a cat takes no spot round the cursor, ignores its partner when steering round other cats (except on its way round to a tail it stalks), doesn't do quirks, copy, pounce at the cursor or go roaming, and the passive cat doesn't lie down from sitting (or roll off its side onto its back) mid-act. Its "distance to the cursor" is how far the cursor has moved since the engagement began.
 
-**Ending.** A cat marks its half done when its act is over, when it gives up getting there (20 s, `SOCIAL_GIVE_UP`), when its part is interrupted (a sleeper wakes, a resting partner gets up), or when something more pressing comes up (sprinting, feeding, being shaken off, fetching a kitten). `tend_engagements` then ends it for **both** cats (`end_social`): a social pose turns into standing, sitting or lying, and they carry on as before (back to their spots by the cursor). If the cursor moves more than the sit wake radius from where it was when they began, each cat drops it at once (`abandon_social`) and gets up. A greeting or grooming that both cats saw through adds 0.03 or 0.06 to their affection (play and friction: see below). Removing a cat ends everything under way. A sniff circle counts as there once a cat's nose is within 18 px of the other's body as well, since two cats each heading for the other's rear can chase each other round.
+**Ending.** A cat marks its half done when its act is over, when it gives up getting there (20 s, `SOCIAL_GIVE_UP`), when its part is interrupted (a sleeper wakes, a resting partner gets up), or when something more pressing comes up (sprinting, feeding, being shaken off, fetching a kitten). `tend_engagements` then ends it for **both** cats (`end_social`): a social pose turns into standing, sitting or lying, and they carry on as before (back to their spots by the cursor). If the cursor moves more than the sit wake radius from where it was when they began, each cat that follows the cursor drops it at once (`abandon_social`) and gets up. Cats roaming (or with Follow Cursor off) or busy at the bowl ignore the cursor. A greeting or grooming that both cats saw through adds 0.03 or 0.06 to their affection (play and friction: see below). Removing a cat ends everything under way. A sniff circle counts as there once a cat's nose is within 18 px of the other's body as well, since two cats each heading for the other's rear can chase each other round.
 
 ### Playing and squabbling
 
@@ -308,7 +309,7 @@ A cat backing off (`CatSim::retreat`) walks to its point with its tail held stil
 - A pair that has never met starts at familiarity 0 and affection 0.1 below the baseline. A mother and her kitten never drop below familiarity 0.9 and affection 0.8; siblings never below 0.8 and 0.6.
 - **Spacing:** how far apart two cats keep (in slot assignment and while walking) is their personal spaces × `Neighbor::space_mult`: 0.75 for family, otherwise 1.3 for strangers down to 1.0 when fully familiar, then up to 15% less (or more) by affection.
 
-The bonds are saved to `bonds.toml` next to `config.toml` every 5 minutes and on quit, atomically like the prefs. Rows stay when a cat is removed, so adding a cat with the same name brings its bonds back.
+The bonds are saved to `bonds.toml` next to `config.toml` every 5 minutes and on quit, atomically like the prefs. Removing a cat from the tray drops its rows (and saves straight away), so a new cat that gets its name starts as a stranger. A cat left out of the config by hand keeps its rows. A row missing `familiarity` or `affection` reads it as 0. Bonds live in a `PairMap` keyed by the two names, which looks pairs up without allocating.
 
 ## Determinism
 

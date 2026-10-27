@@ -1134,9 +1134,7 @@ impl X11App {
     /// Advances the simulation from the root-window cursor. Hidden cats stay paused unless
     /// they are feeding.
     fn step_cat(&mut self, dt: f32) {
-        for cat in self.clowder.cats_mut() {
-            self.coats.refresh(cat);
-        }
+        self.coats.refresh(self.clowder.cats_mut());
         self.update_roam_bounds();
         if (!self.cat_hidden || self.clowder.feeding_preset().is_some())
             && let Ok(cookie) = self.conn.query_pointer(self.env.root)

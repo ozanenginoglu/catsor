@@ -1426,9 +1426,7 @@ impl WinApp {
     /// Advances the simulation from the cursor and handles bowl placement clicks (left places
     /// it, right or Escape cancels). Hidden cats stay paused unless they are feeding.
     fn step_cat(&mut self, dt: f32) {
-        for cat in self.clowder.cats_mut() {
-            self.coats.refresh(cat);
-        }
+        self.coats.refresh(self.clowder.cats_mut());
         if self.cat_hidden && self.clowder.feeding_preset().is_none() {
             self.keep_awake.set_active(false);
             return;

@@ -3,6 +3,7 @@ mod body;
 pub mod clowder;
 mod social;
 
+use crate::bonds::Bond;
 use crate::coat::Coat;
 use glam::Vec2;
 
@@ -277,7 +278,11 @@ impl Neighbor {
 
     /// A cat this one is glad to see: family, or a cat it knows and likes
     pub fn is_friend(&self) -> bool {
-        self.kin.is_family() || (self.affection > 0.3 && self.familiarity > 0.3)
+        Bond {
+            familiarity: self.familiarity,
+            affection: self.affection,
+        }
+        .friends(self.kin)
     }
 
     /// A cat this one would rather keep clear of
@@ -1195,6 +1200,23 @@ impl CatSim {
     pub fn place_bowl_for_turn(&mut self, bowl_pos: Vec2, turn: Option<f32>) {
         self.eat_turn = turn;
         self.place_bowl(bowl_pos);
+    }
+
+    /// Changes how long the turn at the bowl lasts from now (`None`: the whole preset), when
+    /// cats join or leave while it eats or walks over
+    pub fn retime_eat_turn(&mut self, turn: Option<f32>) {
+        if let Activity::Eating {
+            preset, elapsed, ..
+        } = self.activity
+        {
+            self.activity = Activity::Eating {
+                preset,
+                elapsed,
+                duration: turn.map(|t| elapsed + t),
+            };
+        } else {
+            self.eat_turn = turn;
+        }
     }
 
     /// Queues the cat for the shared bowl at `bowl_pos`: it goes and sits near the bowl until

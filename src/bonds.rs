@@ -43,6 +43,11 @@ impl Bond {
         }
     }
 
+    /// Glad to see each other: family, or cats that know and like each other
+    pub fn friends(self, kin: Kinship) -> bool {
+        kin.is_family() || (self.affection > 0.3 && self.familiarity > 0.3)
+    }
+
     /// Where affection settles without anything happening between the two: the average of how
     /// warm each one is toward other cats
     pub fn baseline(a: (Temperament, bool), b: (Temperament, bool)) -> f32 {
@@ -59,21 +64,98 @@ impl Bond {
     }
 }
 
-/// Every pair's bond, by the two cats' names. Rows stay when a cat is removed, so adding a cat
-/// with the same name again brings its bonds back.
-#[derive(Debug, Default)]
-pub struct Bonds {
-    pairs: BTreeMap<(String, String), Bond>,
-    /// Where `save` writes; `None` (as in tests) doesn't save
-    path: Option<PathBuf>,
+/// A value for each pair of cats, by the two names in either order. Looking a pair up borrows
+/// the names, so the per-frame lookups don't allocate.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PairMap<T> {
+    /// By the lesser name, then the greater
+    map: BTreeMap<String, BTreeMap<String, T>>,
 }
 
-fn key(a: &str, b: &str) -> (String, String) {
-    if a <= b {
-        (a.to_string(), b.to_string())
-    } else {
-        (b.to_string(), a.to_string())
+impl<T> Default for PairMap<T> {
+    fn default() -> Self {
+        Self {
+            map: BTreeMap::new(),
+        }
     }
+}
+
+impl<T> PairMap<T> {
+    fn order<'a>(a: &'a str, b: &'a str) -> (&'a str, &'a str) {
+        if a <= b { (a, b) } else { (b, a) }
+    }
+
+    pub fn get(&self, a: &str, b: &str) -> Option<&T> {
+        let (lo, hi) = Self::order(a, b);
+        self.map.get(lo)?.get(hi)
+    }
+
+    pub fn get_mut(&mut self, a: &str, b: &str) -> Option<&mut T> {
+        let (lo, hi) = Self::order(a, b);
+        self.map.get_mut(lo)?.get_mut(hi)
+    }
+
+    /// The pair's value, first set to `value` if the pair has none
+    pub fn get_or_insert(&mut self, a: &str, b: &str, value: T) -> &mut T {
+        let (lo, hi) = Self::order(a, b);
+        if self.get(lo, hi).is_none() {
+            self.map
+                .entry(lo.to_string())
+                .or_default()
+                .insert(hi.to_string(), value);
+        }
+        self.map.get_mut(lo).and_then(|m| m.get_mut(hi)).unwrap()
+    }
+
+    pub fn insert(&mut self, a: &str, b: &str, value: T) {
+        match self.get_mut(a, b) {
+            Some(slot) => *slot = value,
+            None => {
+                let (lo, hi) = Self::order(a, b);
+                self.map
+                    .entry(lo.to_string())
+                    .or_default()
+                    .insert(hi.to_string(), value);
+            }
+        }
+    }
+
+    /// Drops every pair `name` is in
+    pub fn forget(&mut self, name: &str) {
+        self.map.remove(name);
+        for inner in self.map.values_mut() {
+            inner.remove(name);
+        }
+        self.map.retain(|_, inner| !inner.is_empty());
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.map.values().map(BTreeMap::len).sum()
+    }
+
+    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        self.map.values_mut().flat_map(BTreeMap::values_mut)
+    }
+
+    /// Every pair, the lesser name first, in order
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str, &T)> {
+        self.map.iter().flat_map(|(lo, inner)| {
+            inner
+                .iter()
+                .map(move |(hi, v)| (lo.as_str(), hi.as_str(), v))
+        })
+    }
+}
+
+/// Every pair's bond, by the two cats' names. A cat removed from the tray takes its bonds with
+/// it, so a new cat that gets its name starts as a stranger; a cat left out of the config by
+/// hand keeps them.
+#[derive(Debug, Default)]
+pub struct Bonds {
+    pairs: PairMap<Bond>,
+    /// Where `save` writes; `None` (as in tests) doesn't save
+    path: Option<PathBuf>,
 }
 
 impl Bonds {
@@ -102,16 +184,21 @@ impl Bonds {
     }
 
     pub fn get(&self, a: &str, b: &str) -> Option<Bond> {
-        self.pairs.get(&key(a, b)).copied()
+        self.pairs.get(a, b).copied()
     }
 
     pub fn set(&mut self, a: &str, b: &str, bond: Bond) {
-        self.pairs.insert(key(a, b), bond);
+        self.pairs.insert(a, b, bond);
+    }
+
+    /// Drops every bond `name` has
+    pub fn forget(&mut self, name: &str) {
+        self.pairs.forget(name);
     }
 
     pub fn to_toml_string(&self) -> String {
         let mut out = String::from("# Catsor: how well the cats know and like each other\n");
-        for ((a, b), bond) in &self.pairs {
+        for (a, b, bond) in self.pairs.iter() {
             out.push_str(&format!(
                 "\n[[bond]]\n\
                  a = \"{a}\"\n\
@@ -125,7 +212,8 @@ impl Bonds {
     }
 
     /// One `[[bond]]` table per pair. A table missing a name, naming the same cat twice or with
-    /// no valid numbers is skipped; a missing number starts from strangers' values.
+    /// no valid numbers is skipped; a missing familiarity is 0 (strangers) and a missing
+    /// affection 0 (neutral).
     pub fn parse_toml(input: &str) -> Self {
         #[derive(Default)]
         struct Row {
@@ -188,6 +276,19 @@ impl Bonds {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pairs_are_found_either_way_round_and_forgotten_by_name() {
+        let mut pairs = PairMap::default();
+        pairs.insert("Pip", "Luna", 1.0);
+        *pairs.get_or_insert("Luna", "Milo", 2.0) += 1.0;
+        pairs.insert("Milo", "Pip", 4.0);
+        assert_eq!(pairs.get("Luna", "Pip"), Some(&1.0));
+        assert_eq!(pairs.get("Milo", "Luna"), Some(&3.0));
+        pairs.forget("Pip");
+        let left: Vec<_> = pairs.iter().collect();
+        assert_eq!(left, [("Luna", "Milo", &3.0)]);
+    }
 
     #[test]
     fn bonds_roundtrip_and_skip_invalid_rows() {
