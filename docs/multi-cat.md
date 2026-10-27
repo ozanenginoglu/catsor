@@ -59,7 +59,7 @@ All cats follow. Instead of one `rest_target` per cat at `stop_radius` from the 
 - Slots are spaced by body size and assigned by approach angle, so cats don't cross paths to reach them. Assignments are sticky, so they don't swap every frame.
 - A kitten's slot is next to its mother's. *(Not done: kittens take their own slots after the grown cats; the leash keeps them within reach of their mother.)*
 - Temperament keeps working per cat: an Aloof cat can still hang back or take its AloofNotice pause, and a Lazy cat may stay asleep while the others move.
-- **Spacing:** separation steering while walking, plus a personal-space radius by temperament (Aloof large, Playful small, kitten↔mother almost zero). Cats only overlap during joint activities.
+- **Spacing:** separation steering while walking, plus a personal-space radius by temperament (Aloof large, Playful small, kitten↔mother almost zero). Cats only overlap during joint activities. *(Done: steering round the other cat's whole body, and `Clowder::separate` easing apart any bodies that still sink into each other, with some contact allowed per joint activity.)*
 - **Laser wiggle:** every cat in range gets excited, but only one gets to pounce on the cursor. The losers sit and flick their tails, or pounce on the winner's tail. *(Done. Only kittens and Playful cats go for the winner's tail; the winner doesn't notice.)*
 - **Shake over a cat** starts roaming for that cat only.
 - **Follow Cursor off** makes every cat roam. Kittens then stay within the leash of their roaming mother instead of wandering alone, and friends sometimes wander together. **Playful Hunting** is likewise one switch for everyone.

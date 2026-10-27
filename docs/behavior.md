@@ -203,7 +203,7 @@ With more than one cat, `Clowder` runs one feeding session (`FeedSession`) for o
 
 ## Several cats
 
-`Clowder` (`src/cat/clowder.rs`) owns every cat. Each frame it gives each cat a snapshot of the others from the previous frame (`Neighbor`: head, body point, personal-space radius), so the order cats are updated in never matters. A lone cat gets no neighbours and no slot, and behaves bit for bit like a bare `CatSim`.
+`Clowder` (`src/cat/clowder.rs`) owns every cat. Each frame it gives each cat a snapshot of the others from the previous frame (`Neighbor`: head, body point, rump, personal-space radius), so the order cats are updated in never matters. A lone cat gets no neighbours and no slot, and behaves bit for bit like a bare `CatSim`.
 
 **Slots.** A cat that rests round the cursor (or round the bowl while Waiting or Carrying) gets a `Slot`: an angle and a radius round that point. `Clowder::assign_slots` hands them out each frame, grown cats first, then kittens, then in list order:
 
@@ -213,7 +213,9 @@ With more than one cat, `Clowder` runs one feeding session (`FeedSession`) for o
 
 **Settling.** The cat walks to its slot point and counts as there within `SLOT_ARRIVAL` (12 px). It comes in from outside the circle facing the middle; a cat that would arrive facing outward overshoots by two body lengths and turns back, so it never sits down facing away or swings its head into the bowl. Once there it records where the cursor (or bowl) was (`slot_settled_at`), and from then on only that point moving wakes it: its effective distance is `stop_radius` plus how far the point has moved. The cursor jittering within the wake radii doesn't make settled cats shuffle.
 
-**Walking.** `steer_walk` pushes a walking cat away from other cats' heads and body points within personal space, so paths cross without overlapping.
+**Walking.** `steer_clear` leans a walking cat round other cats, judged from its head and from where it will be in `AVOID_LOOKAHEAD` (0.25 s at its speed). It treats each other cat's body as a segment from head to rump (`Neighbor::rump`). When that body lies across its path, the cat goes round the end nearer its line; otherwise it bears away from the body. Pushing straight off the head and middle steered cats between those two points, right through the body. The cat also slows down by up to `AVOID_BRAKE` (60%) for a cat right in its way. It ignores cats beyond its target, so one settled beside its spot doesn't keep it from arriving, and the cat it's doing something with (except when stalking its tail). Zoomies use the same steering. When the target is behind it (`ROUND_TURN`, 2.2 rad), a cat turns round the way that keeps its hindquarters clear of the cats beside it (`turn_clear_of_neighbors`).
+
+**Bodies don't pass through each other.** After every cat has moved, `Clowder::separate` checks each pair's bodies, one circle per body node (`CatSim::body_circles`, slightly inside the drawn outline), and eases any overlap apart at `SEPARATION_RATE` (18/s), moving the whole cat with `CatSim::shove`. How the push is split comes from `CatSim::give`: a moving cat gives way (1.0), a settled one holds its ground (0.15) and one asleep, lying, eating or kneading hardly budges (0.06), divided by scale² so kittens move more. A pair doing something together may press in by `SocialKind::contact` (6 px for head bunts, wrestling and a chaser catching up, 4 for grooming, sleeping together and nursing, 2 otherwise). A carried kitten is skipped. This catches what steering can't, such as a cat rolling over beside another. `cats_walk_round_each_other_rather_than_through` checks that bodies overlap by more than 4 px in under 1% of frames, and never by 10 px.
 
 Shakes, wiggles and Follow Cursor work per cat as before; Follow Cursor and Playful Hunting are one switch for every cat.
 

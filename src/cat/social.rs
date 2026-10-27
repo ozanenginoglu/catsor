@@ -362,8 +362,8 @@ impl CatSim {
             }
             // In front of the partner's face, a little to one side, then along its flank to its
             // hips, cheek against its side
-            (SocialKind::HeadBunt, false) => p.head + heading * (14.0 * s) + flank * (9.0 * s),
-            (SocialKind::HeadBunt, true) => p.center - heading * (16.0 * s) + flank * (10.0 * s),
+            (SocialKind::HeadBunt, false) => p.head + heading * (14.0 * s) + flank * (12.0 * s),
+            (SocialKind::HeadBunt, true) => p.center - heading * (16.0 * s) + flank * (12.0 * s),
             (SocialKind::Groom, false) => p.head + flank * (13.0 * s) - heading * (3.0 * s),
             // Comes up from behind along its friend's side, so it lies down alongside it
             (SocialKind::SleepTogether, false) if e.reached_side => {

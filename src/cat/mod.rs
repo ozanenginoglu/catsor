@@ -226,6 +226,8 @@ pub struct Neighbor {
     pub head: Vec2,
     /// Middle of the body (`CatSim::body_point`)
     pub center: Vec2,
+    /// Base of the tail, the back end of the body
+    pub rump: Vec2,
     /// End of the tail
     pub tail_tip: Vec2,
     /// Personal-space radius (already scaled)
@@ -249,6 +251,7 @@ impl Neighbor {
         Self {
             head,
             center: head + back * (CatSim::BODY_SPACING_OFFSET * scale),
+            rump: head + back * (38.0 * scale),
             tail_tip: head + back * (70.0 * scale),
             radius: CatSim::PERSONAL_SPACE * scale,
             scale,
@@ -474,6 +477,17 @@ impl SocialKind {
             self,
             Self::TailStalk | Self::Chase | Self::Wrestle | Self::Standoff | Self::Swat
         )
+    }
+
+    /// How far (unscaled px) the two cats' bodies may press into each other while doing it:
+    /// rubbing, cuddling, tangling and tagging squash fur together, the rest only touch
+    pub fn contact(self) -> f32 {
+        match self {
+            // A chaser that catches up bumps into the other
+            Self::HeadBunt | Self::Wrestle | Self::Chase => 6.0,
+            Self::Groom | Self::SleepTogether | Self::Nurse => 4.0,
+            _ => 2.0,
+        }
     }
 }
 
@@ -948,10 +962,21 @@ impl CatSim {
     /// How far (unscaled px) behind its head the middle of a cat's body is, for keeping cats
     /// apart
     pub const BODY_SPACING_OFFSET: f32 = 24.0;
+    /// Radius (unscaled px) of each body node's circle in `body_circles`, a little inside the
+    /// drawn head and torso half-widths
+    const BODY_RADII: [f32; BODY_NODES] = [6.5, 5.0, 7.5, 7.0, 7.0, 4.5];
     /// How close (unscaled px) a cat must be to its spot to count as there
     const SLOT_ARRIVAL: f32 = 12.0;
     /// How far (unscaled px, times the mother's scale) a kitten goes from its mother
     pub const KITTEN_LEASH: f32 = 150.0;
+    /// How far ahead (seconds at its current speed) a walking cat looks for other cats in its
+    /// way, at most its personal space
+    const AVOID_LOOKAHEAD: f32 = 0.25;
+    /// How much a walking cat slows down for another cat right in its way (0–1)
+    const AVOID_BRAKE: f32 = 0.6;
+    /// Heading error (rad) past which a walking cat turns round the way that keeps its
+    /// hindquarters clear of the cats beside it
+    const ROUND_TURN: f32 = 2.2;
     /// How far (unscaled px) away another cat can be for this one to watch it
     const WATCH_RANGE: f32 = 170.0;
     /// How close (unscaled px) a friend has to be for this cat to copy it
@@ -1445,6 +1470,80 @@ impl CatSim {
         self.nodes[0] - Vec2::from_angle(self.body_angle) * (Self::BODY_SPACING_OFFSET * self.scale)
     }
 
+    /// The body as seen from above for keeping cats from passing through each other: one
+    /// circle per body node (head, neck, shoulders, waist, hips, rump), a little inside the
+    /// drawn outline so cats can touch
+    pub fn body_circles(&self) -> [(Vec2, f32); BODY_NODES] {
+        std::array::from_fn(|i| (self.nodes[i], Self::BODY_RADII[i] * self.scale))
+    }
+
+    /// How deep (px) two cats' bodies sink into each other, and which way to push this one out
+    /// (a unit vector, zero when they don't touch)
+    pub fn body_overlap(&self, other: &CatSim) -> (f32, Vec2) {
+        let (mine, theirs) = (self.body_circles(), other.body_circles());
+        let mut deepest = (0.0, Vec2::ZERO);
+        for &(p, r) in &mine {
+            for &(q, rq) in &theirs {
+                let away = p - q;
+                let depth = r + rq - away.length();
+                if depth > deepest.0 {
+                    deepest = (depth, away.normalize_or(Vec2::X));
+                }
+            }
+        }
+        deepest
+    }
+
+    /// How readily this cat gives way when another cat's body presses into it: one on the
+    /// move steps aside, one settled holds its ground and one asleep or eating hardly budges.
+    /// Bigger cats give way less.
+    pub fn give(&self) -> f32 {
+        let give = match self.activity {
+            Activity::Walking
+            | Activity::StandingUp { .. }
+            | Activity::Pouncing { .. }
+            | Activity::Zoomies { .. }
+            | Activity::Sniffing { .. }
+            | Activity::Greeting { .. } => 1.0,
+            Activity::Sleeping
+            | Activity::Lying
+            | Activity::Eating { .. }
+            | Activity::Kneading { .. } => 0.06,
+            _ => 0.15,
+        };
+        give / (self.scale * self.scale)
+    }
+
+    /// Moves the whole cat by `by` without changing its pose, as when another cat's body
+    /// pushes it aside: the body, the planted paws and whatever spot it's moving round
+    pub fn shove(&mut self, by: Vec2) {
+        for node in &mut self.nodes {
+            *node += by;
+        }
+        for node in &mut self.carrier_nodes {
+            *node += by;
+        }
+        self.window_anchor += by;
+        for paw in &mut self.paws {
+            paw.world_pos += by;
+        }
+        match &mut self.activity {
+            Activity::TailChasing { center, .. }
+            | Activity::Circling { center, .. }
+            | Activity::Zoomies { center, .. }
+            | Activity::Sniffing { center, .. } => *center += by,
+            Activity::Pouncing {
+                start_pos,
+                target_pos,
+                ..
+            } => {
+                *start_pos += by;
+                *target_pos += by;
+            }
+            _ => {}
+        }
+    }
+
     /// Stable torso anchor in screen space for positioning the compact ARGB overlay window
     /// without jittering when the tail sways, hips wiggle, or posture curls/extends.
     pub fn window_center(&self) -> Vec2 {
@@ -1487,11 +1586,15 @@ pub fn pounce_stretch(progress: f32) -> f32 {
     smoothstep(progress / 0.2) * (1.0 - smoothstep((progress - 0.75) / 0.25))
 }
 
+/// How far (0–1) along the segment `a`–`b` the point nearest `p` is
+pub fn segment_t(p: Vec2, a: Vec2, b: Vec2) -> f32 {
+    let ab = b - a;
+    ((p - a).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0)
+}
+
 /// Distance from `p` to the segment `a`–`b`
 pub fn dist_to_segment(p: Vec2, a: Vec2, b: Vec2) -> f32 {
-    let ab = b - a;
-    let t = ((p - a).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
-    p.distance(a + ab * t)
+    p.distance(a + (b - a) * segment_t(p, a, b))
 }
 
 #[inline]

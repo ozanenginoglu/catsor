@@ -1,6 +1,6 @@
 use super::{
     Activity, BODY_NODES, CatSim, FeedPreset, FeedingPhase, Pose, SocialKind, SocialRole,
-    Temperament, dist_to_segment, pounce_stretch, pounce_travel, smoothstep, wrap_angle,
+    Temperament, dist_to_segment, pounce_stretch, pounce_travel, segment_t, smoothstep, wrap_angle,
 };
 use glam::Vec2;
 
@@ -1517,6 +1517,8 @@ impl CatSim {
         let target = center + Vec2::new(phase.cos() * radius, (phase * 2.0).sin() * radius * 0.55);
         let to_z = target - self.nodes[0];
         if to_z.length_squared() > 1.0 {
+            // Tearing round, but not through another cat
+            let (to_z, _) = self.steer_clear(to_z.normalize(), f32::INFINITY);
             let desired_angle = to_z.y.atan2(to_z.x);
             let diff = wrap_angle(desired_angle - self.body_angle);
             self.body_angle = wrap_angle(self.body_angle + diff * dt * 14.0);
@@ -1673,37 +1675,13 @@ impl CatSim {
         } else {
             Vec2::from_angle(self.body_angle)
         };
-        // Walk round other cats rather than through them: lean away from any cat close ahead
-        let my_radius = Self::PERSONAL_SPACE * self.scale;
-        if dist_to_target > my_radius {
-            let head = self.nodes[0];
-            let mut push = Vec2::ZERO;
-            // Up to the cat it's doing something with, except round to its tail
-            let partner = self
-                .social
-                .filter(|e| e.kind != SocialKind::TailStalk)
-                .map(|e| e.partner);
-            for (_, n) in self
-                .neighbors
-                .iter()
-                .enumerate()
-                .filter(|&(i, n)| Some(i) != partner && n.pose != Pose::Carried)
-            {
-                for p in [n.head, n.center] {
-                    let away = head - p;
-                    let d = away.length();
-                    let reach = (my_radius + n.radius) * 1.3;
-                    if d > 0.01 && d < reach && desired_dir.dot(-away) > 0.0 {
-                        push += away / d * (1.0 - d / reach);
-                    }
-                }
-            }
-            if push != Vec2::ZERO {
-                desired_dir = (desired_dir + push * 1.5).normalize_or(desired_dir);
-            }
+        // Walk round other cats rather than through them, slowing down for them
+        let mut crowded = 0.0;
+        if dist_to_target > Self::PERSONAL_SPACE * self.scale {
+            (desired_dir, crowded) = self.steer_clear(desired_dir, dist_to_target);
         }
         let desired_angle = desired_dir.y.atan2(desired_dir.x);
-        let angle_err = wrap_angle(desired_angle - self.body_angle);
+        let angle_err = self.turn_clear_of_neighbors(wrap_angle(desired_angle - self.body_angle));
 
         // Smooth, compact turn trajectory: scale turn rate up slightly when close to target
         // and slow forward speed smoothly during sharp heading changes so the turning radius
@@ -1758,7 +1736,8 @@ impl CatSim {
             cruise_speed * (dist_to_target / slow_radius).powf(brake_exp)
         } else {
             cruise_speed
-        } * turn_slowdown;
+        } * turn_slowdown
+            * (1.0 - Self::AVOID_BRAKE * crowded);
 
         let speed_rate = if dist_to_target < 12.0 * self.scale {
             24.0
@@ -1791,6 +1770,90 @@ impl CatSim {
             8.5
         };
         self.gait_weight += (target_gait_weight - self.gait_weight) * (1.0 - (-dt * gw_rate).exp());
+    }
+
+    /// Leans `desired_dir` away from any cat close ahead, judged from the head and from where
+    /// it's about to be, except the cat it's doing something with (unless stalking its tail)
+    /// and any further away than where it's going (`reach_target` px off): one settled beside
+    /// its spot isn't in its way. Also says how much in the way the nearest of them is (0–1),
+    /// to slow down for it.
+    fn steer_clear(&self, desired_dir: Vec2, reach_target: f32) -> (Vec2, f32) {
+        let my_radius = Self::PERSONAL_SPACE * self.scale;
+        let head = self.nodes[0];
+        let ahead = head
+            + Vec2::from_angle(self.body_angle)
+                * (self.speed * Self::AVOID_LOOKAHEAD).min(my_radius);
+        let partner = self
+            .social
+            .filter(|e| e.kind != SocialKind::TailStalk)
+            .map(|e| e.partner);
+        let mut push = Vec2::ZERO;
+        let mut crowded = 0.0_f32;
+        for (_, n) in self
+            .neighbors
+            .iter()
+            .enumerate()
+            .filter(|&(i, n)| Some(i) != partner && n.pose != Pose::Carried)
+        {
+            // The other cat's body, head to rump. Round whichever end is nearer the line it's
+            // walking along when the body lies across it, and away from the body otherwise:
+            // pushing off its head and its middle alone steers between them, right through it.
+            let across = desired_dir.perp();
+            let (off_head, off_rump) = ((n.head - head).dot(across), (n.rump - head).dot(across));
+            let side = if off_head * off_rump < 0.0 {
+                if off_head.abs() < off_rump.abs() {
+                    across * off_head.signum()
+                } else {
+                    across * off_rump.signum()
+                }
+            } else {
+                -across * (off_head + off_rump).signum()
+            };
+            for from in [head, ahead] {
+                let closest = n.rump + (n.head - n.rump) * segment_t(from, n.rump, n.head);
+                let away = from - closest;
+                let d = away.length();
+                let reach = (my_radius + n.radius) * 1.1;
+                if d > 0.01 && d < reach.min(reach_target) && desired_dir.dot(-away) > 0.0 {
+                    let near = 1.0 - d / reach;
+                    push += side * near;
+                    crowded = crowded.max(near * desired_dir.dot(-away / d));
+                }
+            }
+        }
+        if push == Vec2::ZERO {
+            return (desired_dir, 0.0);
+        }
+        (
+            (desired_dir + push * 1.5).normalize_or(desired_dir),
+            crowded,
+        )
+    }
+
+    /// Which way to turn round when the target is behind: the long way round if the short
+    /// way would swing the cat's hindquarters into a cat beside them
+    fn turn_clear_of_neighbors(&self, angle_err: f32) -> f32 {
+        if angle_err.abs() < Self::ROUND_TURN || self.neighbors.is_empty() {
+            return angle_err;
+        }
+        let rump = self.body_point();
+        // Turning one way swings the hindquarters out the other way
+        let swing = -Vec2::from_angle(self.body_angle).perp() * angle_err.signum();
+        let reach = 2.0 * Self::PERSONAL_SPACE * self.scale;
+        let in_the_way = self
+            .neighbors
+            .iter()
+            .filter(|n| n.pose != Pose::Carried)
+            .flat_map(|n| [n.head, n.center])
+            .any(|p| {
+                let to = p - rump;
+                to.length() < reach && to.dot(swing) > 0.0
+            });
+        if in_the_way {
+            angle_err - std::f32::consts::TAU * angle_err.signum()
+        } else {
+            angle_err
+        }
     }
 
     /// Eases posture extension and spine curl toward the current activity's pose.

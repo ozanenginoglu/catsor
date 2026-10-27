@@ -6,8 +6,8 @@
 //! first.
 
 use super::{
-    Activity, CatSim, FeedPreset, Kinship, Neighbor, Pose, Slot, SocialKind, SocialRole,
-    TOTAL_NODES, Temperament, wrap_angle,
+    Activity, BODY_NODES, CatSim, FeedPreset, Kinship, Neighbor, Pose, Slot, SocialKind,
+    SocialRole, TOTAL_NODES, Temperament, wrap_angle,
 };
 use crate::bonds::{Bond, Bonds, PairMap};
 use crate::coat::{Coat, CoatId, CoatLibrary, fresh_seed};
@@ -45,6 +45,8 @@ const PLAY_REST: f32 = 25.0;
 const SQUABBLE_REST: f32 = 120.0;
 /// How long (seconds) the cat that got the laser dot keeps it after it last crouched or leapt
 const LASER_HOLD: f32 = 3.0;
+/// How fast (1/s) two cats whose bodies sank into each other are eased apart
+const SEPARATION_RATE: f32 = 18.0;
 /// How many days a kitten that grows up takes to become a grown cat
 pub const GROW_UP_DAYS: f32 = 30.0;
 /// The size a kitten grows to (unless it was already bigger)
@@ -557,8 +559,47 @@ impl Clowder {
             }
         }
         self.hang_carried(cursor, dt);
+        self.separate(dt);
         self.tick_feeding(dt);
         self.update_bonds(dt);
+    }
+
+    /// Eases apart any two cats whose bodies sank into each other this tick, beyond what
+    /// they're doing together allows, the one that gives way more moving further. Walking round
+    /// each other is the cats' own job; this catches what steering can't, such as a cat turning
+    /// its rump into another or rolling over beside it.
+    fn separate(&mut self, dt: f32) {
+        let n = self.members.len();
+        let ease = 1.0 - (-dt * SEPARATION_RATE).exp();
+        let mut shoves = vec![Vec2::ZERO; n];
+        for i in 0..n {
+            for j in i + 1..n {
+                let (a, b) = (&self.members[i].cat, &self.members[j].cat);
+                if Pose::of(a) == Pose::Carried || Pose::of(b) == Pose::Carried {
+                    continue;
+                }
+                let contact = match a.social {
+                    Some(e) if self.members[i].partner == Some(j) => {
+                        e.kind.contact() * 0.5 * (a.scale + b.scale)
+                    }
+                    _ => 0.0,
+                };
+                let (depth, out) = a.body_overlap(b);
+                let excess = depth - contact;
+                if excess <= 0.0 {
+                    continue;
+                }
+                let (give_a, give_b) = (a.give(), b.give());
+                let push = out * (excess * ease / (give_a + give_b));
+                shoves[i] += push * give_a;
+                shoves[j] -= push * give_b;
+            }
+        }
+        for (m, by) in self.members.iter_mut().zip(shoves) {
+            if by != Vec2::ZERO {
+                m.cat.shove(by);
+            }
+        }
     }
 
     /// What cat `j` is to cat `i`
@@ -639,6 +680,7 @@ impl Clowder {
                 seen.push(Neighbor {
                     head: cat.nodes[0],
                     center: cat.body_point(),
+                    rump: cat.nodes[BODY_NODES - 1],
                     tail_tip: cat.nodes[TOTAL_NODES - 1],
                     radius: CatSim::PERSONAL_SPACE * cat.scale,
                     scale: cat.scale,
@@ -2459,14 +2501,16 @@ mod tests {
     #[test]
     fn cats_get_to_know_each_other_and_friends_sit_closer() {
         let start = Vec2::new(600.0, 400.0);
-        let mut group = clowder(
+        let group = clowder(
             &[profile("Luna"), profile("Milo"), kitten_of("Pip", "Luna")],
             start,
         );
-        let first = group.bond(0, 1);
-        assert_eq!(first.familiarity, 0.0);
         let family = group.bond(0, 2);
         assert!(family.familiarity >= 0.9 && family.affection >= 0.8);
+        // Two grown cats (a kitten would draw its mother off to sleep with it, wherever it is)
+        let mut group = clowder(&[profile("Luna"), profile("Milo")], start);
+        let first = group.bond(0, 1);
+        assert_eq!(first.familiarity, 0.0);
         run(&mut group, start, 600.0);
         let later = group.bond(0, 1);
         assert!(later.familiarity > 0.2, "familiarity {}", later.familiarity);
@@ -3019,5 +3063,100 @@ mod tests {
         assert!(group.feeding.is_some(), "feeding stopped");
         let eater = group.feeding.as_ref().and_then(|s| s.eater).unwrap();
         assert!(matches!(group.cat(eater).activity, Activity::Eating { .. }));
+    }
+
+    /// A cursor that rests at one spot, glides to the next over 1.5 s, and rests again, round
+    /// a loop that sends the cats across and round each other
+    fn wandering_cursor(t: f32) -> Vec2 {
+        const SPOTS: [Vec2; 6] = [
+            Vec2::new(600.0, 400.0),
+            Vec2::new(900.0, 420.0),
+            Vec2::new(620.0, 450.0),
+            Vec2::new(760.0, 250.0),
+            Vec2::new(780.0, 560.0),
+            Vec2::new(500.0, 300.0),
+        ];
+        let leg = 18.0;
+        let k = (t / leg) as usize;
+        let (from, to) = (SPOTS[k % SPOTS.len()], SPOTS[(k + 1) % SPOTS.len()]);
+        let glide = ((t - k as f32 * leg - (leg - 1.5)) / 1.5).clamp(0.0, 1.0);
+        from + (to - from) * glide
+    }
+
+    /// Over `secs` of the cats following `cursor`, how deep (px) two cats' bodies sank into
+    /// each other at worst, beyond what they were doing together allows, and how many
+    /// frames they did so by more than `slack` px (a kitten in its mother's mouth aside)
+    fn overlaps(
+        group: &mut Clowder,
+        cursor: impl Fn(f32) -> Vec2,
+        secs: f32,
+        slack: f32,
+    ) -> (f32, usize) {
+        let (mut worst, mut frames) = (0.0_f32, 0);
+        for k in 0..(secs / DT) as usize {
+            group.update(cursor(k as f32 * DT), DT);
+            let mut sank = false;
+            for i in 0..group.len() {
+                for j in i + 1..group.len() {
+                    let (a, b) = (group.cat(i), group.cat(j));
+                    if [a, b].iter().any(|c| Pose::of(c) == Pose::Carried) {
+                        continue;
+                    }
+                    let contact = match a.social {
+                        Some(e) if group.members[i].partner == Some(j) => {
+                            e.kind.contact() * 0.5 * (a.scale + b.scale)
+                        }
+                        _ => 0.0,
+                    };
+                    let excess = a.body_overlap(b).0 - contact;
+                    worst = worst.max(excess);
+                    sank |= excess > slack;
+                }
+            }
+            frames += usize::from(sank);
+        }
+        (worst, frames)
+    }
+
+    #[test]
+    fn cats_walk_round_each_other_rather_than_through() {
+        // A brush in passing now and then (under one frame in 100), never half through
+        let check = |group: &mut Clowder, cursor: &dyn Fn(f32) -> Vec2, secs: f32| {
+            let (worst, frames) = overlaps(group, cursor, secs, 4.0);
+            assert!(worst < 10.0, "bodies sank {worst} px into each other");
+            let total = (secs / DT) as usize;
+            assert!(
+                frames * 100 < total,
+                "overlapped in {frames} of {total} frames"
+            );
+        };
+        let profiles = [
+            profile("Luna"),
+            profile("Milo"),
+            profile("Mochi"),
+            kitten_of("Pip", "Luna"),
+        ];
+        let start = Vec2::new(600.0, 400.0);
+        check(
+            &mut clowder(&profiles, start).without_social(),
+            &wandering_cursor,
+            216.0,
+        );
+        // Friends getting on and playing, and kittens chasing and wrestling
+        let mut group = clowder(&profiles, start);
+        for (i, j) in [(0, 1), (0, 2), (1, 2)] {
+            group.set_bond(i, j, FRIENDS);
+        }
+        check(&mut group, &wandering_cursor, 216.0);
+        let profiles = [
+            profile("Luna"),
+            kitten_of("Pip", "Luna"),
+            kitten_of("Nori", "Luna"),
+        ];
+        check(
+            &mut clowder(&profiles, start),
+            &|t| shifting_cursor(start, t),
+            600.0,
+        );
     }
 }
