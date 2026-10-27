@@ -14,7 +14,8 @@ use crate::coat::{
 use crate::preview::{Pose, posed, render_cropped};
 use crate::render::{color as to_color, render_tray_icon};
 use crate::tray::{
-    build_rounded_rect, draw_checkbox_indicator, draw_text, draw_text_sized, glyph_5x7,
+    build_rounded_rect, draw_checkbox_indicator, draw_text, draw_text_sized, push_drawable,
+    text_end_x,
 };
 use tiny_skia::{
     Color, FillRule, Paint, PathBuilder, Pixmap, PixmapMut, PixmapPaint, PremultipliedColorU8,
@@ -553,10 +554,9 @@ impl Designer {
                 }
             }
             DesignerInput::Char(c) => match self.focus {
+                // ':' would read as part of a coat id
                 Some(Focus::Name) => {
-                    let allowed = c == ' ' || (c != ':' && glyph_5x7(c) != [0; 7]);
-                    if allowed && self.design.name.chars().count() < MAX_NAME_CHARS {
-                        self.design.name.push(c);
+                    if c != ':' && push_drawable(&mut self.design.name, c, MAX_NAME_CHARS) {
                         self.design_changed();
                     }
                 }
@@ -737,7 +737,7 @@ impl Designer {
             );
         }
         if name_focused {
-            let cx = LEFT + 7.0 + self.design.name.chars().count() as f32 * 6.0;
+            let cx = text_end_x(&self.design.name, LEFT + 7.0);
             fill(
                 pixmap,
                 rect(cx, NAME_Y + 5.0, 1.0, 10.0),
@@ -1141,6 +1141,7 @@ impl Designer {
 mod tests {
     use super::*;
     use crate::coat::{COATS_FILE, CoatStyle};
+    use crate::tray::glyph_5x7;
     use glam::Vec2;
 
     fn centre(r: Rect) -> (f32, f32) {

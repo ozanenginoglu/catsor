@@ -1,11 +1,15 @@
 use crate::autostart;
-use crate::cat::clowder::{Clowder, unix_now};
+use crate::cat::clowder::{
+    CatNameProblem, Clowder, MAX_CAT_NAME_CHARS, cat_name_problem, unix_now,
+};
 use crate::cat::{Activity, FeedPreset, Temperament};
 use crate::coat::{Coat, CoatId, CoatLibrary, fresh_seed};
 use crate::prefs::UserPrefs;
 use crate::render::coat_swatch_colors;
 #[cfg(not(any(target_os = "windows", windows_check)))]
 use crate::render::render_tray_icon;
+#[cfg(not(any(target_os = "windows", windows_check)))]
+use crate::x11::Keymap;
 use std::borrow::Cow;
 #[cfg(any(not(any(target_os = "windows", windows_check)), test))]
 use tiny_skia::Pixmap;
@@ -100,23 +104,64 @@ impl TrayState {
     }
 }
 
-/// Which page of the menu is showing: the main page, or one cat's page (its submenu)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Which page of the menu is showing: the main page, one cat's page (its submenu), or the
+/// field for typing a cat's new name
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) enum MenuPage {
     #[default]
     Main,
     Cat(usize),
+    Rename {
+        cat: usize,
+        /// The name typed so far
+        draft: String,
+    },
+}
+
+/// A key press as a text field sees it: a typed character or an editing key. The backends
+/// turn their key events into these for the tray menu's rename field and the coat designer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextKey {
+    Char(char),
+    Backspace,
+    Enter,
+    Escape,
+}
+
+/// What a key press did to the menu
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum KeyOutcome {
+    Ignored,
+    /// The page changed; redraw it
+    Redraw,
+    Close,
+    /// The page changed, and the app has this to carry out
+    Action(TrayAction),
 }
 
 impl MenuPage {
-    /// Applies a navigation action (opening a cat's page, going back) and returns true, or
-    /// returns false for any other action. Removing a cat also goes back to the main page.
-    pub(crate) fn navigate(&mut self, action: TrayAction) -> bool {
-        match action {
+    /// Applies a navigation action (opening a cat's page or its rename field, going back) and
+    /// returns true, or returns false for any other action. Removing a cat also goes back to
+    /// the main page, and renaming one back to its page.
+    pub(crate) fn navigate(&mut self, action: &TrayAction, state: &TrayState) -> bool {
+        match *action {
             TrayAction::OpenCat(i) => *self = MenuPage::Cat(i),
             TrayAction::ShowMain => *self = MenuPage::Main,
+            TrayAction::StartRename(i) => {
+                // Starts from the current name, cut to what could be typed (a hand-edited
+                // config may hold more)
+                let mut draft = String::new();
+                for c in state.cats.get(i).map_or("", |c| c.name.as_str()).chars() {
+                    push_drawable(&mut draft, c, MAX_CAT_NAME_CHARS);
+                }
+                *self = MenuPage::Rename { cat: i, draft };
+            }
             TrayAction::RemoveCat(_) => {
                 *self = MenuPage::Main;
+                return false;
+            }
+            TrayAction::RenameCat(i, _) => {
+                *self = MenuPage::Cat(i);
                 return false;
             }
             _ => return false,
@@ -126,21 +171,71 @@ impl MenuPage {
 
     /// Falls back to the main page when the cat this page shows is gone
     pub(crate) fn validate(&mut self, state: &TrayState) {
-        if let MenuPage::Cat(i) = *self
+        if let MenuPage::Cat(i) | MenuPage::Rename { cat: i, .. } = *self
             && i >= state.cats.len()
         {
             *self = MenuPage::Main;
         }
     }
+
+    /// Handles a key press: typing edits the name on the rename page, Enter saves it and
+    /// Escape goes back to the cat's page; elsewhere Escape closes the menu
+    pub(crate) fn key(&mut self, key: TextKey, state: &TrayState) -> KeyOutcome {
+        let MenuPage::Rename { cat, draft } = self else {
+            return if key == TextKey::Escape {
+                KeyOutcome::Close
+            } else {
+                KeyOutcome::Ignored
+            };
+        };
+        let cat = *cat;
+        match key {
+            TextKey::Char(c) => {
+                if !push_drawable(draft, c, MAX_CAT_NAME_CHARS) {
+                    return KeyOutcome::Ignored;
+                }
+            }
+            TextKey::Backspace => {
+                if draft.pop().is_none() {
+                    return KeyOutcome::Ignored;
+                }
+            }
+            TextKey::Escape => *self = MenuPage::Cat(cat),
+            TextKey::Enter => {
+                let Ok(action) = rename_action(state, cat, draft) else {
+                    return KeyOutcome::Ignored;
+                };
+                self.navigate(&action, state);
+                return KeyOutcome::Action(action);
+            }
+        }
+        KeyOutcome::Redraw
+    }
+}
+
+/// The action that gives cat `i` the name `draft`, or why it can't have it
+fn rename_action(state: &TrayState, i: usize, draft: &str) -> Result<TrayAction, CatNameProblem> {
+    let others = state.cats.iter().enumerate();
+    let others = others
+        .filter(|&(j, _)| j != i)
+        .map(|(_, c)| c.name.as_str());
+    match cat_name_problem(draft, others) {
+        Some(problem) => Err(problem),
+        None => Ok(TrayAction::RenameCat(i, draft.trim().to_string())),
+    }
 }
 
 /// What a menu click asks for. A `usize` is the index of the cat it applies to.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TrayAction {
     /// Show a cat's page (its submenu); handled by the menu itself
     OpenCat(usize),
     /// Back to the main page; handled by the menu itself
     ShowMain,
+    /// Show the field for typing a cat's new name; handled by the menu itself
+    StartRename(usize),
+    /// Give a cat a new name
+    RenameCat(usize, String),
     /// Advance to the next built-in or custom coat
     NextCoat(usize),
     /// Roll a new random coat
@@ -202,6 +297,12 @@ pub(crate) fn apply_shared_action(
         TrayAction::SetTemperament(i, temp) if valid(i) => {
             clowder.cat_mut(i).behaviors.temperament = temp;
         }
+        TrayAction::RenameCat(i, name) if valid(i) => {
+            if let Err(problem) = clowder.rename(i, &name) {
+                eprintln!("catsor: can't rename the cat to {name:?}: {problem:?}");
+                return None;
+            }
+        }
         TrayAction::AddCat => {
             clowder.add_cat();
         }
@@ -226,6 +327,8 @@ pub(crate) fn apply_shared_action(
         // Navigation is the menu's own business, and a stale cat index does nothing
         TrayAction::OpenCat(_)
         | TrayAction::ShowMain
+        | TrayAction::StartRename(_)
+        | TrayAction::RenameCat(..)
         | TrayAction::NextCoat(_)
         | TrayAction::RandomCoat(_)
         | TrayAction::SetTemperament(..)
@@ -247,6 +350,10 @@ pub(crate) fn apply_shared_action(
 pub(crate) enum MenuRow {
     Header(Cow<'static, str>),
     Separator,
+    /// A text field showing what is being typed, with a caret at its end
+    Field(String),
+    /// A line of dim text in place of an item
+    Note(Cow<'static, str>),
     Item {
         label: Cow<'static, str>,
         action: TrayAction,
@@ -280,7 +387,7 @@ pub(crate) enum Indicator {
 /// Coat swatch colours: `(base, accent, outline)`
 pub(crate) type Swatch = (Color, Color, Color);
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct HitEntry {
     pub y_top: i16,
     pub y_bottom: i16,
@@ -369,6 +476,8 @@ pub struct TrayController {
     menu_page: MenuPage,
     hovered_idx: Option<usize>,
     hit_entries: Vec<HitEntry>,
+    /// To read what is typed into the rename field
+    keymap: Keymap,
     // Root position of the tray icon the menu was opened from
     menu_anchor: (i16, i16),
 
@@ -489,7 +598,7 @@ impl TrayController {
         conn.create_gc(tray_gc, tray_win, &CreateGCAux::new())?;
 
         // Create popup menu window (initially unmapped)
-        let rows = build_rows(&initial_state, MenuPage::Main);
+        let rows = build_rows(&initial_state, &MenuPage::Main);
         let (menu_h, hit_entries) = compute_layout(&rows);
         let menu_w = MENU_WIDTH;
         let menu_win = conn.generate_id()?;
@@ -591,6 +700,11 @@ impl TrayController {
             menu_page: MenuPage::Main,
             hovered_idx: None,
             hit_entries,
+            // Without the mapping only Esc works, which is no reason to lose the tray
+            keymap: Keymap::load(conn).unwrap_or_else(|e| {
+                eprintln!("catsor: failed to read the keyboard mapping: {e}");
+                Keymap::default()
+            }),
             sys_tray_atom,
             sys_tray_opcode_atom,
             xembed_info_atom,
@@ -771,8 +885,8 @@ impl TrayController {
                     } else if (ev.detail == 1 || ev.detail == 3)
                         && let Some(idx) = self.hit_test(lx, ly)
                     {
-                        let entry = self.hit_entries[idx];
-                        if self.menu_page.navigate(entry.action) {
+                        let entry = self.hit_entries[idx].clone();
+                        if self.menu_page.navigate(&entry.action, &self.last_state) {
                             self.hovered_idx = None;
                             self.redraw_menu(conn)?;
                             return Ok(None);
@@ -799,9 +913,24 @@ impl TrayController {
                     self.redraw_menu(conn)?;
                 }
             }
-            // Escape keycode on X11 is 9
-            Event::KeyPress(ev) if self.menu_open && ev.detail == 9 => {
-                self.close_menu(conn)?;
+            Event::KeyPress(ev) if self.menu_open => {
+                let Some(key) = self.keymap.text_key(ev.detail, ev.state) else {
+                    return Ok(None);
+                };
+                match self.menu_page.key(key, &self.last_state) {
+                    KeyOutcome::Ignored => {}
+                    // Typing can swap the Save row for a note, so a highlight may be stale
+                    KeyOutcome::Redraw => {
+                        self.hovered_idx = None;
+                        self.redraw_menu(conn)?;
+                    }
+                    KeyOutcome::Close => self.close_menu(conn)?,
+                    KeyOutcome::Action(action) => {
+                        self.hovered_idx = None;
+                        self.redraw_menu(conn)?;
+                        return Ok(Some(action));
+                    }
+                }
             }
             _ => {}
         }
@@ -819,7 +948,7 @@ impl TrayController {
         icon_root_y: i16,
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.menu_page = MenuPage::Main;
-        let rows = build_rows(&self.last_state, self.menu_page);
+        let rows = build_rows(&self.last_state, &self.menu_page);
         let (menu_h, hit_entries) = compute_layout(&rows);
         self.menu_h = menu_h;
         self.hit_entries = hit_entries;
@@ -927,7 +1056,7 @@ impl TrayController {
 
     fn redraw_menu<C: Connection>(&mut self, conn: &C) -> Result<(), Box<dyn std::error::Error>> {
         self.menu_page.validate(&self.last_state);
-        let rows = build_rows(&self.last_state, self.menu_page);
+        let rows = build_rows(&self.last_state, &self.menu_page);
         let (menu_h, hit_entries) = compute_layout(&rows);
         let resized = menu_h != self.menu_h;
         self.menu_h = menu_h;
@@ -1014,11 +1143,46 @@ fn next_in<T: Copy + PartialEq>(all: &[T], current: T) -> T {
 
 /// The rows of `page`: the main page lists the cats, feeding and the global switches; a cat's
 /// page has that cat's own settings
-pub(crate) fn build_rows(state: &TrayState, page: MenuPage) -> Vec<MenuRow> {
+pub(crate) fn build_rows(state: &TrayState, page: &MenuPage) -> Vec<MenuRow> {
     match page {
-        MenuPage::Cat(i) if i < state.cats.len() => cat_rows(state, i),
+        &MenuPage::Cat(i) if i < state.cats.len() => cat_rows(state, i),
+        MenuPage::Rename { cat, draft } if *cat < state.cats.len() => {
+            rename_rows(state, *cat, draft)
+        }
         _ => main_rows(state),
     }
+}
+
+fn rename_rows(state: &TrayState, i: usize, draft: &str) -> Vec<MenuRow> {
+    let mut rows = vec![
+        MenuRow::Item {
+            label: Cow::Borrowed("Back"),
+            action: TrayAction::OpenCat(i),
+            indicator: Indicator::Back,
+            close_on_click: false,
+        },
+        MenuRow::Separator,
+        MenuRow::Header(Cow::Owned(format!(
+            "RENAME {}",
+            state.cats[i].name.to_uppercase()
+        ))),
+        MenuRow::Field(draft.to_string()),
+    ];
+    rows.push(match rename_action(state, i, draft) {
+        Ok(action) => MenuRow::Item {
+            label: Cow::Borrowed("Save Name"),
+            action,
+            indicator: Indicator::Edit,
+            close_on_click: false,
+        },
+        Err(problem) => MenuRow::Note(Cow::Borrowed(match problem {
+            CatNameProblem::Empty => "Type a name",
+            CatNameProblem::Taken => "Another cat has that name",
+            CatNameProblem::TooLong => "That name is too long",
+            CatNameProblem::Quote => "Names cannot have quote marks",
+        })),
+    });
+    rows
 }
 
 fn cat_rows(state: &TrayState, i: usize) -> Vec<MenuRow> {
@@ -1037,6 +1201,12 @@ fn cat_rows(state: &TrayState, i: usize) -> Vec<MenuRow> {
         cat.name.clone()
     };
     rows.push(MenuRow::Header(Cow::Owned(title.to_uppercase())));
+    rows.push(MenuRow::Item {
+        label: Cow::Borrowed("Rename..."),
+        action: TrayAction::StartRename(i),
+        indicator: Indicator::Edit,
+        close_on_click: false,
+    });
     rows.push(MenuRow::Item {
         label: Cow::Owned(format!("Coat: {}", cat.coat.name)),
         action: TrayAction::NextCoat(i),
@@ -1213,6 +1383,9 @@ pub(crate) fn compute_layout(rows: &[MenuRow]) -> (u16, Vec<HitEntry>) {
             MenuRow::Separator => {
                 y += 7;
             }
+            MenuRow::Field(_) | MenuRow::Note(_) => {
+                y += 19;
+            }
             MenuRow::Item {
                 action,
                 close_on_click,
@@ -1222,7 +1395,7 @@ pub(crate) fn compute_layout(rows: &[MenuRow]) -> (u16, Vec<HitEntry>) {
                 hits.push(HitEntry {
                     y_top: y,
                     y_bottom: y + row_h,
-                    action: *action,
+                    action: action.clone(),
                     close_on_click: *close_on_click,
                 });
                 y += row_h;
@@ -1291,6 +1464,47 @@ pub(crate) fn render_menu_pixmap(
                     pixmap.fill_rect(rect, &paint, Transform::identity(), None);
                 }
                 y += 7.0;
+            }
+            MenuRow::Field(text) => {
+                if let Some(field) = build_rounded_rect(10.0, y + 1.0, w - 20.0, 17.0, 4.0) {
+                    paint.set_color(Color::from_rgba8(0x16, 0x17, 0x1f, 255));
+                    pixmap.fill_path(
+                        &field,
+                        &paint,
+                        FillRule::Winding,
+                        Transform::identity(),
+                        None,
+                    );
+                    paint.set_color(Color::from_rgba8(0xbd, 0x93, 0xf9, 230));
+                    let st = Stroke {
+                        width: 1.0,
+                        ..Default::default()
+                    };
+                    pixmap.stroke_path(&field, &paint, &st, Transform::identity(), None);
+                }
+                draw_text(
+                    pixmap,
+                    text,
+                    16.0,
+                    y + 6.0,
+                    Color::from_rgba8(0xf8, 0xf8, 0xf2, 238),
+                );
+                let caret_x = text_end_x(text, 16.0);
+                if let Some(caret) = Rect::from_xywh(caret_x, y + 4.5, 1.0, 10.0) {
+                    paint.set_color(Color::from_rgba8(0xf8, 0xf8, 0xf2, 238));
+                    pixmap.fill_rect(caret, &paint, Transform::identity(), None);
+                }
+                y += 19.0;
+            }
+            MenuRow::Note(text) => {
+                draw_text(
+                    pixmap,
+                    text,
+                    32.0,
+                    y + 6.0,
+                    Color::from_rgba8(0xf8, 0xf8, 0xf2, 110),
+                );
+                y += 19.0;
             }
             MenuRow::Item {
                 label, indicator, ..
@@ -1608,6 +1822,22 @@ pub(crate) fn build_rounded_rect(
 }
 
 /// Draws crisp 5x7 bitmap text onto `pixmap`.
+/// Appends `c` to a text field's `text` if the bitmap font can draw it and `text` has fewer
+/// than `max` characters; returns whether it did
+pub(crate) fn push_drawable(text: &mut String, c: char, max: usize) -> bool {
+    let drawable = c == ' ' || glyph_5x7(c) != [0; 7];
+    if !drawable || text.chars().count() >= max {
+        return false;
+    }
+    text.push(c);
+    true
+}
+
+/// Where the caret goes after `text` drawn from `x` by [`draw_text`]
+pub(crate) fn text_end_x(text: &str, x: f32) -> f32 {
+    x + text.chars().count() as f32 * 6.0
+}
+
 pub(crate) fn draw_text(pixmap: &mut PixmapMut, text: &str, x: f32, y: f32, color: Color) {
     draw_text_sized(pixmap, text, x, y, 1.0, color);
 }
@@ -1893,12 +2123,12 @@ mod tests {
         }
     }
 
-    fn actions(state: &TrayState, page: MenuPage) -> Vec<TrayAction> {
+    fn actions(state: &TrayState, page: &MenuPage) -> Vec<TrayAction> {
         let (_, hits) = compute_layout(&build_rows(state, page));
         hits.into_iter().map(|h| h.action).collect()
     }
 
-    fn label_of(state: &TrayState, page: MenuPage, action: TrayAction) -> String {
+    fn label_of(state: &TrayState, page: &MenuPage, action: TrayAction) -> String {
         build_rows(state, page)
             .into_iter()
             .find_map(|row| match row {
@@ -1916,7 +2146,7 @@ mod tests {
         state.cats.push(tray_cat("Pip", Coat::random(7), true));
         state.feed_preset = Some(FeedPreset::Mins30);
         state.feed_remaining_secs = Some(1795);
-        let rows = build_rows(&state, MenuPage::Main);
+        let rows = build_rows(&state, &MenuPage::Main);
         let (menu_h, hits) = compute_layout(&rows);
 
         // 2 cats + add cat + size + 5 feed presets + stop + 2 toggles + show + login + about
@@ -1930,7 +2160,7 @@ mod tests {
             .map(|i| tray_cat("Cat", Coat::random(i as u32), false))
             .collect();
         full.can_add = false;
-        let (full_h, _) = compute_layout(&build_rows(&full, MenuPage::Main));
+        let (full_h, _) = compute_layout(&build_rows(&full, &MenuPage::Main));
         assert!(full_h < 480, "full_h = {full_h}");
 
         // Verify every hit region is strictly ordered and non-overlapping
@@ -1959,30 +2189,33 @@ mod tests {
         assert!(hits[15].close_on_click);
 
         // A grown cat's page, when there is more than one cat
-        let cat_rows = build_rows(&state, MenuPage::Cat(0));
+        let cat_rows = build_rows(&state, &MenuPage::Cat(0));
         let (cat_h, cat_hits) = compute_layout(&cat_rows);
-        let cat_actions: Vec<_> = cat_hits.iter().map(|h| h.action).collect();
+        let cat_actions: Vec<_> = cat_hits.iter().map(|h| h.action.clone()).collect();
         assert_eq!(
-            cat_actions[..4],
+            cat_actions[..5],
             [
                 TrayAction::ShowMain,
+                TrayAction::StartRename(0),
                 TrayAction::NextCoat(0),
                 TrayAction::RandomCoat(0),
                 TrayAction::OpenDesigner(0),
             ]
         );
-        assert!(matches!(cat_actions[4], TrayAction::SetTemperament(0, _)));
+        assert!(matches!(cat_actions[5], TrayAction::SetTemperament(0, _)));
         assert_eq!(
-            cat_actions[5..],
+            cat_actions[6..],
             [TrayAction::AddKitten(0), TrayAction::RemoveCat(0)]
         );
-        assert!(cat_hits[3].close_on_click);
+        assert!(cat_hits[4].close_on_click);
 
         for h in hits.iter().chain(&cat_hits) {
             if matches!(
                 h.action,
                 TrayAction::OpenCat(_)
                     | TrayAction::ShowMain
+                    | TrayAction::StartRename(_)
+                    | TrayAction::RenameCat(..)
                     | TrayAction::NextCoat(_)
                     | TrayAction::RandomCoat(_)
                     | TrayAction::SetScale(_)
@@ -2012,31 +2245,31 @@ mod tests {
         let mut state = test_state();
         // A lone cat can't be removed
         assert!(
-            !actions(&state, MenuPage::Cat(0))
+            !actions(&state, &MenuPage::Cat(0))
                 .iter()
                 .any(|a| matches!(a, TrayAction::RemoveCat(_)))
         );
         // Kittens don't have kittens, and a full clowder takes no more cats
         state.cats.push(tray_cat("Pip", Coat::random(7), true));
-        let kitten_page = actions(&state, MenuPage::Cat(1));
+        let kitten_page = actions(&state, &MenuPage::Cat(1));
         assert!(!kitten_page.contains(&TrayAction::AddKitten(1)));
         assert!(kitten_page.contains(&TrayAction::RemoveCat(1)));
         // Only a kitten can grow up; its page says how long it has left
         assert!(kitten_page.contains(&TrayAction::ToggleGrowsUp(1)));
-        assert!(!actions(&state, MenuPage::Cat(0)).contains(&TrayAction::ToggleGrowsUp(0)));
+        assert!(!actions(&state, &MenuPage::Cat(0)).contains(&TrayAction::ToggleGrowsUp(0)));
         state.cats[1].days_to_grow = Some(12);
         assert_eq!(
-            label_of(&state, MenuPage::Cat(1), TrayAction::ToggleGrowsUp(1)),
+            label_of(&state, &MenuPage::Cat(1), TrayAction::ToggleGrowsUp(1)),
             "Grows Up (12 days left)"
         );
-        assert!(label_of(&state, MenuPage::Main, TrayAction::OpenCat(1)).contains("kitten"));
+        assert!(label_of(&state, &MenuPage::Main, TrayAction::OpenCat(1)).contains("kitten"));
         state.can_add = false;
-        assert!(!actions(&state, MenuPage::Main).contains(&TrayAction::AddCat));
-        assert!(!actions(&state, MenuPage::Cat(0)).contains(&TrayAction::AddKitten(0)));
+        assert!(!actions(&state, &MenuPage::Main).contains(&TrayAction::AddCat));
+        assert!(!actions(&state, &MenuPage::Cat(0)).contains(&TrayAction::AddKitten(0)));
         // A stale page shows the main page
         assert_eq!(
-            actions(&state, MenuPage::Cat(5)),
-            actions(&state, MenuPage::Main)
+            actions(&state, &MenuPage::Cat(5)),
+            actions(&state, &MenuPage::Main)
         );
     }
 
@@ -2045,16 +2278,24 @@ mod tests {
         let mut state = test_state();
         state.cats.push(tray_cat("Pip", Coat::random(7), true));
         let mut page = MenuPage::Main;
-        assert!(page.navigate(TrayAction::OpenCat(1)));
+        assert!(page.navigate(&TrayAction::OpenCat(1), &state));
         assert_eq!(page, MenuPage::Cat(1));
-        assert!(!page.navigate(TrayAction::NextCoat(1)));
+        assert!(!page.navigate(&TrayAction::NextCoat(1), &state));
         assert_eq!(page, MenuPage::Cat(1));
-        assert!(page.navigate(TrayAction::ShowMain));
+        assert!(page.navigate(&TrayAction::ShowMain, &state));
         assert_eq!(page, MenuPage::Main);
 
         // Removing goes back to the main page but is still for the app to carry out
         page = MenuPage::Cat(1);
-        assert!(!page.navigate(TrayAction::RemoveCat(1)));
+        assert!(!page.navigate(&TrayAction::RemoveCat(1), &state));
+        assert_eq!(page, MenuPage::Main);
+
+        page = MenuPage::Rename {
+            cat: 1,
+            draft: String::new(),
+        };
+        state.cats.truncate(1);
+        page.validate(&state);
         assert_eq!(page, MenuPage::Main);
 
         page = MenuPage::Cat(1);
@@ -2064,11 +2305,87 @@ mod tests {
     }
 
     #[test]
+    fn renaming_types_into_the_field_and_saves_a_free_name() {
+        let mut state = test_state();
+        state.cats.push(tray_cat("Pip", Coat::random(7), true));
+        let mut page = MenuPage::Cat(1);
+        assert!(page.navigate(&TrayAction::StartRename(1), &state));
+        let draft = |page: &MenuPage| match page {
+            MenuPage::Rename { draft, .. } => draft.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(draft(&page), "Pip");
+        let save = |page: &MenuPage| {
+            actions(&state, page)
+                .into_iter()
+                .find(|a| matches!(a, TrayAction::RenameCat(..)))
+        };
+        // Its own name can be saved again
+        assert_eq!(save(&page), Some(TrayAction::RenameCat(1, "Pip".into())));
+
+        for _ in 0..3 {
+            assert_eq!(page.key(TextKey::Backspace, &state), KeyOutcome::Redraw);
+        }
+        assert_eq!(page.key(TextKey::Backspace, &state), KeyOutcome::Ignored);
+        // Nothing to save while it's empty or taken
+        assert_eq!(save(&page), None);
+        assert_eq!(page.key(TextKey::Enter, &state), KeyOutcome::Ignored);
+        for c in "Luna".chars() {
+            page.key(TextKey::Char(c), &state);
+        }
+        assert_eq!(save(&page), None);
+        assert_eq!(page.key(TextKey::Enter, &state), KeyOutcome::Ignored);
+
+        // Only what the font can draw is typed, up to the longest name
+        page.key(TextKey::Char(' '), &state);
+        for c in ['"', '#', 'é', '2'] {
+            page.key(TextKey::Char(c), &state);
+        }
+        assert_eq!(draft(&page), "Luna 2");
+        for _ in 0..MAX_CAT_NAME_CHARS {
+            page.key(TextKey::Char('x'), &state);
+        }
+        assert_eq!(draft(&page).chars().count(), MAX_CAT_NAME_CHARS);
+        let rows = build_rows(&state, &page);
+        let (h, _) = compute_layout(&rows);
+        let mut pixmap = Pixmap::new(MENU_WIDTH as u32, h as u32).unwrap();
+        render_menu_pixmap(&rows, None, &mut pixmap.as_mut());
+
+        while draft(&page) != "Luna 2" {
+            page.key(TextKey::Backspace, &state);
+        }
+        // Enter saves (trimmed) and goes back to the cat's page
+        page.key(TextKey::Char(' '), &state);
+        assert_eq!(
+            page.key(TextKey::Enter, &state),
+            KeyOutcome::Action(TrayAction::RenameCat(1, "Luna 2".into()))
+        );
+        assert_eq!(page, MenuPage::Cat(1));
+
+        // Escape leaves the field without saving, then closes the menu
+        assert!(page.navigate(&TrayAction::StartRename(1), &state));
+        assert_eq!(page.key(TextKey::Escape, &state), KeyOutcome::Redraw);
+        assert_eq!(page, MenuPage::Cat(1));
+        assert_eq!(page.key(TextKey::Escape, &state), KeyOutcome::Close);
+        assert_eq!(page.key(TextKey::Char('a'), &state), KeyOutcome::Ignored);
+
+        // A hand-edited name the field couldn't hold starts cut to what it can
+        state.cats[1].name = "Sir \"Fluff\" McWhiskerton III".into();
+        assert!(page.navigate(&TrayAction::StartRename(1), &state));
+        assert_eq!(draft(&page), "Sir Fluff McWhis");
+        assert!(
+            actions(&state, &page)
+                .iter()
+                .any(|a| matches!(a, TrayAction::RenameCat(..)))
+        );
+    }
+
+    #[test]
     fn stop_feeding_row_only_while_feeding() {
         let mut state = test_state();
-        assert!(!actions(&state, MenuPage::Main).contains(&TrayAction::StopFeeding));
+        assert!(!actions(&state, &MenuPage::Main).contains(&TrayAction::StopFeeding));
         state.feed_preset = Some(FeedPreset::Indefinite);
-        assert!(actions(&state, MenuPage::Main).contains(&TrayAction::StopFeeding));
+        assert!(actions(&state, &MenuPage::Main).contains(&TrayAction::StopFeeding));
 
         let active = Some(FeedPreset::Hour1);
         assert_eq!(
@@ -2086,20 +2403,20 @@ mod tests {
         let mut state = test_state();
         let page = MenuPage::Cat(0);
         assert_eq!(
-            label_of(&state, page, TrayAction::NextCoat(0)),
+            label_of(&state, &page, TrayAction::NextCoat(0)),
             "Coat: Calico"
         );
         assert_eq!(
-            label_of(&state, page, TrayAction::RandomCoat(0)),
+            label_of(&state, &page, TrayAction::RandomCoat(0)),
             "Random Coat"
         );
         assert_eq!(
-            label_of(&state, page, TrayAction::OpenDesigner(0)),
+            label_of(&state, &page, TrayAction::OpenDesigner(0)),
             "Design Coat..."
         );
         state.cats[0].coat = Coat::random(42);
         assert_eq!(
-            label_of(&state, page, TrayAction::NextCoat(0)),
+            label_of(&state, &page, TrayAction::NextCoat(0)),
             format!("Coat: {}", state.cats[0].coat.name)
         );
         // Random coat names and the cat names handed out only use characters the bitmap font has
@@ -2120,7 +2437,7 @@ mod tests {
         for _ in 0..Temperament::ALL.len() {
             let current = state.cats[0].temperament;
             seen.push(current);
-            let next = actions(&state, page)
+            let next = actions(&state, &page)
                 .into_iter()
                 .find_map(|a| match a {
                     TrayAction::SetTemperament(0, t) => Some(t),
@@ -2128,7 +2445,7 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(
-                label_of(&state, page, TrayAction::SetTemperament(0, next)),
+                label_of(&state, &page, TrayAction::SetTemperament(0, next)),
                 format!("Temperament: {}", current.label())
             );
             state.cats[0].temperament = next;
@@ -2141,7 +2458,7 @@ mod tests {
     fn size_row_cycles_presets_and_shows_custom_scale() {
         let mut state = test_state();
         let next_scale = |state: &TrayState| {
-            actions(state, MenuPage::Main)
+            actions(state, &MenuPage::Main)
                 .into_iter()
                 .find_map(|a| match a {
                     TrayAction::SetScale(s) => Some(s),
@@ -2150,7 +2467,7 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(
-            label_of(&state, MenuPage::Main, TrayAction::SetScale(1.35)),
+            label_of(&state, &MenuPage::Main, TrayAction::SetScale(1.35)),
             "Size: Normal 1.0x"
         );
         assert_eq!(next_scale(&state), 1.35);
@@ -2159,7 +2476,7 @@ mod tests {
 
         state.scale = 1.5;
         assert_eq!(
-            label_of(&state, MenuPage::Main, TrayAction::SetScale(1.75)),
+            label_of(&state, &MenuPage::Main, TrayAction::SetScale(1.75)),
             "Size: Custom 1.50x"
         );
         assert_eq!(next_scale(&state), 1.75);
@@ -2169,7 +2486,7 @@ mod tests {
 
     #[test]
     fn about_row_shows_version_and_links_to_repository() {
-        let label = label_of(&test_state(), MenuPage::Main, TrayAction::OpenAbout);
+        let label = label_of(&test_state(), &MenuPage::Main, TrayAction::OpenAbout);
         assert_eq!(
             label,
             format!("About Catsor v{}", env!("CARGO_PKG_VERSION"))
@@ -2183,7 +2500,7 @@ mod tests {
     fn show_cat_checkbox_reflects_visibility() {
         let mut state = test_state();
         let checked = |state: &TrayState| {
-            build_rows(state, MenuPage::Main)
+            build_rows(state, &MenuPage::Main)
                 .into_iter()
                 .find_map(|row| match row {
                     MenuRow::Item {

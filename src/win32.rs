@@ -10,8 +10,9 @@ use crate::render::{
     bowl_window_dim, cat_window_dim, render_bowl_overlay, render_cats, render_tray_icon,
 };
 use crate::tray::{
-    ABOUT_URL, HitEntry, MENU_WIDTH, MenuPage, TrayAction, TrayState, apply_shared_action,
-    build_rows, compute_layout, hit_test_entries, render_menu_pixmap, rgba_to_bgra,
+    ABOUT_URL, HitEntry, KeyOutcome, MENU_WIDTH, MenuPage, TextKey, TrayAction, TrayState,
+    apply_shared_action, build_rows, compute_layout, hit_test_entries, render_menu_pixmap,
+    rgba_to_bgra,
 };
 use core::cell::RefCell;
 use core::ffi::c_void;
@@ -282,7 +283,7 @@ struct MenuWndState {
 impl MenuWndState {
     fn redraw_menu(&mut self) {
         self.menu_page.validate(&self.last_state);
-        let rows = build_rows(&self.last_state, self.menu_page);
+        let rows = build_rows(&self.last_state, &self.menu_page);
         let (menu_h, hit_entries) = compute_layout(&rows);
         let resized = menu_h != self.menu_h;
         self.menu_h = menu_h;
@@ -316,7 +317,7 @@ impl MenuWndState {
 
     fn prepare_open_at_cursor(&mut self) -> (HWND, i32, i32, i32, i32) {
         self.menu_page = MenuPage::Main;
-        let rows = build_rows(&self.last_state, self.menu_page);
+        let rows = build_rows(&self.last_state, &self.menu_page);
         let (menu_h, hit_entries) = compute_layout(&rows);
         self.menu_h = menu_h;
         self.hit_entries = hit_entries;
@@ -422,7 +423,7 @@ impl WinTrayController {
         menu_class_name: &[u16],
         initial_state: TrayState,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let rows = build_rows(&initial_state, MenuPage::Main);
+        let rows = build_rows(&initial_state, &MenuPage::Main);
         let (menu_h, hit_entries) = compute_layout(&rows);
         let taskbar_created_msg =
             unsafe { RegisterWindowMessageW(to_wide_null("TaskbarCreated").as_ptr()) };
@@ -676,14 +677,15 @@ unsafe extern "system" fn menu_wnd_proc(
         WM_LBUTTONDOWN | WM_RBUTTONDOWN => {
             let hide_hwnd = {
                 let mut st = state_cell.borrow_mut();
+                let st = &mut *st;
                 if st.menu_open {
                     let lx = (lparam & 0xFFFF) as i16;
                     let ly = ((lparam >> 16) & 0xFFFF) as i16;
                     if lx < 0 || ly < 0 || lx >= st.menu_w as i16 || ly >= st.menu_h as i16 {
                         st.mark_closed()
                     } else if let Some(idx) = hit_test_entries(&st.hit_entries, st.menu_w, lx, ly) {
-                        let entry = st.hit_entries[idx];
-                        if st.menu_page.navigate(entry.action) {
+                        let entry = st.hit_entries[idx].clone();
+                        if st.menu_page.navigate(&entry.action, &st.last_state) {
                             st.hovered_idx = None;
                             st.redraw_menu();
                             None
@@ -705,11 +707,39 @@ unsafe extern "system" fn menu_wnd_proc(
             hide_menu_window(hide_hwnd);
             0
         }
-        WM_KEYDOWN => {
-            if (wparam as u16) == VK_ESCAPE {
-                let hide_hwnd = state_cell.borrow_mut().mark_closed();
-                hide_menu_window(hide_hwnd);
-            }
+        WM_KEYDOWN | WM_CHAR => {
+            // Escape comes as a key; typing, Backspace and Enter as characters
+            let key = match (msg, wparam as u32) {
+                (WM_KEYDOWN, k) if k == VK_ESCAPE as u32 => Some(TextKey::Escape),
+                (WM_CHAR, 0x08) => Some(TextKey::Backspace),
+                (WM_CHAR, 0x0d) => Some(TextKey::Enter),
+                (WM_CHAR, c) if c >= 0x20 => char::from_u32(c).map(TextKey::Char),
+                _ => None,
+            };
+            let hide_hwnd = {
+                let mut st = state_cell.borrow_mut();
+                let st = &mut *st;
+                match key.filter(|_| st.menu_open) {
+                    Some(key) => match st.menu_page.key(key, &st.last_state) {
+                        KeyOutcome::Ignored => None,
+                        // Typing can swap the Save row for a note, so a highlight may be stale
+                        KeyOutcome::Redraw => {
+                            st.hovered_idx = None;
+                            st.redraw_menu();
+                            None
+                        }
+                        KeyOutcome::Close => st.mark_closed(),
+                        KeyOutcome::Action(action) => {
+                            st.actions.push_back(action);
+                            st.hovered_idx = None;
+                            st.redraw_menu();
+                            None
+                        }
+                    },
+                    None => None,
+                }
+            };
+            hide_menu_window(hide_hwnd);
             0
         }
         WM_ACTIVATE => {
@@ -1363,6 +1393,8 @@ impl WinApp {
                 // Handled by `apply_shared_action`
                 TrayAction::OpenCat(_)
                 | TrayAction::ShowMain
+                | TrayAction::StartRename(_)
+                | TrayAction::RenameCat(..)
                 | TrayAction::NextCoat(_)
                 | TrayAction::RandomCoat(_)
                 | TrayAction::SetTemperament(..)

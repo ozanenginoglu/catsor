@@ -59,6 +59,39 @@ pub fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// The longest name a cat can be given, so it fits on the tray menu
+pub const MAX_CAT_NAME_CHARS: usize = 16;
+
+/// Why a name can't be given to a cat
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatNameProblem {
+    Empty,
+    TooLong,
+    /// A double quote or backslash would break the saved TOML string
+    Quote,
+    /// Another cat has it
+    Taken,
+}
+
+/// Why a cat can't be called `name` (trimmed) when the other cats are called `others`
+pub fn cat_name_problem<'a>(
+    name: &str,
+    mut others: impl Iterator<Item = &'a str>,
+) -> Option<CatNameProblem> {
+    let name = name.trim();
+    if name.is_empty() {
+        Some(CatNameProblem::Empty)
+    } else if name.chars().count() > MAX_CAT_NAME_CHARS {
+        Some(CatNameProblem::TooLong)
+    } else if name.contains(['"', '\\']) {
+        Some(CatNameProblem::Quote)
+    } else if others.any(|other| other == name) {
+        Some(CatNameProblem::Taken)
+    } else {
+        None
+    }
+}
+
 /// Names handed to cats added from the tray, in order, skipping names already in use
 const NAMES: [&str; 12] = [
     "Luna", "Milo", "Pip", "Mochi", "Olive", "Biscuit", "Nori", "Ziggy", "Maple", "Tofu",
@@ -312,6 +345,32 @@ impl Clowder {
 
     pub fn index_of(&self, name: &str) -> Option<usize> {
         self.members.iter().position(|m| m.name == name)
+    }
+
+    /// Calls cat `i` `name` (trimmed). Its bonds and its kittens' `mother` follow the new name.
+    pub fn rename(&mut self, i: usize, name: &str) -> Result<(), CatNameProblem> {
+        let others = self.members.iter().enumerate();
+        let others = others
+            .filter(|&(j, _)| j != i)
+            .map(|(_, m)| m.name.as_str());
+        if let Some(problem) = cat_name_problem(name, others) {
+            return Err(problem);
+        }
+        let name = name.trim();
+        if self.members[i].name == name {
+            return Ok(());
+        }
+        let old = std::mem::replace(&mut self.members[i].name, name.to_string());
+        for m in &mut self.members {
+            if m.mother.as_deref() == Some(old.as_str()) {
+                m.mother = Some(name.to_string());
+            }
+        }
+        self.bonds.rename(&old, name);
+        self.apart.rename(&old, name);
+        self.play_rest.rename(&old, name);
+        self.save_bonds_now();
+        Ok(())
     }
 
     /// The first name from `NAMES` nobody uses yet, or "Cat N"
@@ -2253,6 +2312,41 @@ mod tests {
         };
         group.set_bond(0, 1, close);
         assert!(group.remove(1));
+        let newcomer = group.add_cat().unwrap();
+        assert_eq!(group.members()[newcomer].name, "Milo");
+        assert!(group.bond(0, newcomer).familiarity < 0.1);
+    }
+
+    #[test]
+    fn a_renamed_cat_keeps_its_bonds_and_kittens() {
+        let start = Vec2::new(600.0, 400.0);
+        let mut group = clowder(
+            &[profile("Luna"), profile("Milo"), kitten_of("Pip", "Luna")],
+            start,
+        );
+        let close = Bond {
+            familiarity: 0.9,
+            affection: 0.8,
+        };
+        group.set_bond(0, 1, close);
+        assert_eq!(group.rename(0, "Milo"), Err(CatNameProblem::Taken));
+        assert_eq!(group.rename(0, "  "), Err(CatNameProblem::Empty));
+        assert_eq!(group.rename(0, "Bad \"name\""), Err(CatNameProblem::Quote));
+        assert_eq!(
+            group.rename(0, &"x".repeat(MAX_CAT_NAME_CHARS + 1)),
+            Err(CatNameProblem::TooLong)
+        );
+        assert_eq!(group.members()[0].name, "Luna");
+        // Its own name again is fine
+        assert_eq!(group.rename(0, "Luna"), Ok(()));
+
+        assert_eq!(group.rename(0, " Mrs Whiskers "), Ok(()));
+        assert_eq!(group.members()[0].name, "Mrs Whiskers");
+        assert_eq!(group.members()[2].mother.as_deref(), Some("Mrs Whiskers"));
+        assert_eq!(group.bond(0, 1), close);
+        // The old name is free again, and whoever takes it is a stranger
+        assert_eq!(group.rename(1, "Luna"), Ok(()));
+        assert_eq!(group.bond(0, 1), close);
         let newcomer = group.add_cat().unwrap();
         assert_eq!(group.members()[newcomer].name, "Milo");
         assert!(group.bond(0, newcomer).familiarity < 0.1);

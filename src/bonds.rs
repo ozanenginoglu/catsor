@@ -129,6 +129,19 @@ impl<T> PairMap<T> {
         self.map.retain(|_, inner| !inner.is_empty());
     }
 
+    /// Moves every pair `old` is in over to `new`, first dropping any pairs `new` had
+    pub fn rename(&mut self, old: &str, new: &str) {
+        self.forget(new);
+        let mut moved: Vec<(String, T)> = self.map.remove(old).into_iter().flatten().collect();
+        for (lo, inner) in &mut self.map {
+            moved.extend(inner.remove(old).map(|v| (lo.clone(), v)));
+        }
+        self.map.retain(|_, inner| !inner.is_empty());
+        for (other, v) in moved {
+            self.insert(new, &other, v);
+        }
+    }
+
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.map.values().map(BTreeMap::len).sum()
@@ -194,6 +207,11 @@ impl Bonds {
     /// Drops every bond `name` has
     pub fn forget(&mut self, name: &str) {
         self.pairs.forget(name);
+    }
+
+    /// Moves every bond `old` has over to `new`
+    pub fn rename(&mut self, old: &str, new: &str) {
+        self.pairs.rename(old, new);
     }
 
     pub fn to_toml_string(&self) -> String {
@@ -288,6 +306,26 @@ mod tests {
         pairs.forget("Pip");
         let left: Vec<_> = pairs.iter().collect();
         assert_eq!(left, [("Luna", "Milo", &3.0)]);
+    }
+
+    #[test]
+    fn renaming_moves_every_pair_and_drops_the_new_names_old_pairs() {
+        let mut pairs = PairMap::default();
+        pairs.insert("Pip", "Luna", 1.0);
+        pairs.insert("Milo", "Pip", 2.0);
+        pairs.insert("Luna", "Milo", 3.0);
+        // A pair left behind by a cat once called Zed
+        pairs.insert("Zed", "Luna", 9.0);
+        pairs.rename("Pip", "Zed");
+        let left: Vec<_> = pairs.iter().collect();
+        assert_eq!(
+            left,
+            [
+                ("Luna", "Milo", &3.0),
+                ("Luna", "Zed", &1.0),
+                ("Milo", "Zed", &2.0)
+            ]
+        );
     }
 
     #[test]

@@ -84,6 +84,7 @@ A cat's page (**Back** returns to the main page):
 
 | Row | What it does |
 |---|---|
+| **Rename...** | Opens a field in the menu: type the new name (up to 16 letters, digits, spaces and `.!()&-/:`), then Enter or **Save Name**; Esc goes back. The cat keeps its bonds and kittens |
 | **Coat** | Click to cycle Calico → Brown → Charcoal → Tuxedo → Silver, then your [custom coats](#custom-coats) |
 | **Random Coat** | Rolls a new random coat (see below) |
 | **Design Coat...** | Opens the [coat designer](#coat-designer) for this cat |

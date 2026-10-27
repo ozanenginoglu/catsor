@@ -8,7 +8,7 @@ use crate::designer::{DESIGNER_H, DESIGNER_TITLE, DESIGNER_W, Designer, Designer
 use crate::prefs::UserPrefs;
 use crate::render::{bowl_window_dim, cat_window_dim, render_bowl_overlay, render_cats};
 use crate::tray::{
-    ABOUT_URL, TrayAction, TrayController, TrayState, apply_shared_action, rgba_to_bgra,
+    ABOUT_URL, TextKey, TrayAction, TrayController, TrayState, apply_shared_action, rgba_to_bgra,
 };
 use glam::Vec2;
 use std::time::{Duration, Instant};
@@ -345,10 +345,7 @@ struct DesignerWindow {
     wm_protocols: Atom,
     wm_delete: Atom,
     net_active_window: Atom,
-    /// Keyboard mapping, to turn keycodes into keysyms without xkbcommon
-    min_keycode: u8,
-    keysyms_per_keycode: u8,
-    keysyms: Vec<Keysym>,
+    keymap: Keymap,
     designer: Designer,
     /// Reused frame buffers, reallocated when the window is resized
     frame: Pixmap,
@@ -472,11 +469,7 @@ impl DesignerWindow {
         let gc = conn.generate_id()?;
         conn.create_gc(gc, win, &CreateGCAux::new())?;
 
-        let setup = conn.setup();
-        let (min_keycode, max_keycode) = (setup.min_keycode, setup.max_keycode);
-        let mapping = conn
-            .get_keyboard_mapping(min_keycode, max_keycode - min_keycode + 1)?
-            .reply()?;
+        let keymap = Keymap::load(conn)?;
 
         conn.map_window(win)?;
         conn.flush()?;
@@ -489,9 +482,7 @@ impl DesignerWindow {
             wm_protocols,
             wm_delete,
             net_active_window,
-            min_keycode,
-            keysyms_per_keycode: mapping.keysyms_per_keycode,
-            keysyms: mapping.keysyms,
+            keymap,
             designer: Designer::new(current, coats),
             frame: Pixmap::new(w as u32, h as u32).ok_or("Failed to allocate Pixmap")?,
             bgra: Vec::new(),
@@ -513,26 +504,6 @@ impl DesignerWindow {
             ev,
         )?;
         Ok(())
-    }
-
-    /// The keysym for a key press, from the keycode's first two columns
-    fn keysym(&self, keycode: u8, state: KeyButMask) -> Keysym {
-        let per = self.keysyms_per_keycode as usize;
-        let base = keycode.saturating_sub(self.min_keycode) as usize * per;
-        let col = |i: usize| {
-            if i < per {
-                self.keysyms.get(base + i).copied().unwrap_or(0)
-            } else {
-                0
-            }
-        };
-        resolve_keysym(
-            col(0),
-            col(1),
-            state.contains(KeyButMask::SHIFT),
-            state.contains(KeyButMask::LOCK),
-            state.contains(KeyButMask::MOD2),
-        )
     }
 
     /// Turns an event on the designer window into designer input. `None` means the event
@@ -585,20 +556,12 @@ impl DesignerWindow {
             }
             Event::LeaveNotify(ev) if ev.event == self.win => DesignerInput::Leave,
             Event::KeyPress(ev) if ev.event == self.win => {
-                match self.keysym(ev.detail, ev.state) {
-                    0xff08 => DesignerInput::Backspace,
-                    0xff0d | 0xff8d => DesignerInput::Enter,
-                    0xff1b => DesignerInput::Escape,
-                    // Keypad digits (with NumLock on)
-                    sym @ 0xffb0..=0xffb9 => {
-                        DesignerInput::Char((b'0' + (sym - 0xffb0) as u8) as char)
-                    }
-                    // Printable ASCII and Latin-1 keysyms equal their code points
-                    sym @ (0x20..=0x7e | 0xa0..=0xff) => match char::from_u32(sym) {
-                        Some(c) => DesignerInput::Char(c),
-                        None => return Some(false),
-                    },
-                    _ => return Some(false),
+                match self.keymap.text_key(ev.detail, ev.state) {
+                    Some(TextKey::Char(c)) => DesignerInput::Char(c),
+                    Some(TextKey::Backspace) => DesignerInput::Backspace,
+                    Some(TextKey::Enter) => DesignerInput::Enter,
+                    Some(TextKey::Escape) => DesignerInput::Escape,
+                    None => return Some(false),
                 }
             }
             Event::DestroyNotify(ev) if ev.window == self.win => return Some(true),
@@ -1061,6 +1024,8 @@ impl X11App {
             // Handled by `apply_shared_action`, or a stale cat index
             TrayAction::OpenCat(_)
             | TrayAction::ShowMain
+            | TrayAction::StartRename(_)
+            | TrayAction::RenameCat(..)
             | TrayAction::NextCoat(_)
             | TrayAction::RandomCoat(_)
             | TrayAction::OpenDesigner(_)
@@ -1274,6 +1239,74 @@ fn open_about_page() {
     }
 }
 
+/// The keyboard mapping, to turn keycodes into keysyms without xkbcommon. The default (empty)
+/// one knows only Escape
+#[derive(Default)]
+pub(crate) struct Keymap {
+    min_keycode: u8,
+    keysyms_per_keycode: u8,
+    keysyms: Vec<Keysym>,
+}
+
+impl Keymap {
+    pub(crate) fn load<C: Connection>(conn: &C) -> BoxResult<Self> {
+        let setup = conn.setup();
+        let (min_keycode, max_keycode) = (setup.min_keycode, setup.max_keycode);
+        let mapping = conn
+            .get_keyboard_mapping(min_keycode, max_keycode - min_keycode + 1)?
+            .reply()?;
+        Ok(Self {
+            min_keycode,
+            keysyms_per_keycode: mapping.keysyms_per_keycode,
+            keysyms: mapping.keysyms,
+        })
+    }
+
+    /// The keysym for a key press, from the keycode's first two columns
+    fn keysym(&self, keycode: u8, state: KeyButMask) -> Keysym {
+        let per = self.keysyms_per_keycode as usize;
+        let base = keycode.saturating_sub(self.min_keycode) as usize * per;
+        let col = |i: usize| {
+            if i < per {
+                self.keysyms.get(base + i).copied().unwrap_or(0)
+            } else {
+                0
+            }
+        };
+        resolve_keysym(
+            col(0),
+            col(1),
+            state.contains(KeyButMask::SHIFT),
+            state.contains(KeyButMask::LOCK),
+            state.contains(KeyButMask::MOD2),
+        )
+    }
+
+    /// A key press as text editing sees it: a character, or one of the editing keys
+    pub(crate) fn text_key(&self, keycode: u8, state: KeyButMask) -> Option<TextKey> {
+        // Escape's usual keycode
+        if self.keysyms.is_empty() && keycode == 9 {
+            return Some(TextKey::Escape);
+        }
+        // Ctrl, Alt or Super with a key is a shortcut, not typing
+        let shortcut = state.intersects(KeyButMask::CONTROL | KeyButMask::MOD1 | KeyButMask::MOD4);
+        match self.keysym(keycode, state) {
+            0xff08 => Some(TextKey::Backspace),
+            0xff0d | 0xff8d => Some(TextKey::Enter),
+            0xff1b => Some(TextKey::Escape),
+            // Keypad digits (with NumLock on)
+            sym @ 0xffb0..=0xffb9 if !shortcut => {
+                Some(TextKey::Char((b'0' + (sym - 0xffb0) as u8) as char))
+            }
+            // Printable ASCII and Latin-1 keysyms equal their code points
+            sym @ (0x20..=0x7e | 0xa0..=0xff) if !shortcut => {
+                char::from_u32(sym).map(TextKey::Char)
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Picks the keysym for a key press from the keycode's first two keysym columns (unshifted,
 /// shifted), following the core protocol rules: Shift selects the second column, Caps Lock
 /// only shifts letters (Shift + Caps Lock gives lower case), and with NumLock on keypad keys
@@ -1294,7 +1327,31 @@ fn resolve_keysym(col0: Keysym, col1: Keysym, shift: bool, lock: bool, numlock: 
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_keysym;
+    use super::{Keymap, TextKey, resolve_keysym};
+    use x11rb::protocol::xproto::KeyButMask;
+
+    #[test]
+    fn shortcuts_dont_type_and_an_empty_keymap_still_knows_escape() {
+        // Keycode 38: a / A; keycode 22: BackSpace
+        let keymap = Keymap {
+            min_keycode: 22,
+            keysyms_per_keycode: 2,
+            keysyms: [[0xff08, 0].as_slice(), &[0; 30], &[0x61, 0x41]].concat(),
+        };
+        let none = KeyButMask::default();
+        assert_eq!(keymap.text_key(38, none), Some(TextKey::Char('a')));
+        assert_eq!(
+            keymap.text_key(38, KeyButMask::SHIFT),
+            Some(TextKey::Char('A'))
+        );
+        for held in [KeyButMask::CONTROL, KeyButMask::MOD1, KeyButMask::MOD4] {
+            assert_eq!(keymap.text_key(38, held), None);
+            assert_eq!(keymap.text_key(22, held), Some(TextKey::Backspace));
+        }
+        let empty = Keymap::default();
+        assert_eq!(empty.text_key(9, none), Some(TextKey::Escape));
+        assert_eq!(empty.text_key(38, none), None);
+    }
 
     #[test]
     fn caps_lock_shifts_only_letters_and_numlock_enables_keypad_digits() {
