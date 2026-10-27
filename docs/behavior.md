@@ -190,6 +190,30 @@ Every trigger except Pounce **latches** `wake_anchor` on the next `update`, so t
 
 When the timer finishes, or on `stop_feeding()`, the phase is cleared and the cat grooms for 2.6 s with a fresh `wake_anchor`, then goes back to following. Keep-awake is active during WalkingToBowl and Eating. See [platform-notes.md](platform-notes.md#keep-awake-feeding-mode).
 
+### Sharing the bowl
+
+With more than one cat, `Clowder` runs one feeding session (`FeedSession`) for one bowl:
+
+- While the bowl is being placed, every cat is in Carrying and follows it, each on a slot round it. On the click, the queue is built: **kittens first, then grown cats, each group nearest first**. The first cat gets `place_bowl_for_turn`; the others get `wait_for_bowl` and enter a fourth phase, **Waiting**, in which they sit `BOWL_WAIT_RADIUS` (50 px) from the bowl on slots of their own (see below), and don't pounce, gallop or start zoomies.
+- A turn lasts `min(150 s, time left in the preset)`. When it ends, the eater gets up and waits again at the back of the queue, and the next cat walks in. The bowl level (`bowl_fill`) is shared, so it keeps draining across turns.
+- The session ends when less than 1 s of the preset is left, or on Stop Feeding. A lone cat eats the whole preset in one turn, exactly as above.
+
+## Several cats
+
+`Clowder` (`src/cat/clowder.rs`) owns every cat. Each frame it gives each cat a snapshot of the others from the previous frame (`Neighbor`: head, body point, personal-space radius), so the order cats are updated in never matters. A lone cat gets no neighbours and no slot, and behaves bit for bit like a bare `CatSim`.
+
+**Slots.** A cat that rests round the cursor (or round the bowl while Waiting or Carrying) gets a `Slot`: an angle and a radius round that point. `Clowder::assign_slots` hands them out each frame, grown cats first, then kittens, then in list order:
+
+- A cat keeps its previous angle if it's still free, otherwise the search starts from the angle it's coming in at. Angles are tried moving outward from there, on the cat's own side first, and then on up to 3 rings, each two personal-space radii further out.
+- An angle is free when the cat's head and body point there keep `PERSONAL_SPACE` (19 px per cat) from every slot already handed out this frame and from cats not on slots (walking to the bowl, eating, roaming, hunting).
+- If a resting cat's slot moves, it gets `slot_bumped`, which wakes it up (`make_way`) to shuffle over.
+
+**Settling.** The cat walks to its slot point and counts as there within `SLOT_ARRIVAL` (12 px). It comes in from outside the circle facing the middle; a cat that would arrive facing outward overshoots by two body lengths and turns back, so it never sits down facing away or swings its head into the bowl. Once there it records where the cursor (or bowl) was (`slot_settled_at`), and from then on only that point moving wakes it: its effective distance is `stop_radius` plus how far the point has moved. The cursor jittering within the wake radii doesn't make settled cats shuffle.
+
+**Walking.** `steer_walk` pushes a walking cat away from other cats' heads and body points within personal space, so paths cross without overlapping.
+
+Shakes, wiggles and Follow Cursor work per cat as before; Follow Cursor and Playful Hunting are one switch for every cat.
+
 ## Determinism
 
 `CatSim` uses its own PCG-style RNG with a fixed seed (`rng_state`), and `update` clamps `dt` to [0.001, 0.05]. The same cursor path at the same `dt` always produces the same behavior. The tests in `src/cat/tests.rs` rely on this.

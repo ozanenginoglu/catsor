@@ -54,10 +54,10 @@ Without a compositor the window's background shows up black. If there's no tray,
 ```
 catsor [OPTIONS]
 
-  -c, --coat <COAT>                 calico | brown | charcoal | tuxedo | silver | random,
+  -c, --coat <COAT>                 the first cat's coat: calico | brown | charcoal | tuxedo | silver | random,
                                     or the name of a custom coat (see Custom coats)
   -s, --scale <SCALE>               size multiplier, 0.5–2.5 (1.0 ≈ 38 px body)
-  -t, --temperament <TEMPERAMENT>   balanced | playful | lazy | aloof | realistic
+  -t, --temperament <TEMPERAMENT>   the first cat's temperament: balanced | playful | lazy | aloof | realistic
       --no-tray                     don't create a tray icon
       --fps <FPS>                   target frame rate (default 60, min 15)
       --preview-sheet <PATH>        render a PNG of all coats and poses (or only --coat), then exit
@@ -67,7 +67,7 @@ catsor [OPTIONS]
 
 `--coat`, `--scale` and `--temperament` override your saved preferences **and are saved as the new defaults**.
 
-The cat window ignores the mouse entirely, so clicks and hovers go straight to whatever is underneath it. You control it from the tray icon.
+The cat windows ignore the mouse entirely, so clicks and hovers go straight to whatever is underneath it. You control it from the tray icon.
 
 ### Tray menu
 
@@ -75,10 +75,21 @@ Left- or right-click the tray icon to open the menu. Press Esc or click outside 
 
 | Section | Items |
 |---|---|
-| **Appearance** | **Coat** row: click to cycle Calico → Brown → Charcoal → Tuxedo → Silver, then your [custom coats](#custom-coats). **Random Coat**: rolls a new random cat (see below). **Design Coat...**: opens the [coat designer](#coat-designer). **Size** row: click to cycle Compact 0.8× → Normal 1.0× → Large 1.35× → Extra Large 1.75× (a `--scale` outside these shows as "Custom"). **Temperament** row: click to cycle Balanced → Playful → Lazy → Aloof → Realistic (see [behavior.md](docs/behavior.md#temperaments)) |
+| **Cats** | One row per cat (a coat swatch, the name, "(kitten)" for kittens). Click one to open its page, below. **Add Cat** brings in a new cat with a random coat; it walks in from the nearest screen edge (up to 6 cats). **Size** row: click to cycle Compact 0.8× → Normal 1.0× → Large 1.35× → Extra Large 1.75× for every cat (a `--scale` outside these shows as "Custom") |
 | **Feed (keep awake)** | 15 m · 30 m · 1 h · 2 h · Unlimited. While feeding, a **Stop Feeding** row appears (choosing the active preset again also stops) |
-| **Behaviors** | Follow Cursor · Playful Hunting (pounce/zoomies/tail-chase/paw-bat) |
-| | Show Cat (checkbox) · Start on Login (checkbox) · About Catsor (shows the version, opens the GitHub page) · Quit Catsor |
+| **Behaviors** | Follow Cursor · Playful Hunting (pounce/zoomies/tail-chase/paw-bat). Each is one switch for every cat |
+| | Show Cat(s) (checkbox) · Start on Login (checkbox) · About Catsor (shows the version, opens the GitHub page) · Quit Catsor |
+
+A cat's page (**Back** returns to the main page):
+
+| Row | What it does |
+|---|---|
+| **Coat** | Click to cycle Calico → Brown → Charcoal → Tuxedo → Silver, then your [custom coats](#custom-coats) |
+| **Random Coat** | Rolls a new random coat (see below) |
+| **Design Coat...** | Opens the [coat designer](#coat-designer) for this cat |
+| **Temperament** | Click to cycle Balanced → Playful → Lazy → Aloof → Realistic (see [behavior.md](docs/behavior.md#temperaments)) |
+| **Add Kitten** | Grown cats only: adds a smaller, Playful kitten with this cat as its mother. It walks in behind her |
+| **Remove** | Sends the cat away (shown while there's more than one cat) |
 
 ### Things to try
 
@@ -87,10 +98,11 @@ Left- or right-click the tray icon to open the menu. Press Esc or click outside 
 - **Shake the mouse right over the cat** to shoo it off. It goes its own way: it wanders around the screen, naps, and keeps away from the cursor. Shake the mouse again (anywhere) to call it back. It gallops over and goes back to following you.
 - **Turn off Follow Cursor** in the tray menu and the cat roams the same way, until you turn it back on.
 - **Leave it alone.** It sits, then lies down, then curls up and sleeps.
+- **Add a second cat** (or a kitten). Each cat finds its own spot round the cursor, and they keep out of each other's way.
 
 ### Feeding mode (keep-awake)
 
-When you pick a feed preset, a food bowl sticks to your cursor. **Left-click** to put it down. Right-click or Esc cancels. The cat walks to the bowl and eats until the timer runs out, then grooms itself and goes back to following you. While it's walking to the bowl or eating, Catsor keeps the session and screen awake. It only asks the OS not to idle (no simulated mouse moves, clicks or key presses), so chat apps can still show you as away. Details are in [platform-notes.md](docs/platform-notes.md#keep-awake-feeding-mode).
+When you pick a feed preset, a food bowl sticks to your cursor. **Left-click** to put it down. Right-click or Esc cancels. The cat walks to the bowl and eats until the timer runs out, then grooms itself and goes back to following you. With several cats there's still one bowl: they take turns of up to 2.5 minutes, kittens first, while the others sit round the bowl and wait. While it's walking to the bowl or eating, Catsor keeps the session and screen awake. It only asks the OS not to idle (no simulated mouse moves, clicks or key presses), so chat apps can still show you as away. Details are in [platform-notes.md](docs/platform-notes.md#keep-awake-feeding-mode).
 
 ### Start on login
 
@@ -110,14 +122,27 @@ Preferences are saved automatically whenever you change them in the tray. They'r
 
 ```toml
 # Catsor user preferences
-coat = "calico"
-temperament = "balanced"
 scale = 1.00
 follow_cursor = true
 playful_quirks = true
+
+[[cat]]
+name = "Luna"
+coat = "calico"
+temperament = "balanced"
+
+[[cat]]
+name = "Pip"
+coat = "random:00c0ffee"
+temperament = "playful"
+size = 0.60
+kitten = true
+mother = "Luna"
 ```
 
 Lines that are unknown or invalid are skipped, and the default is used for those settings. Feeding sessions and hide/show are not saved; they reset when Catsor restarts.
+
+Each `[[cat]]` table is one cat, up to 6. `name` identifies the cat and must be unique. `size` (optional, 0.4–1.5) multiplies `scale`; kittens added from the tray get 0.6. `mother` must name another cat that isn't a kitten, otherwise it's ignored. A kitten's mother lets it eat first. Kittens behave like grown cats for now, only smaller. A config from an older version, with `coat` and `temperament` at the top level, is read as a single cat named Luna.
 
 `coat` is a built-in coat, the name of a custom coat, or `random:<seed>` for a random coat, so the same random cat comes back after a restart.
 

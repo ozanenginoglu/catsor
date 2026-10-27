@@ -11,7 +11,6 @@ use crate::coat::{
     Coat, CoatDesign, CoatId, CoatLibrary, MAX_NAME_CHARS, NameProblem, Pattern, Rgba8, SaveError,
     fresh_seed, rgb,
 };
-use crate::prefs::UserPrefs;
 use crate::preview::{Pose, posed, render_cropped};
 use crate::render::{color as to_color, render_tray_icon};
 use crate::tray::{
@@ -623,8 +622,8 @@ impl Designer {
             match coats.save_design(&self.design, self.original.as_deref()) {
                 Ok(coat) => {
                     let name = coat.name.to_string();
+                    // The backend notices the new coat and saves the preferences
                     cat.coat = coat;
-                    UserPrefs::from_cat(cat).save();
                     let msg = format!("Saved {name}. Your cat is wearing it.");
                     self.design.name = name.clone();
                     self.original = Some(name);

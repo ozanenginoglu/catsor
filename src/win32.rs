@@ -1,6 +1,7 @@
 use crate::Args;
 use crate::autostart;
 use crate::cat::CatSim;
+use crate::cat::clowder::Clowder;
 use crate::coat::{Coat, CoatLibrary};
 use crate::designer::{DESIGNER_H, DESIGNER_TITLE, DESIGNER_W, Designer, DesignerInput};
 use crate::prefs::UserPrefs;
@@ -8,8 +9,8 @@ use crate::render::{
     bowl_window_dim, cat_window_dim, render_bowl_overlay, render_cat, render_tray_icon,
 };
 use crate::tray::{
-    ABOUT_URL, HitEntry, MENU_WIDTH, TrayAction, TrayState, apply_shared_action, build_rows,
-    compute_layout, hit_test_entries, render_menu_pixmap, rgba_to_bgra,
+    ABOUT_URL, HitEntry, MENU_WIDTH, MenuPage, TrayAction, TrayState, apply_shared_action,
+    build_rows, compute_layout, hit_test_entries, render_menu_pixmap, rgba_to_bgra,
 };
 use core::cell::RefCell;
 use core::ffi::c_void;
@@ -227,7 +228,7 @@ fn create_tray_hicon(state: &TrayState) -> Option<HICON> {
     let icon_px = unsafe { GetSystemMetrics(SM_CXSMICON).clamp(24, 64) as u32 };
     let mut pixmap = Pixmap::new(icon_px, icon_px)?;
     render_tray_icon(
-        &state.coat,
+        state.icon_coat(),
         state.sleeping,
         state.hidden,
         false,
@@ -266,6 +267,7 @@ struct MenuWndState {
     // Cursor position the menu was opened at
     menu_anchor: POINT,
     menu_open: bool,
+    menu_page: MenuPage,
     tracking_mouse: bool,
     hovered_idx: Option<usize>,
     hit_entries: Vec<HitEntry>,
@@ -278,7 +280,8 @@ struct MenuWndState {
 
 impl MenuWndState {
     fn redraw_menu(&mut self) {
-        let rows = build_rows(&self.last_state);
+        self.menu_page.validate(&self.last_state);
+        let rows = build_rows(&self.last_state, self.menu_page);
         let (menu_h, hit_entries) = compute_layout(&rows);
         let resized = menu_h != self.menu_h;
         self.menu_h = menu_h;
@@ -311,7 +314,8 @@ impl MenuWndState {
     }
 
     fn prepare_open_at_cursor(&mut self) -> (HWND, i32, i32, i32, i32) {
-        let rows = build_rows(&self.last_state);
+        self.menu_page = MenuPage::Main;
+        let rows = build_rows(&self.last_state, self.menu_page);
         let (menu_h, hit_entries) = compute_layout(&rows);
         self.menu_h = menu_h;
         self.hit_entries = hit_entries;
@@ -417,7 +421,7 @@ impl WinTrayController {
         menu_class_name: &[u16],
         initial_state: TrayState,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let rows = build_rows(&initial_state);
+        let rows = build_rows(&initial_state, MenuPage::Main);
         let (menu_h, hit_entries) = compute_layout(&rows);
         let taskbar_created_msg =
             unsafe { RegisterWindowMessageW(to_wide_null("TaskbarCreated").as_ptr()) };
@@ -451,6 +455,7 @@ impl WinTrayController {
             menu_y: 0,
             menu_anchor: POINT { x: 0, y: 0 },
             menu_open: false,
+            menu_page: MenuPage::Main,
             tracking_mouse: false,
             hovered_idx: None,
             hit_entries,
@@ -677,11 +682,17 @@ unsafe extern "system" fn menu_wnd_proc(
                         st.mark_closed()
                     } else if let Some(idx) = hit_test_entries(&st.hit_entries, st.menu_w, lx, ly) {
                         let entry = st.hit_entries[idx];
-                        st.actions.push_back(entry.action);
-                        if entry.close_on_click {
-                            st.mark_closed()
-                        } else {
+                        if st.menu_page.navigate(entry.action) {
+                            st.hovered_idx = None;
+                            st.redraw_menu();
                             None
+                        } else {
+                            st.actions.push_back(entry.action);
+                            if entry.close_on_click {
+                                st.mark_closed()
+                            } else {
+                                None
+                            }
                         }
                     } else {
                         None
@@ -1087,14 +1098,25 @@ unsafe extern "system" fn designer_wnd_proc(
     }
 }
 
+/// A cat's layered window. Windows outlive removed cats (hidden; destroying an overlay ends
+/// the app) and are reused when cats are added again
+struct CatWindow {
+    layered: LayeredWindow,
+    visible: bool,
+}
+
 struct WinApp {
-    cat: CatSim,
+    clowder: Clowder,
     /// Custom coats from `coats.toml`, reloaded when the file changes
     coats: CoatLibrary,
     hinstance: HINSTANCE,
+    overlay_class_name: Vec<u16>,
     designer_class_name: Vec<u16>,
     designer: Option<DesignerWnd>,
-    cat_win: LayeredWindow,
+    /// Which cat the open designer puts its coat on
+    designer_cat: usize,
+    /// One window per cat, in the clowder's order (plus spare hidden ones)
+    cat_wins: Vec<CatWindow>,
     /// Standalone bowl window shown while carrying or walking to the placed bowl
     bowl_win: Option<LayeredWindow>,
     bowl_visible: bool,
@@ -1110,7 +1132,7 @@ struct WinApp {
 pub fn run(args: &Args, prefs: UserPrefs, coats: CoatLibrary) -> BoxResult<()> {
     let mut app = WinApp::new(args, prefs, coats)?;
     if args.design_coat {
-        app.open_designer();
+        app.open_designer(0);
     }
     let frame_duration = Duration::from_secs_f64(1.0 / (args.fps.max(15) as f64));
     let mut last_tick = Instant::now();
@@ -1140,16 +1162,17 @@ pub fn run(args: &Args, prefs: UserPrefs, coats: CoatLibrary) -> BoxResult<()> {
             needs_raise = true;
         }
         if let Some(tray_ctrl) = &mut app.tray {
-            tray_ctrl.sync_state(TrayState::from_cat(
-                &app.cat,
+            tray_ctrl.sync_state(TrayState::from_clowder(
+                &app.clowder,
                 app.cat_hidden,
                 app.start_on_login,
             ));
         }
 
         app.draw_bowl();
+        needs_raise |= app.sync_cat_windows()?;
         if !app.cat_hidden {
-            app.draw_cat(needs_raise);
+            app.draw_cats(needs_raise);
         }
 
         let elapsed = now.elapsed();
@@ -1179,32 +1202,23 @@ impl WinApp {
             GetCursorPos(&mut init_pt);
         }
         let start_cursor = Vec2::new(init_pt.x as f32, init_pt.y as f32);
-        let mut cat = CatSim::new(start_cursor, prefs.scale, coats.resolve(&prefs.coat));
-        cat.behaviors = prefs.behaviors;
-
-        let win_dim = cat_window_dim(prefs.scale);
-        let init_center = cat.window_center();
-        let win_x = (init_center.x - (win_dim as f32) * 0.5).round() as i32;
-        let win_y = (init_center.y - (win_dim as f32) * 0.5).round() as i32;
+        let clowder = Clowder::new(
+            &prefs.cats,
+            prefs.scale,
+            prefs.follow_cursor,
+            prefs.playful_quirks,
+            &coats,
+            start_cursor,
+        );
 
         let overlay_title = to_wide_null("Catsor");
-        let cat_win = LayeredWindow::create(
-            hinstance,
-            &overlay_class_name,
-            &overlay_title,
-            win_dim,
-            win_x,
-            win_y,
-        )?
-        .ok_or("Failed to create Win32 layered overlay window")?;
-        cat_win.show(true);
         let bowl_win = LayeredWindow::create(
             hinstance,
             &overlay_class_name,
             &overlay_title,
             bowl_window_dim(prefs.scale),
-            win_x,
-            win_y,
+            init_pt.x,
+            init_pt.y,
         )?;
 
         let cat_hidden = false;
@@ -1212,17 +1226,19 @@ impl WinApp {
         let tray = if args.no_tray {
             None
         } else {
-            let initial_state = TrayState::from_cat(&cat, cat_hidden, start_on_login);
+            let initial_state = TrayState::from_clowder(&clowder, cat_hidden, start_on_login);
             WinTrayController::new(hinstance, &menu_class_name, initial_state).ok()
         };
 
-        Ok(Self {
-            cat,
+        let mut app = Self {
+            clowder,
             coats,
             hinstance,
+            overlay_class_name,
             designer_class_name,
             designer: None,
-            cat_win,
+            designer_cat: 0,
+            cat_wins: Vec::new(),
             bowl_win,
             bowl_visible: false,
             bowl_click_armed: false,
@@ -1230,7 +1246,54 @@ impl WinApp {
             start_on_login,
             keep_awake: WinKeepAwake::new(),
             tray,
-        })
+        };
+        app.sync_cat_windows()?;
+        if app.cat_wins.is_empty() {
+            return Err("Failed to create Win32 layered overlay window".into());
+        }
+        Ok(app)
+    }
+
+    /// Gives every cat a shown window of the right size (creating windows as cats are added)
+    /// and hides the windows of removed cats, or all of them while the cats are hidden.
+    /// Returns whether a window was shown or resized, so the cats should be re-raised.
+    fn sync_cat_windows(&mut self) -> BoxResult<bool> {
+        let mut changed = false;
+        while self.cat_wins.len() < self.clowder.len() {
+            let cat = self.clowder.cat(self.cat_wins.len());
+            let dim = cat_window_dim(cat.scale);
+            let center = cat.window_center();
+            let title = to_wide_null("Catsor");
+            let Some(layered) = LayeredWindow::create(
+                self.hinstance,
+                &self.overlay_class_name,
+                &title,
+                dim,
+                (center.x - (dim as f32) * 0.5).round() as i32,
+                (center.y - (dim as f32) * 0.5).round() as i32,
+            )?
+            else {
+                break;
+            };
+            self.cat_wins.push(CatWindow {
+                layered,
+                visible: false,
+            });
+        }
+        for (i, cw) in self.cat_wins.iter_mut().enumerate() {
+            let wanted = !self.cat_hidden && i < self.clowder.len();
+            if wanted {
+                changed |= cw
+                    .layered
+                    .resize(cat_window_dim(self.clowder.cat(i).scale))?;
+            }
+            if wanted != cw.visible {
+                cw.layered.show(wanted);
+                cw.visible = wanted;
+                changed |= wanted;
+            }
+        }
+        Ok(changed)
     }
 
     /// Dispatches pending Win32 messages; returns true once `WM_QUIT` arrives
@@ -1251,55 +1314,60 @@ impl WinApp {
     fn handle_tray_actions(&mut self) -> BoxResult<Flow> {
         let mut needs_raise = false;
         while let Some(action) = self.tray.as_mut().and_then(|t| t.pop_action()) {
-            let Some(action) =
-                apply_shared_action(action, &mut self.cat, &self.coats, &mut self.start_on_login)
-            else {
+            // The designer follows its cat down the list, and closes if its cat goes
+            if let TrayAction::RemoveCat(i) = action
+                && self.clowder.len() > 1
+            {
+                if i == self.designer_cat {
+                    self.designer = None;
+                } else if i < self.designer_cat {
+                    self.designer_cat -= 1;
+                }
+            }
+            let Some(action) = apply_shared_action(
+                action,
+                &mut self.clowder,
+                &self.coats,
+                &mut self.start_on_login,
+            ) else {
                 continue;
             };
             match action {
                 TrayAction::StopFeeding => {
-                    self.cat.stop_feeding();
+                    self.clowder.stop_feeding();
                     self.bowl_click_armed = false;
                     self.keep_awake.set_active(false);
                 }
                 TrayAction::SelectFeedPreset(preset) => {
                     if self.cat_hidden {
                         self.cat_hidden = false;
-                        self.cat_win.show(true);
                         needs_raise = true;
                     }
                     let mut pt = POINT { x: 0, y: 0 };
                     unsafe {
                         GetCursorPos(&mut pt);
                     }
-                    self.cat
+                    self.clowder
                         .begin_bowl_placement(preset, Vec2::new(pt.x as f32, pt.y as f32));
                     self.bowl_click_armed = false;
                 }
-                TrayAction::SetScale(new_scale) => {
-                    self.cat.set_scale(new_scale);
-                    UserPrefs::from_cat(&self.cat).save();
-                    if self.cat_win.resize(cat_window_dim(self.cat.scale))? {
-                        needs_raise = true;
-                    }
-                    if let Some(bowl_win) = &mut self.bowl_win {
-                        bowl_win.resize(bowl_window_dim(self.cat.scale))?;
-                    }
-                }
                 TrayAction::ToggleHidden => {
                     self.cat_hidden = !self.cat_hidden;
-                    self.cat_win.show(!self.cat_hidden);
-                    if !self.cat_hidden {
-                        needs_raise = true;
-                    }
+                    needs_raise = !self.cat_hidden;
                 }
                 TrayAction::OpenAbout => open_about_page(),
-                TrayAction::OpenDesigner => self.open_designer(),
+                TrayAction::OpenDesigner(i) => self.open_designer(i),
                 TrayAction::Quit => return Ok(Flow::Quit),
                 // Handled by `apply_shared_action`
-                TrayAction::NextCoat
-                | TrayAction::RandomCoat
-                | TrayAction::SetTemperament(_)
+                TrayAction::OpenCat(_)
+                | TrayAction::ShowMain
+                | TrayAction::NextCoat(_)
+                | TrayAction::RandomCoat(_)
+                | TrayAction::SetTemperament(..)
+                | TrayAction::AddCat
+                | TrayAction::AddKitten(_)
+                | TrayAction::RemoveCat(_)
+                | TrayAction::SetScale(_)
                 | TrayAction::ToggleFollowCursor
                 | TrayAction::TogglePlayfulQuirks
                 | TrayAction::ToggleStartOnLogin => {}
@@ -1308,15 +1376,22 @@ impl WinApp {
         Ok(Flow::Continue { needs_raise })
     }
 
-    /// Opens the coat designer, or brings it forward if it is already open. The designer is
-    /// optional: if its window fails, say so and keep the cat running
-    fn open_designer(&mut self) {
+    /// Opens the coat designer for cat `i`, or brings it forward if it is already open for
+    /// that cat. The designer is optional: if its window fails, say so and keep the cats running
+    fn open_designer(&mut self, i: usize) {
+        if i >= self.clowder.len() {
+            return;
+        }
+        if self.designer_cat != i {
+            self.designer = None;
+        }
+        self.designer_cat = i;
         match &self.designer {
             Some(dw) => dw.activate(),
             None => match DesignerWnd::open(
                 self.hinstance,
                 &self.designer_class_name,
-                &self.cat.coat,
+                &self.clowder.cat(i).coat,
                 &self.coats,
             ) {
                 Ok(dw) => self.designer = Some(dw),
@@ -1330,7 +1405,15 @@ impl WinApp {
         let Some(dw) = &mut self.designer else {
             return;
         };
-        if dw.pump(&mut self.coats, &mut self.cat) {
+        let cat = self
+            .clowder
+            .cat_mut(self.designer_cat.min(self.clowder.len() - 1));
+        let coat_before = cat.coat.id.clone();
+        let close = dw.pump(&mut self.coats, cat);
+        if cat.coat.id != coat_before {
+            UserPrefs::from_clowder(&self.clowder).save();
+        }
+        if close {
             self.designer = None;
         } else {
             dw.present();
@@ -1338,10 +1421,12 @@ impl WinApp {
     }
 
     /// Advances the simulation from the cursor and handles bowl placement clicks (left places
-    /// it, right or Escape cancels). A hidden cat stays paused unless it is feeding.
+    /// it, right or Escape cancels). Hidden cats stay paused unless they are feeding.
     fn step_cat(&mut self, dt: f32) {
-        self.coats.refresh(&mut self.cat);
-        if self.cat_hidden && self.cat.feeding_preset().is_none() {
+        for cat in self.clowder.cats_mut() {
+            self.coats.refresh(cat);
+        }
+        if self.cat_hidden && self.clowder.feeding_preset().is_none() {
             self.keep_awake.set_active(false);
             return;
         }
@@ -1352,29 +1437,31 @@ impl WinApp {
         let cursor_pos = Vec2::new(pt.x as f32, pt.y as f32);
         // A roaming cat stays within the work area of the monitor it is on. Looked up every
         // frame so it follows the cat across monitors and display changes.
-        let center = self.cat.window_center();
-        let work = monitor_work_area(POINT {
-            x: center.x as i32,
-            y: center.y as i32,
-        });
-        self.cat.roam_bounds = Some((
-            Vec2::new(work.left as f32, work.top as f32),
-            Vec2::new(work.right as f32, work.bottom as f32),
-        ));
-        if self.cat.is_carrying_bowl() {
+        for cat in self.clowder.cats_mut() {
+            let center = cat.window_center();
+            let work = monitor_work_area(POINT {
+                x: center.x as i32,
+                y: center.y as i32,
+            });
+            cat.roam_bounds = Some((
+                Vec2::new(work.left as f32, work.top as f32),
+                Vec2::new(work.right as f32, work.bottom as f32),
+            ));
+        }
+        if self.clowder.is_carrying_bowl() {
             if !is_key_down(VK_LBUTTON) {
                 self.bowl_click_armed = true;
             } else if self.bowl_click_armed {
                 self.bowl_click_armed = false;
-                self.cat.place_bowl(cursor_pos);
+                self.clowder.place_bowl(cursor_pos);
             }
             if is_key_down(VK_RBUTTON) || is_key_down(VK_ESCAPE) {
                 self.bowl_click_armed = false;
-                self.cat.stop_feeding();
+                self.clowder.stop_feeding();
             }
         }
-        self.cat.update(cursor_pos, dt);
-        self.keep_awake.tick(self.cat.keeps_awake());
+        self.clowder.update(cursor_pos, dt);
+        self.keep_awake.tick(self.clowder.keeps_awake());
     }
 
     /// Shows the bowl window at the detached bowl while there is one, and hides it otherwise
@@ -1382,8 +1469,12 @@ impl WinApp {
         let Some(bowl_win) = &mut self.bowl_win else {
             return;
         };
-        if let Some(detached_pos) = self.cat.detached_bowl_pos() {
-            render_bowl_overlay(self.cat.scale, &mut bowl_win.pixmap.as_mut());
+        if let Some(detached_pos) = self.clowder.detached_bowl_pos() {
+            let bowl_scale = self.clowder.bowl_scale();
+            if bowl_win.resize(bowl_window_dim(bowl_scale)).is_err() {
+                return;
+            }
+            render_bowl_overlay(bowl_scale, &mut bowl_win.pixmap.as_mut());
             let bx = (detached_pos.x - (bowl_win.dim as f32) * 0.5).round() as i32;
             let by = (detached_pos.y - (bowl_win.dim as f32) * 0.5).round() as i32;
             bowl_win.present(bx, by);
@@ -1397,39 +1488,36 @@ impl WinApp {
         }
     }
 
-    /// Renders the cat and moves its window to follow it, re-raising it when needed (kept just
-    /// below an open tray menu)
-    fn draw_cat(&mut self, needs_raise: bool) {
-        let cat_win = &mut self.cat_win;
-        let center = self.cat.window_center();
-        let origin = center - Vec2::splat((cat_win.dim as f32) * 0.5);
+    /// Renders each cat and moves its window to follow it, re-raising it when needed (kept
+    /// just below an open tray menu)
+    fn draw_cats(&mut self, needs_raise: bool) {
+        let insert_after = self
+            .tray
+            .as_ref()
+            .and_then(|t| t.open_menu_window())
+            .unwrap_or(HWND_TOPMOST);
+        for (cat, cw) in self.clowder.cats().zip(&mut self.cat_wins) {
+            let cat_win = &mut cw.layered;
+            let center = cat.window_center();
+            let origin = center - Vec2::splat((cat_win.dim as f32) * 0.5);
 
-        if needs_raise {
-            let insert_after = self
-                .tray
-                .as_ref()
-                .and_then(|t| t.open_menu_window())
-                .unwrap_or(HWND_TOPMOST);
-            unsafe {
-                SetWindowPos(
-                    cat_win.hwnd,
-                    insert_after,
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                );
+            if needs_raise {
+                unsafe {
+                    SetWindowPos(
+                        cat_win.hwnd,
+                        insert_after,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                }
             }
-        }
 
-        render_cat(
-            &self.cat,
-            &mut cat_win.pixmap.as_mut(),
-            &mut cat_win.mask,
-            origin,
-        );
-        cat_win.present(origin.x.round() as i32, origin.y.round() as i32);
+            render_cat(cat, &mut cat_win.pixmap.as_mut(), &mut cat_win.mask, origin);
+            cat_win.present(origin.x.round() as i32, origin.y.round() as i32);
+        }
     }
 
     fn shutdown(&mut self) {
@@ -1441,7 +1529,9 @@ impl WinApp {
             if let Some(bowl_win) = &self.bowl_win {
                 DestroyWindow(bowl_win.hwnd);
             }
-            DestroyWindow(self.cat_win.hwnd);
+            for cw in &self.cat_wins {
+                DestroyWindow(cw.layered.hwnd);
+            }
         }
     }
 }

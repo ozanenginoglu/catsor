@@ -1,5 +1,6 @@
 mod behavior;
 mod body;
+pub mod clowder;
 
 use crate::coat::Coat;
 use glam::Vec2;
@@ -137,6 +138,27 @@ pub enum FeedingPhase {
     WalkingToBowl { preset: FeedPreset, bowl_pos: Vec2 },
     /// Cat has arrived at `bowl_pos` and is actively eating from it
     Eating { preset: FeedPreset, bowl_pos: Vec2 },
+    /// Another cat has the shared bowl at `bowl_pos`; this one sits nearby until its turn
+    Waiting { preset: FeedPreset, bowl_pos: Vec2 },
+}
+
+/// What a cat knows about another cat this tick: a snapshot from the previous frame, so the
+/// order cats are updated in never changes the outcome
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Neighbor {
+    pub head: Vec2,
+    /// Middle of the body (`CatSim::body_point`)
+    pub center: Vec2,
+    /// Personal-space radius (already scaled)
+    pub radius: f32,
+}
+
+/// A cat's own spot among others: `radius` from the cursor (or the shared bowl it waits for)
+/// in direction `angle`. `Clowder` hands these out so cats settle side by side.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Slot {
+    pub angle: f32,
+    pub radius: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -424,6 +446,22 @@ pub struct CatSim {
     prev_head_offset: Vec2,
     /// Stable screen-space torso anchor for positioning the overlay window without jitter
     window_anchor: Vec2,
+
+    /// The other cats, refreshed by `Clowder` before every `update` (empty for a lone cat)
+    pub neighbors: Vec<Neighbor>,
+    /// This cat's spot round the cursor or the bowl, set by `Clowder` when there are other cats
+    pub slot: Option<Slot>,
+    /// Set when `Clowder` moved this cat's spot to make room for another cat while it was
+    /// resting; it gets up and goes to the new spot
+    pub slot_bumped: bool,
+    /// Where the cursor (or bowl) was when this cat settled at its spot; only that moving gets
+    /// it up again
+    slot_settled_at: Option<Vec2>,
+    /// Bowl fill shown while eating, set by `Clowder` when cats share one bowl in turns
+    pub bowl_fill: Option<f32>,
+    /// How long the next turn at the bowl lasts, set by `Clowder` when cats take turns (`None`:
+    /// the whole feed preset)
+    eat_turn: Option<f32>,
 }
 
 impl CatSim {
@@ -432,6 +470,8 @@ impl CatSim {
     const STANDING_BODY_LENGTHS: [f32; BODY_NODES - 1] = [6.2, 7.6, 8.8, 8.2, 6.8];
     /// Distance from the waist node to the food bowl centre in the eating pose (unscaled)
     pub const BOWL_REACH: f32 = 27.2;
+    /// How far (unscaled px) from the shared bowl a cat waiting for its turn sits
+    const BOWL_WAIT_RADIUS: f32 = 50.0;
     /// Rest lengths for tail segments (5..11) in unscaled pose (~24px total).
     const TAIL_LENGTHS: [f32; TAIL_NODES] = [4.5, 4.3, 4.1, 3.8, 3.5, 3.2];
     /// Extra bend per tail segment (rad) when fully wrapped while sitting: turn sideways off the
@@ -567,12 +607,31 @@ impl CatSim {
             carrier_nodes,
             prev_head_offset: Vec2::ZERO,
             window_anchor: carrier_nodes[3],
+            neighbors: Vec::new(),
+            slot: None,
+            slot_bumped: false,
+            slot_settled_at: None,
+            bowl_fill: None,
+            eat_turn: None,
         }
     }
 
+    /// Smallest and largest `scale`. Kittens are a fraction of the size picked in the tray,
+    /// so the smallest goes below the tray's 0.5x
+    pub const MIN_SCALE: f32 = 0.25;
+    pub const MAX_SCALE: f32 = 2.5;
+
+    /// Personal-space radius (unscaled px): how far apart two cats' heads stay, per cat
+    pub const PERSONAL_SPACE: f32 = 19.0;
+    /// How far (unscaled px) behind its head the middle of a cat's body is, for keeping cats
+    /// apart
+    pub const BODY_SPACING_OFFSET: f32 = 24.0;
+    /// How close (unscaled px) a cat must be to its spot to count as there
+    const SLOT_ARRIVAL: f32 = 12.0;
+
     /// Dynamically rescales the cat in-place without teleporting or kinking the spine
     pub fn set_scale(&mut self, new_scale: f32) {
-        let clamped = new_scale.clamp(0.5, 2.5);
+        let clamped = new_scale.clamp(Self::MIN_SCALE, Self::MAX_SCALE);
         if (clamped - self.scale).abs() < 1e-4 {
             return;
         }
@@ -639,6 +698,12 @@ impl CatSim {
             TriggerKind::BellyUp => Activity::BellyUp { side, timer: 0.0 },
             TriggerKind::Sleep => Activity::Sleeping,
         };
+    }
+
+    /// Restarts the random choices from `seed`, so cats side by side don't act in lockstep
+    pub(crate) fn seed_rng(&mut self, seed: u64) {
+        self.rng_state = seed | 1;
+        self.next_quirk_timer += self.rand_range(0.0, 4.0);
     }
 
     /// Clears sprint state and any in-progress left/right shake stroke
@@ -737,7 +802,8 @@ impl CatSim {
             Some(
                 FeedingPhase::Carrying { preset, .. }
                 | FeedingPhase::WalkingToBowl { preset, .. }
-                | FeedingPhase::Eating { preset, .. },
+                | FeedingPhase::Eating { preset, .. }
+                | FeedingPhase::Waiting { preset, .. },
             ) => preset,
             None => FeedPreset::Mins30,
         };
@@ -778,8 +844,33 @@ impl CatSim {
         self.activity = Activity::Eating {
             preset,
             elapsed: 0.0,
-            duration: preset.duration_secs(),
+            duration: self.eat_turn.take().or(preset.duration_secs()),
         };
+    }
+
+    /// Like `place_bowl`, but the cat eats for one turn of `turn` seconds (`None`: the whole
+    /// preset) before handing the bowl to the next cat
+    pub fn place_bowl_for_turn(&mut self, bowl_pos: Vec2, turn: Option<f32>) {
+        self.eat_turn = turn;
+        self.place_bowl(bowl_pos);
+    }
+
+    /// Queues the cat for the shared bowl at `bowl_pos`: it goes and sits near the bowl until
+    /// `place_bowl_for_turn` gives it a turn. Whatever it is doing (a post-meal groom, say)
+    /// carries on.
+    pub fn wait_for_bowl(&mut self, preset: FeedPreset, bowl_pos: Vec2) {
+        self.wake_anchor = None;
+        self.latch_wake_anchor = false;
+        self.pinned_rest = false;
+        self.manual_pounce = false;
+        self.feeding_phase = Some(FeedingPhase::Waiting { preset, bowl_pos });
+        if matches!(self.activity, Activity::Eating { .. }) {
+            self.activity = Activity::StandingUp { progress: 0.35 };
+        }
+    }
+
+    pub fn is_waiting_for_bowl(&self) -> bool {
+        matches!(self.feeding_phase, Some(FeedingPhase::Waiting { .. }))
     }
 
     /// Places a food bowl immediately in front of the cat and begins eating for the selected preset duration
@@ -792,6 +883,8 @@ impl CatSim {
     /// Removes the food bowl and transitions the cat into a brief post-meal grooming before resuming mouse follow
     pub fn stop_feeding(&mut self) {
         self.feeding_phase = None;
+        self.bowl_fill = None;
+        self.eat_turn = None;
         if matches!(self.activity, Activity::Eating { .. }) {
             let side = self.rand_side();
             self.settle_in_place();
@@ -834,6 +927,7 @@ impl CatSim {
     }
 
     /// Whether keep-awake should be active: the bowl is placed and the cat is walking to it or eating.
+    #[cfg(test)]
     pub fn keeps_awake(&self) -> bool {
         matches!(
             self.feeding_phase,
@@ -841,12 +935,14 @@ impl CatSim {
         )
     }
 
+    #[cfg(test)]
     pub fn feeding_preset(&self) -> Option<FeedPreset> {
         match self.feeding_phase {
             Some(
                 FeedingPhase::Carrying { preset, .. }
                 | FeedingPhase::WalkingToBowl { preset, .. }
-                | FeedingPhase::Eating { preset, .. },
+                | FeedingPhase::Eating { preset, .. }
+                | FeedingPhase::Waiting { preset, .. },
             ) => Some(preset),
             None => None,
         }
@@ -854,6 +950,11 @@ impl CatSim {
 
     /// Returns the food fill fraction in `[0.0, 1.0]` while the cat is eating (`None` when not eating)
     pub fn feeding_fill_ratio(&self) -> Option<f32> {
+        if self.is_feeding()
+            && let Some(fill) = self.bowl_fill
+        {
+            return Some(fill.clamp(0.0, 1.0));
+        }
         match self.activity {
             Activity::Eating {
                 elapsed,
@@ -866,6 +967,7 @@ impl CatSim {
     }
 
     /// Returns remaining whole seconds for a timed feeding session (`None` if not feeding or unlimited)
+    #[cfg(test)]
     pub fn feeding_remaining_secs(&self) -> Option<u32> {
         if let Activity::Eating {
             elapsed,
@@ -970,6 +1072,12 @@ impl CatSim {
     const ROAM_CLEARANCE: f32 = 180.0;
     /// How close (unscaled px) to its body the cursor must shake to send the cat roaming
     const SHAKE_OFF_RADIUS: f32 = 18.0;
+
+    /// Where the middle of the body is for keeping cats apart: a fixed distance behind the
+    /// head along the heading, so it doesn't shift as the cat sits, stands or lies down
+    pub fn body_point(&self) -> Vec2 {
+        self.nodes[0] - Vec2::from_angle(self.body_angle) * (Self::BODY_SPACING_OFFSET * self.scale)
+    }
 
     /// Stable torso anchor in screen space for positioning the compact ARGB overlay window
     /// without jittering when the tail sways, hips wiggle, or posture curls/extends.

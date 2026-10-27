@@ -1,5 +1,6 @@
 use crate::autostart;
-use crate::cat::{Activity, BehaviorConfig, CatSim, FeedPreset, Temperament};
+use crate::cat::clowder::Clowder;
+use crate::cat::{Activity, FeedPreset, Temperament};
 use crate::coat::{Coat, CoatId, CoatLibrary, fresh_seed};
 use crate::prefs::UserPrefs;
 use crate::render::coat_swatch_colors;
@@ -32,11 +33,25 @@ const XEMBED_MAPPED: u32 = 1 << 0;
 pub(crate) const MENU_WIDTH: u16 = 228;
 /// Opened by the About row
 pub(crate) const ABOUT_URL: &str = env!("CARGO_PKG_REPOSITORY");
+/// One cat as the menu shows it
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrayCat {
+    pub name: String,
+    pub coat: Coat,
+    pub temperament: Temperament,
+    pub kitten: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrayState {
-    pub coat: Coat,
-    pub behaviors: BehaviorConfig,
+    /// Every cat, in order; never empty. The tray icon shows the first one
+    pub cats: Vec<TrayCat>,
+    /// Whether another cat can be added
+    pub can_add: bool,
+    pub follow_cursor: bool,
+    pub playful_quirks: bool,
     pub scale: f32,
+    /// Whether the first cat is asleep (the tray icon closes its eyes)
     pub sleeping: bool,
     pub hidden: bool,
     pub start_on_login: bool,
@@ -45,34 +60,95 @@ pub struct TrayState {
 }
 
 impl TrayState {
-    pub fn from_cat(cat: &CatSim, hidden: bool, start_on_login: bool) -> Self {
+    pub fn from_clowder(clowder: &Clowder, hidden: bool, start_on_login: bool) -> Self {
         Self {
-            coat: cat.coat.clone(),
-            behaviors: cat.behaviors,
-            scale: cat.scale,
-            sleeping: matches!(cat.activity, Activity::Sleeping),
+            cats: clowder
+                .members()
+                .iter()
+                .map(|m| TrayCat {
+                    name: m.name.clone(),
+                    coat: m.cat.coat.clone(),
+                    temperament: m.cat.behaviors.temperament,
+                    kitten: m.kitten,
+                })
+                .collect(),
+            can_add: clowder.can_add(),
+            follow_cursor: clowder.follow_cursor(),
+            playful_quirks: clowder.playful_quirks(),
+            scale: clowder.scale(),
+            sleeping: matches!(clowder.cat(0).activity, Activity::Sleeping),
             hidden,
             start_on_login,
-            feed_preset: cat.feeding_preset(),
-            feed_remaining_secs: cat.feeding_remaining_secs(),
+            feed_preset: clowder.feeding_preset(),
+            feed_remaining_secs: clowder.feeding_remaining_secs(),
         }
+    }
+
+    /// The coat the tray icon shows: the first cat's
+    pub fn icon_coat(&self) -> &Coat {
+        &self.cats[0].coat
     }
 
     /// Whether the tray icon (which only depends on coat, sleep and visibility) must be redrawn
     pub fn icon_differs(&self, other: &TrayState) -> bool {
-        self.coat != other.coat || self.sleeping != other.sleeping || self.hidden != other.hidden
+        self.icon_coat() != other.icon_coat()
+            || self.sleeping != other.sleeping
+            || self.hidden != other.hidden
     }
 }
 
+/// Which page of the menu is showing: the main page, or one cat's page (its submenu)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum MenuPage {
+    #[default]
+    Main,
+    Cat(usize),
+}
+
+impl MenuPage {
+    /// Applies a navigation action (opening a cat's page, going back) and returns true, or
+    /// returns false for any other action. Removing a cat also goes back to the main page.
+    pub(crate) fn navigate(&mut self, action: TrayAction) -> bool {
+        match action {
+            TrayAction::OpenCat(i) => *self = MenuPage::Cat(i),
+            TrayAction::ShowMain => *self = MenuPage::Main,
+            TrayAction::RemoveCat(_) => {
+                *self = MenuPage::Main;
+                return false;
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Falls back to the main page when the cat this page shows is gone
+    pub(crate) fn validate(&mut self, state: &TrayState) {
+        if let MenuPage::Cat(i) = *self
+            && i >= state.cats.len()
+        {
+            *self = MenuPage::Main;
+        }
+    }
+}
+
+/// What a menu click asks for. A `usize` is the index of the cat it applies to.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TrayAction {
+    /// Show a cat's page (its submenu); handled by the menu itself
+    OpenCat(usize),
+    /// Back to the main page; handled by the menu itself
+    ShowMain,
     /// Advance to the next built-in or custom coat
-    NextCoat,
+    NextCoat(usize),
     /// Roll a new random coat
-    RandomCoat,
-    /// Open the coat designer window
-    OpenDesigner,
-    SetTemperament(Temperament),
+    RandomCoat(usize),
+    /// Open the coat designer window for a cat
+    OpenDesigner(usize),
+    SetTemperament(usize, Temperament),
+    AddCat,
+    /// Add a kitten to a grown cat
+    AddKitten(usize),
+    RemoveCat(usize),
     ToggleFollowCursor,
     TogglePlayfulQuirks,
     SelectFeedPreset(FeedPreset),
@@ -95,28 +171,54 @@ pub(crate) fn normalize_tray_action(action: TrayAction, active: Option<FeedPrese
 /// Applies the tray actions that work the same on every platform (they only touch the
 /// simulation, saved prefs or autostart). Returns the normalized action when the platform
 /// backend still has to handle it.
+/// The backend creates, resizes and hides the cat windows to match the clowder every frame, so
+/// adding or removing cats and changing the size are handled here too.
 pub(crate) fn apply_shared_action(
     action: TrayAction,
-    cat: &mut CatSim,
+    clowder: &mut Clowder,
     coats: &CoatLibrary,
     start_on_login: &mut bool,
 ) -> Option<TrayAction> {
-    match normalize_tray_action(action, cat.feeding_preset()) {
-        TrayAction::NextCoat => cat.coat = coats.next_after(&cat.coat.id),
-        TrayAction::RandomCoat => {
+    let len = clowder.len();
+    let valid = |i: usize| i < len;
+    match normalize_tray_action(action, clowder.feeding_preset()) {
+        TrayAction::NextCoat(i) if valid(i) => {
+            let cat = clowder.cat_mut(i);
+            cat.coat = coats.next_after(&cat.coat.id);
+        }
+        TrayAction::RandomCoat(i) if valid(i) => {
+            let cat = clowder.cat_mut(i);
             let mut seed = fresh_seed();
             if cat.coat.id == CoatId::Random(seed) {
                 seed = seed.wrapping_add(1);
             }
             cat.coat = Coat::random(seed);
         }
-        TrayAction::SetTemperament(temp) => cat.behaviors.temperament = temp,
+        TrayAction::SetTemperament(i, temp) if valid(i) => {
+            clowder.cat_mut(i).behaviors.temperament = temp;
+        }
+        TrayAction::AddCat => {
+            clowder.add_cat();
+        }
+        TrayAction::AddKitten(mother) => {
+            clowder.add_kitten(mother);
+        }
+        TrayAction::RemoveCat(i) => {
+            clowder.remove(i);
+        }
+        TrayAction::SetScale(scale) => clowder.set_scale(scale),
         TrayAction::ToggleFollowCursor => {
-            cat.behaviors.follow_cursor = !cat.behaviors.follow_cursor;
+            clowder.set_follow_cursor(!clowder.follow_cursor());
         }
         TrayAction::TogglePlayfulQuirks => {
-            cat.behaviors.playful_quirks = !cat.behaviors.playful_quirks;
+            clowder.set_playful_quirks(!clowder.playful_quirks());
         }
+        // Navigation is the menu's own business, and a stale cat index does nothing
+        TrayAction::OpenCat(_)
+        | TrayAction::ShowMain
+        | TrayAction::NextCoat(_)
+        | TrayAction::RandomCoat(_)
+        | TrayAction::SetTemperament(..) => return None,
         TrayAction::ToggleStartOnLogin => {
             if let Err(e) = autostart::set_enabled(!*start_on_login) {
                 eprintln!("catsor: failed to update start on login: {e}");
@@ -126,13 +228,13 @@ pub(crate) fn apply_shared_action(
         }
         other => return Some(other),
     }
-    UserPrefs::from_cat(cat).save();
+    UserPrefs::from_clowder(clowder).save();
     None
 }
 
 #[derive(Debug, Clone)]
 pub(crate) enum MenuRow {
-    Header(&'static str),
+    Header(Cow<'static, str>),
     Separator,
     Item {
         label: Cow<'static, str>,
@@ -146,6 +248,12 @@ pub(crate) enum MenuRow {
 pub(crate) enum Indicator {
     /// Click advances to the next value; optionally shows a coat swatch on the right
     Cycle(Option<Swatch>),
+    /// Opens a cat's page: its coat swatch on the left, a chevron on the right
+    Submenu(Swatch),
+    /// Back to the main page
+    Back,
+    /// Adds something
+    Add,
     FeedRadio {
         selected: bool,
         remaining_secs: Option<u32>,
@@ -247,6 +355,7 @@ pub struct TrayController {
     menu_w: u16,
     menu_h: u16,
     menu_open: bool,
+    menu_page: MenuPage,
     hovered_idx: Option<usize>,
     hit_entries: Vec<HitEntry>,
     // Root position of the tray icon the menu was opened from
@@ -369,7 +478,7 @@ impl TrayController {
         conn.create_gc(tray_gc, tray_win, &CreateGCAux::new())?;
 
         // Create popup menu window (initially unmapped)
-        let rows = build_rows(&initial_state);
+        let rows = build_rows(&initial_state, MenuPage::Main);
         let (menu_h, hit_entries) = compute_layout(&rows);
         let menu_w = MENU_WIDTH;
         let menu_win = conn.generate_id()?;
@@ -468,6 +577,7 @@ impl TrayController {
             menu_h,
             menu_open: false,
             menu_anchor: (0, 0),
+            menu_page: MenuPage::Main,
             hovered_idx: None,
             hit_entries,
             sys_tray_atom,
@@ -651,6 +761,11 @@ impl TrayController {
                         && let Some(idx) = self.hit_test(lx, ly)
                     {
                         let entry = self.hit_entries[idx];
+                        if self.menu_page.navigate(entry.action) {
+                            self.hovered_idx = None;
+                            self.redraw_menu(conn)?;
+                            return Ok(None);
+                        }
                         if entry.close_on_click {
                             self.close_menu(conn)?;
                         }
@@ -692,7 +807,8 @@ impl TrayController {
         icon_root_x: i16,
         icon_root_y: i16,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let rows = build_rows(&self.last_state);
+        self.menu_page = MenuPage::Main;
+        let rows = build_rows(&self.last_state, self.menu_page);
         let (menu_h, hit_entries) = compute_layout(&rows);
         self.menu_h = menu_h;
         self.hit_entries = hit_entries;
@@ -780,7 +896,7 @@ impl TrayController {
             return Ok(());
         };
         render_tray_icon(
-            &self.last_state.coat,
+            self.last_state.icon_coat(),
             self.last_state.sleeping,
             self.last_state.hidden,
             self.tray_opaque_bg,
@@ -799,7 +915,8 @@ impl TrayController {
     }
 
     fn redraw_menu<C: Connection>(&mut self, conn: &C) -> Result<(), Box<dyn std::error::Error>> {
-        let rows = build_rows(&self.last_state);
+        self.menu_page.validate(&self.last_state);
+        let rows = build_rows(&self.last_state, self.menu_page);
         let (menu_h, hit_entries) = compute_layout(&rows);
         let resized = menu_h != self.menu_h;
         self.menu_h = menu_h;
@@ -884,28 +1001,100 @@ fn next_in<T: Copy + PartialEq>(all: &[T], current: T) -> T {
     all[(idx + 1) % all.len()]
 }
 
-pub(crate) fn build_rows(state: &TrayState) -> Vec<MenuRow> {
-    let mut rows = Vec::with_capacity(24);
+/// The rows of `page`: the main page lists the cats, feeding and the global switches; a cat's
+/// page has that cat's own settings
+pub(crate) fn build_rows(state: &TrayState, page: MenuPage) -> Vec<MenuRow> {
+    match page {
+        MenuPage::Cat(i) if i < state.cats.len() => cat_rows(state, i),
+        _ => main_rows(state),
+    }
+}
 
-    rows.push(MenuRow::Header("APPEARANCE"));
+fn cat_rows(state: &TrayState, i: usize) -> Vec<MenuRow> {
+    let cat = &state.cats[i];
+    let mut rows = Vec::with_capacity(10);
     rows.push(MenuRow::Item {
-        label: Cow::Owned(format!("Coat: {}", state.coat.name)),
-        action: TrayAction::NextCoat,
-        indicator: Indicator::Cycle(Some(coat_swatch_colors(&state.coat))),
+        label: Cow::Borrowed("Back"),
+        action: TrayAction::ShowMain,
+        indicator: Indicator::Back,
+        close_on_click: false,
+    });
+    rows.push(MenuRow::Separator);
+    let title = if cat.kitten {
+        format!("{} (KITTEN)", cat.name)
+    } else {
+        cat.name.clone()
+    };
+    rows.push(MenuRow::Header(Cow::Owned(title.to_uppercase())));
+    rows.push(MenuRow::Item {
+        label: Cow::Owned(format!("Coat: {}", cat.coat.name)),
+        action: TrayAction::NextCoat(i),
+        indicator: Indicator::Cycle(Some(coat_swatch_colors(&cat.coat))),
         close_on_click: false,
     });
     rows.push(MenuRow::Item {
         label: Cow::Borrowed("Random Coat"),
-        action: TrayAction::RandomCoat,
+        action: TrayAction::RandomCoat(i),
         indicator: Indicator::Cycle(None),
         close_on_click: false,
     });
     rows.push(MenuRow::Item {
         label: Cow::Borrowed("Design Coat..."),
-        action: TrayAction::OpenDesigner,
+        action: TrayAction::OpenDesigner(i),
         indicator: Indicator::Edit,
         close_on_click: true,
     });
+    rows.push(MenuRow::Item {
+        label: Cow::Owned(format!("Temperament: {}", cat.temperament.label())),
+        action: TrayAction::SetTemperament(i, next_in(&Temperament::ALL, cat.temperament)),
+        indicator: Indicator::Cycle(None),
+        close_on_click: false,
+    });
+    if !cat.kitten && state.can_add {
+        rows.push(MenuRow::Item {
+            label: Cow::Borrowed("Add Kitten"),
+            action: TrayAction::AddKitten(i),
+            indicator: Indicator::Add,
+            close_on_click: false,
+        });
+    }
+    if state.cats.len() > 1 {
+        rows.push(MenuRow::Separator);
+        rows.push(MenuRow::Item {
+            label: Cow::Owned(format!("Remove {}", cat.name)),
+            action: TrayAction::RemoveCat(i),
+            indicator: Indicator::Danger,
+            close_on_click: false,
+        });
+    }
+    rows
+}
+
+fn main_rows(state: &TrayState) -> Vec<MenuRow> {
+    let mut rows = Vec::with_capacity(28);
+
+    rows.push(MenuRow::Header(Cow::Borrowed("CATS")));
+    for (i, cat) in state.cats.iter().enumerate() {
+        let label = if cat.kitten {
+            format!("{} (kitten)", cat.name)
+        } else {
+            cat.name.clone()
+        };
+        rows.push(MenuRow::Item {
+            label: Cow::Owned(label),
+            action: TrayAction::OpenCat(i),
+            indicator: Indicator::Submenu(coat_swatch_colors(&cat.coat)),
+            close_on_click: false,
+        });
+    }
+    if state.can_add {
+        rows.push(MenuRow::Item {
+            label: Cow::Borrowed("Add Cat"),
+            action: TrayAction::AddCat,
+            indicator: Indicator::Add,
+            close_on_click: false,
+        });
+    }
     let (size_label, next_scale) = size_row(state.scale);
     rows.push(MenuRow::Item {
         label: size_label,
@@ -913,16 +1102,9 @@ pub(crate) fn build_rows(state: &TrayState) -> Vec<MenuRow> {
         indicator: Indicator::Cycle(None),
         close_on_click: false,
     });
-    let temperament = state.behaviors.temperament;
-    rows.push(MenuRow::Item {
-        label: Cow::Owned(format!("Temperament: {}", temperament.label())),
-        action: TrayAction::SetTemperament(next_in(&Temperament::ALL, temperament)),
-        indicator: Indicator::Cycle(None),
-        close_on_click: false,
-    });
 
     rows.push(MenuRow::Separator);
-    rows.push(MenuRow::Header("FEED (KEEP AWAKE)"));
+    rows.push(MenuRow::Header(Cow::Borrowed("FEED (KEEP AWAKE)")));
     for preset in FeedPreset::ALL {
         let selected = state.feed_preset == Some(preset);
         rows.push(MenuRow::Item {
@@ -949,23 +1131,27 @@ pub(crate) fn build_rows(state: &TrayState) -> Vec<MenuRow> {
     }
 
     rows.push(MenuRow::Separator);
-    rows.push(MenuRow::Header("BEHAVIORS"));
+    rows.push(MenuRow::Header(Cow::Borrowed("BEHAVIORS")));
     rows.push(MenuRow::Item {
         label: Cow::Borrowed("Follow Cursor"),
         action: TrayAction::ToggleFollowCursor,
-        indicator: Indicator::Checkbox(state.behaviors.follow_cursor),
+        indicator: Indicator::Checkbox(state.follow_cursor),
         close_on_click: false,
     });
     rows.push(MenuRow::Item {
         label: Cow::Borrowed("Playful Hunting"),
         action: TrayAction::TogglePlayfulQuirks,
-        indicator: Indicator::Checkbox(state.behaviors.playful_quirks),
+        indicator: Indicator::Checkbox(state.playful_quirks),
         close_on_click: false,
     });
 
     rows.push(MenuRow::Separator);
     rows.push(MenuRow::Item {
-        label: Cow::Borrowed("Show Cat"),
+        label: Cow::Borrowed(if state.cats.len() > 1 {
+            "Show Cats"
+        } else {
+            "Show Cat"
+        }),
         action: TrayAction::ToggleHidden,
         indicator: Indicator::Checkbox(!state.hidden),
         close_on_click: false,
@@ -1118,34 +1304,29 @@ pub(crate) fn render_menu_pixmap(
                             paint.set_color(Color::from_rgba8(0xbd, 0x93, 0xf9, 240));
                             pixmap.stroke_path(&p, &paint, &st, Transform::identity(), None);
                         }
-                        if let Some((base, accent, outline)) = swatch {
-                            let sx = w - 22.0;
-                            if let Some(sw) = PathBuilder::from_circle(sx, cy, 5.5) {
-                                paint.set_color(base);
-                                pixmap.fill_path(
-                                    &sw,
-                                    &paint,
-                                    FillRule::Winding,
-                                    Transform::identity(),
-                                    None,
-                                );
-                                let st = Stroke {
-                                    width: 1.0,
-                                    ..Default::default()
-                                };
-                                paint.set_color(outline);
-                                pixmap.stroke_path(&sw, &paint, &st, Transform::identity(), None);
-                            }
-                            if let Some(dot) = PathBuilder::from_circle(sx + 2.0, cy - 1.5, 2.6) {
-                                paint.set_color(accent);
-                                pixmap.fill_path(
-                                    &dot,
-                                    &paint,
-                                    FillRule::Winding,
-                                    Transform::identity(),
-                                    None,
-                                );
-                            }
+                        if let Some(swatch) = swatch {
+                            draw_swatch(pixmap, w - 22.0, cy, swatch);
+                        }
+                    }
+                    Indicator::Submenu(swatch) => {
+                        draw_swatch(pixmap, ix, cy, swatch);
+                        draw_chevron(pixmap, w - 18.0, cy, 1.0);
+                    }
+                    Indicator::Back => draw_chevron(pixmap, ix, cy, -1.0),
+                    Indicator::Add => {
+                        let mut pb = PathBuilder::new();
+                        pb.move_to(ix - 3.5, cy);
+                        pb.line_to(ix + 3.5, cy);
+                        pb.move_to(ix, cy - 3.5);
+                        pb.line_to(ix, cy + 3.5);
+                        if let Some(p) = pb.finish() {
+                            let st = Stroke {
+                                width: 1.6,
+                                line_cap: LineCap::Round,
+                                ..Default::default()
+                            };
+                            paint.set_color(Color::from_rgba8(0x50, 0xfa, 0x7b, 240));
+                            pixmap.stroke_path(&p, &paint, &st, Transform::identity(), None);
                         }
                     }
                     Indicator::FeedRadio {
@@ -1270,6 +1451,44 @@ pub(crate) fn render_menu_pixmap(
                 y += row_h;
             }
         }
+    }
+}
+
+/// A coat swatch: a disc in the base colour with an accent dot
+fn draw_swatch(pixmap: &mut PixmapMut, cx: f32, cy: f32, (base, accent, outline): Swatch) {
+    let mut paint = Paint::default();
+    if let Some(sw) = PathBuilder::from_circle(cx, cy, 5.5) {
+        paint.set_color(base);
+        pixmap.fill_path(&sw, &paint, FillRule::Winding, Transform::identity(), None);
+        let st = Stroke {
+            width: 1.0,
+            ..Default::default()
+        };
+        paint.set_color(outline);
+        pixmap.stroke_path(&sw, &paint, &st, Transform::identity(), None);
+    }
+    if let Some(dot) = PathBuilder::from_circle(cx + 2.0, cy - 1.5, 2.6) {
+        paint.set_color(accent);
+        pixmap.fill_path(&dot, &paint, FillRule::Winding, Transform::identity(), None);
+    }
+}
+
+/// A single chevron pointing right (`dir` 1.0) or left (`dir` -1.0)
+fn draw_chevron(pixmap: &mut PixmapMut, cx: f32, cy: f32, dir: f32) {
+    let mut pb = PathBuilder::new();
+    pb.move_to(cx - 1.75 * dir, cy - 3.5);
+    pb.line_to(cx + 1.75 * dir, cy);
+    pb.line_to(cx - 1.75 * dir, cy + 3.5);
+    if let Some(p) = pb.finish() {
+        let st = Stroke {
+            width: 1.5,
+            line_cap: LineCap::Round,
+            line_join: LineJoin::Round,
+            ..Default::default()
+        };
+        let mut paint = Paint::default();
+        paint.set_color(Color::from_rgba8(0xbd, 0x93, 0xf9, 240));
+        pixmap.stroke_path(&p, &paint, &st, Transform::identity(), None);
     }
 }
 
@@ -1625,10 +1844,21 @@ mod tests {
     use super::*;
     use crate::coat::CoatStyle;
 
+    fn tray_cat(name: &str, coat: Coat, kitten: bool) -> TrayCat {
+        TrayCat {
+            name: name.into(),
+            coat,
+            temperament: Temperament::Balanced,
+            kitten,
+        }
+    }
+
     fn test_state() -> TrayState {
         TrayState {
-            coat: Coat::builtin(CoatStyle::Calico),
-            behaviors: BehaviorConfig::default(),
+            cats: vec![tray_cat("Luna", Coat::builtin(CoatStyle::Calico), false)],
+            can_add: true,
+            follow_cursor: true,
+            playful_quirks: true,
             scale: 1.0,
             sleeping: false,
             hidden: false,
@@ -1638,13 +1868,13 @@ mod tests {
         }
     }
 
-    fn actions(state: &TrayState) -> Vec<TrayAction> {
-        let (_, hits) = compute_layout(&build_rows(state));
+    fn actions(state: &TrayState, page: MenuPage) -> Vec<TrayAction> {
+        let (_, hits) = compute_layout(&build_rows(state, page));
         hits.into_iter().map(|h| h.action).collect()
     }
 
-    fn label_of(state: &TrayState, action: TrayAction) -> String {
-        build_rows(state)
+    fn label_of(state: &TrayState, page: MenuPage, action: TrayAction) -> String {
+        build_rows(state, page)
             .into_iter()
             .find_map(|row| match row {
                 MenuRow::Item {
@@ -1658,17 +1888,25 @@ mod tests {
     #[test]
     fn menu_layout_covers_all_actions_and_renders_cleanly() {
         let mut state = test_state();
+        state.cats.push(tray_cat("Pip", Coat::random(7), true));
         state.feed_preset = Some(FeedPreset::Mins30);
         state.feed_remaining_secs = Some(1795);
-        let rows = build_rows(&state);
+        let rows = build_rows(&state, MenuPage::Main);
         let (menu_h, hits) = compute_layout(&rows);
 
-        // coat + random coat + design + size + temperament + 5 feed presets + stop + 2 toggles
-        // + show + login + about + quit
-        assert_eq!(hits.len(), 17);
+        // 2 cats + add cat + size + 5 feed presets + stop + 2 toggles + show + login + about
+        // + quit
+        assert_eq!(hits.len(), 16);
         // Must fit comfortably on a 768 px tall screen with a panel (the menu is clamped on
-        // screen with an 8 px margin)
+        // screen with an 8 px margin), even with the most cats
         assert!(menu_h > 200 && menu_h < 440, "menu_h = {menu_h}");
+        let mut full = state.clone();
+        full.cats = (0..crate::cat::clowder::MAX_CATS)
+            .map(|i| tray_cat("Cat", Coat::random(i as u32), false))
+            .collect();
+        full.can_add = false;
+        let (full_h, _) = compute_layout(&build_rows(&full, MenuPage::Main));
+        assert!(full_h < 480, "full_h = {full_h}");
 
         // Verify every hit region is strictly ordered and non-overlapping
         for pair in hits.windows(2) {
@@ -1676,31 +1914,57 @@ mod tests {
             assert!(pair[0].y_bottom <= pair[1].y_top);
         }
 
-        assert_eq!(hits[0].action, TrayAction::NextCoat);
-        assert_eq!(hits[1].action, TrayAction::RandomCoat);
-        assert_eq!(hits[2].action, TrayAction::OpenDesigner);
-        assert!(hits[2].close_on_click);
+        assert_eq!(hits[0].action, TrayAction::OpenCat(0));
+        assert_eq!(hits[1].action, TrayAction::OpenCat(1));
+        assert_eq!(hits[2].action, TrayAction::AddCat);
         assert!(matches!(hits[3].action, TrayAction::SetScale(_)));
-        assert!(matches!(hits[4].action, TrayAction::SetTemperament(_)));
         assert_eq!(
-            hits[5].action,
+            hits[4].action,
             TrayAction::SelectFeedPreset(FeedPreset::Mins15)
         );
-        assert!(hits[5].close_on_click);
-        assert_eq!(hits[10].action, TrayAction::StopFeeding);
-        assert!(hits[10].close_on_click);
-        assert_eq!(hits[14].action, TrayAction::ToggleStartOnLogin);
-        assert_eq!(hits[15].action, TrayAction::OpenAbout);
+        assert!(hits[4].close_on_click);
+        assert_eq!(hits[9].action, TrayAction::StopFeeding);
+        assert!(hits[9].close_on_click);
+        assert_eq!(hits[10].action, TrayAction::ToggleFollowCursor);
+        assert_eq!(hits[11].action, TrayAction::TogglePlayfulQuirks);
+        assert_eq!(hits[13].action, TrayAction::ToggleStartOnLogin);
+        assert_eq!(hits[14].action, TrayAction::OpenAbout);
+        assert!(hits[14].close_on_click);
+        assert_eq!(hits[15].action, TrayAction::Quit);
         assert!(hits[15].close_on_click);
-        assert_eq!(hits[16].action, TrayAction::Quit);
-        assert!(hits[16].close_on_click);
-        for h in &hits {
+
+        // A grown cat's page, when there is more than one cat
+        let cat_rows = build_rows(&state, MenuPage::Cat(0));
+        let (cat_h, cat_hits) = compute_layout(&cat_rows);
+        let cat_actions: Vec<_> = cat_hits.iter().map(|h| h.action).collect();
+        assert_eq!(
+            cat_actions[..4],
+            [
+                TrayAction::ShowMain,
+                TrayAction::NextCoat(0),
+                TrayAction::RandomCoat(0),
+                TrayAction::OpenDesigner(0),
+            ]
+        );
+        assert!(matches!(cat_actions[4], TrayAction::SetTemperament(0, _)));
+        assert_eq!(
+            cat_actions[5..],
+            [TrayAction::AddKitten(0), TrayAction::RemoveCat(0)]
+        );
+        assert!(cat_hits[3].close_on_click);
+
+        for h in hits.iter().chain(&cat_hits) {
             if matches!(
                 h.action,
-                TrayAction::NextCoat
-                    | TrayAction::RandomCoat
+                TrayAction::OpenCat(_)
+                    | TrayAction::ShowMain
+                    | TrayAction::NextCoat(_)
+                    | TrayAction::RandomCoat(_)
                     | TrayAction::SetScale(_)
-                    | TrayAction::SetTemperament(_)
+                    | TrayAction::SetTemperament(..)
+                    | TrayAction::AddCat
+                    | TrayAction::AddKitten(_)
+                    | TrayAction::RemoveCat(_)
                     | TrayAction::ToggleHidden
                     | TrayAction::ToggleStartOnLogin
             ) {
@@ -1713,14 +1977,64 @@ mod tests {
         }
         let mut pixmap = Pixmap::new(MENU_WIDTH as u32, menu_h as u32).unwrap();
         render_menu_pixmap(&rows, Some(3), &mut pixmap.as_mut());
+        let mut pixmap = Pixmap::new(MENU_WIDTH as u32, cat_h as u32).unwrap();
+        render_menu_pixmap(&cat_rows, Some(0), &mut pixmap.as_mut());
+    }
+
+    #[test]
+    fn cat_pages_offer_what_fits_the_cat() {
+        let mut state = test_state();
+        // A lone cat can't be removed
+        assert!(
+            !actions(&state, MenuPage::Cat(0))
+                .iter()
+                .any(|a| matches!(a, TrayAction::RemoveCat(_)))
+        );
+        // Kittens don't have kittens, and a full clowder takes no more cats
+        state.cats.push(tray_cat("Pip", Coat::random(7), true));
+        let kitten_page = actions(&state, MenuPage::Cat(1));
+        assert!(!kitten_page.contains(&TrayAction::AddKitten(1)));
+        assert!(kitten_page.contains(&TrayAction::RemoveCat(1)));
+        assert!(label_of(&state, MenuPage::Main, TrayAction::OpenCat(1)).contains("kitten"));
+        state.can_add = false;
+        assert!(!actions(&state, MenuPage::Main).contains(&TrayAction::AddCat));
+        assert!(!actions(&state, MenuPage::Cat(0)).contains(&TrayAction::AddKitten(0)));
+        // A stale page shows the main page
+        assert_eq!(
+            actions(&state, MenuPage::Cat(5)),
+            actions(&state, MenuPage::Main)
+        );
+    }
+
+    #[test]
+    fn menu_navigation_stays_inside_the_menu() {
+        let mut state = test_state();
+        state.cats.push(tray_cat("Pip", Coat::random(7), true));
+        let mut page = MenuPage::Main;
+        assert!(page.navigate(TrayAction::OpenCat(1)));
+        assert_eq!(page, MenuPage::Cat(1));
+        assert!(!page.navigate(TrayAction::NextCoat(1)));
+        assert_eq!(page, MenuPage::Cat(1));
+        assert!(page.navigate(TrayAction::ShowMain));
+        assert_eq!(page, MenuPage::Main);
+
+        // Removing goes back to the main page but is still for the app to carry out
+        page = MenuPage::Cat(1);
+        assert!(!page.navigate(TrayAction::RemoveCat(1)));
+        assert_eq!(page, MenuPage::Main);
+
+        page = MenuPage::Cat(1);
+        state.cats.truncate(1);
+        page.validate(&state);
+        assert_eq!(page, MenuPage::Main);
     }
 
     #[test]
     fn stop_feeding_row_only_while_feeding() {
         let mut state = test_state();
-        assert!(!actions(&state).contains(&TrayAction::StopFeeding));
+        assert!(!actions(&state, MenuPage::Main).contains(&TrayAction::StopFeeding));
         state.feed_preset = Some(FeedPreset::Indefinite);
-        assert!(actions(&state).contains(&TrayAction::StopFeeding));
+        assert!(actions(&state, MenuPage::Main).contains(&TrayAction::StopFeeding));
 
         let active = Some(FeedPreset::Hour1);
         assert_eq!(
@@ -1736,15 +2050,25 @@ mod tests {
     #[test]
     fn coat_row_shows_the_current_coat_name() {
         let mut state = test_state();
-        assert_eq!(label_of(&state, TrayAction::NextCoat), "Coat: Calico");
-        assert_eq!(label_of(&state, TrayAction::RandomCoat), "Random Coat");
-        assert_eq!(label_of(&state, TrayAction::OpenDesigner), "Design Coat...");
-        state.coat = Coat::random(42);
+        let page = MenuPage::Cat(0);
         assert_eq!(
-            label_of(&state, TrayAction::NextCoat),
-            format!("Coat: {}", state.coat.name)
+            label_of(&state, page, TrayAction::NextCoat(0)),
+            "Coat: Calico"
         );
-        // Random coat names only use characters the bitmap font has
+        assert_eq!(
+            label_of(&state, page, TrayAction::RandomCoat(0)),
+            "Random Coat"
+        );
+        assert_eq!(
+            label_of(&state, page, TrayAction::OpenDesigner(0)),
+            "Design Coat..."
+        );
+        state.cats[0].coat = Coat::random(42);
+        assert_eq!(
+            label_of(&state, page, TrayAction::NextCoat(0)),
+            format!("Coat: {}", state.cats[0].coat.name)
+        );
+        // Random coat names and the cat names handed out only use characters the bitmap font has
         for seed in 0..200 {
             let name = Coat::random(seed).name;
             assert!(
@@ -1757,24 +2081,25 @@ mod tests {
     #[test]
     fn temperament_row_cycles_through_every_temperament() {
         let mut state = test_state();
+        let page = MenuPage::Cat(0);
         let mut seen = Vec::new();
         for _ in 0..Temperament::ALL.len() {
-            let current = state.behaviors.temperament;
+            let current = state.cats[0].temperament;
             seen.push(current);
-            let next = actions(&state)
+            let next = actions(&state, page)
                 .into_iter()
                 .find_map(|a| match a {
-                    TrayAction::SetTemperament(t) => Some(t),
+                    TrayAction::SetTemperament(0, t) => Some(t),
                     _ => None,
                 })
                 .unwrap();
             assert_eq!(
-                label_of(&state, TrayAction::SetTemperament(next)),
+                label_of(&state, page, TrayAction::SetTemperament(0, next)),
                 format!("Temperament: {}", current.label())
             );
-            state.behaviors.temperament = next;
+            state.cats[0].temperament = next;
         }
-        assert_eq!(state.behaviors.temperament, Temperament::Balanced);
+        assert_eq!(state.cats[0].temperament, Temperament::Balanced);
         assert_eq!(seen, Temperament::ALL.to_vec());
     }
 
@@ -1782,7 +2107,7 @@ mod tests {
     fn size_row_cycles_presets_and_shows_custom_scale() {
         let mut state = test_state();
         let next_scale = |state: &TrayState| {
-            actions(state)
+            actions(state, MenuPage::Main)
                 .into_iter()
                 .find_map(|a| match a {
                     TrayAction::SetScale(s) => Some(s),
@@ -1791,7 +2116,7 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(
-            label_of(&state, TrayAction::SetScale(1.35)),
+            label_of(&state, MenuPage::Main, TrayAction::SetScale(1.35)),
             "Size: Normal 1.0x"
         );
         assert_eq!(next_scale(&state), 1.35);
@@ -1800,7 +2125,7 @@ mod tests {
 
         state.scale = 1.5;
         assert_eq!(
-            label_of(&state, TrayAction::SetScale(1.75)),
+            label_of(&state, MenuPage::Main, TrayAction::SetScale(1.75)),
             "Size: Custom 1.50x"
         );
         assert_eq!(next_scale(&state), 1.75);
@@ -1810,7 +2135,7 @@ mod tests {
 
     #[test]
     fn about_row_shows_version_and_links_to_repository() {
-        let label = label_of(&test_state(), TrayAction::OpenAbout);
+        let label = label_of(&test_state(), MenuPage::Main, TrayAction::OpenAbout);
         assert_eq!(
             label,
             format!("About Catsor v{}", env!("CARGO_PKG_VERSION"))
@@ -1824,22 +2149,23 @@ mod tests {
     fn show_cat_checkbox_reflects_visibility() {
         let mut state = test_state();
         let checked = |state: &TrayState| {
-            build_rows(state).into_iter().find_map(|row| match row {
-                MenuRow::Item {
-                    label,
-                    indicator: Indicator::Checkbox(c),
-                    action: TrayAction::ToggleHidden,
-                    ..
-                } => {
-                    assert_eq!(label, "Show Cat");
-                    Some(c)
-                }
-                _ => None,
-            })
+            build_rows(state, MenuPage::Main)
+                .into_iter()
+                .find_map(|row| match row {
+                    MenuRow::Item {
+                        label,
+                        indicator: Indicator::Checkbox(c),
+                        action: TrayAction::ToggleHidden,
+                        ..
+                    } => Some((label.into_owned(), c)),
+                    _ => None,
+                })
         };
-        assert_eq!(checked(&state), Some(true));
+        assert_eq!(checked(&state), Some(("Show Cat".into(), true)));
         state.hidden = true;
-        assert_eq!(checked(&state), Some(false));
+        assert_eq!(checked(&state), Some(("Show Cat".into(), false)));
+        state.cats.push(tray_cat("Pip", Coat::random(7), true));
+        assert_eq!(checked(&state), Some(("Show Cats".into(), false)));
     }
 
     #[test]

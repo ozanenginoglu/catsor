@@ -57,22 +57,28 @@ The root window's `SUBSTRUCTURE_NOTIFY` events supply the Map and Configure noti
 
 Unlike the overlays, the designer is an **ordinary managed window**. It is not override-redirect, and it uses the root's opaque visual instead of ARGB. That way the window manager gives it a title bar, keyboard focus and a close button (`WM_DELETE_WINDOW`), and it shows up in window lists. It is marked `_NET_WM_WINDOW_TYPE_DIALOG`, has fixed-size `WM_NORMAL_HINTS`, and sets `WM_TRANSIENT_FOR` to the root window. xmonad floats transient windows, so the designer isn't tiled there. If a window manager resizes it anyway, the contents stay centred at their logical size (`Designer::set_window_size`). Key presses are turned into keysyms with the core `GetKeyboardMapping` table (`resolve_keysym`), without depending on xkbcommon: Shift picks column 1, Caps Lock shifts letters only (Shift + Caps Lock gives lower case), and with NumLock on, keypad keys use their digit column unless Shift is held. Only printable ASCII/Latin-1, keypad digits, BackSpace, Return and Escape are used. If the designer window fails to open or draw, the error is logged and the cat keeps running without it. A frame is uploaded in horizontal strips sized to `maximum_request_bytes`, so it never runs into the request size limit. Opening it again while it is open sends `_NET_ACTIVE_WINDOW` to raise and focus the existing one.
 
+### One window per cat
+
+Every cat has its own `OverlayWindow`, so each one is only as large as that cat's frame. `sync_cat_windows` runs every frame and matches the window list to the `Clowder`: it creates windows for new cats, resizes them when the scale changes, and maps or unmaps them. Windows are **never destroyed** while Catsor runs; a removed cat's window is unmapped and reused by the next cat. Win32 does the same (`CatWindow` in `win32.rs`) for a stronger reason: destroying an overlay window there runs the `WM_DESTROY` handler, which posts `WM_QUIT` and ends the app.
+
+The graphics context is shared by all overlays and created on the bowl window rather than the root window, because a GC can only draw on drawables of the depth it was created for, and the overlays are 32-bit while the root window usually isn't (drawing would fail with BadMatch).
+
 ### Bowl placement
 
 When a feed preset is picked, the loop **grabs the pointer and keyboard on the root window**, so the placement click doesn't reach the app underneath:
 
-- Button 1 → `cat.place_bowl(click position)`
-- Any other button, or Esc → `cat.stop_feeding()`
+- Button 1 → `clowder.place_bowl(click position)`
+- Any other button, or Esc → `clowder.stop_feeding()`
 
 If the grab fails (another client already holds a grab), the bowl is placed at the cursor straight away. The grab is released as soon as the cat stops carrying the bowl, whatever the reason. The bowl is drawn in its **own small click-through window** while it's being carried or walked to. Once eating starts, `render_cat` draws it as part of the cat's frame.
 
 ### Roaming bounds
 
-Each frame, `update_roam_bounds` sets `cat.roam_bounds` to the monitor that contains the cat's `window_center()`, or the nearest one. Monitors come from RandR 1.5 `GetMonitors` (active monitors only) and are re-read every 2 s, so plugging, unplugging or rearranging screens is picked up. Per-monitor bounds matter because with monitors of different sizes, the root window has areas no screen shows. If RandR monitors aren't available, the whole root window is used. Docks and panels (e.g. xmobar) aren't excluded. Roam targets stay 30 px inside the monitor edge, so the cat may partly overlap a bar.
+Each frame, `update_roam_bounds` sets every cat's `roam_bounds` to the monitor that contains the cat's `window_center()`, or the nearest one. Monitors come from RandR 1.5 `GetMonitors` (active monitors only) and are re-read every 2 s, so plugging, unplugging or rearranging screens is picked up. Per-monitor bounds matter because with monitors of different sizes, the root window has areas no screen shows. If RandR monitors aren't available, the whole root window is used. Docks and panels (e.g. xmobar) aren't excluded. Roam targets stay 30 px inside the monitor edge, so the cat may partly overlap a bar.
 
 ### Keep-awake (feeding mode)
 
-`X11KeepAwake` is active while `cat.keeps_awake()` is true, which covers WalkingToBowl and Eating.
+`X11KeepAwake` is active while `clowder.keeps_awake()` is true, which covers the whole shared-bowl session once the bowl is down.
 
 1. **`systemd-inhibit --what=idle:sleep --who=catsor … sleep infinity`** is started as a child process. The child is killed and reaped when feeding ends, and in `Drop`. If `systemd-inhibit` is missing, this step silently does nothing.
 2. **`ForceScreenSaver(Reset)`** is called every 25 s.

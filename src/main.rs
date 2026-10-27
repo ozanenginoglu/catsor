@@ -28,7 +28,7 @@ use clap::Parser;
     about = "Top-down procedural desktop cat companion for Linux (X11) and Windows that leisurely follows the mouse cursor"
 )]
 pub(crate) struct Args {
-    /// Coat: calico, brown, charcoal, tuxedo, silver, a custom coat's name from coats.toml, or
+    /// The first cat's coat: calico, brown, charcoal, tuxedo, silver, a custom coat's name from coats.toml, or
     /// random; overrides saved preference
     #[arg(short, long)]
     coat: Option<String>,
@@ -37,7 +37,7 @@ pub(crate) struct Args {
     #[arg(short, long)]
     scale: Option<f32>,
 
-    /// Initial cat temperament (balanced, playful, lazy, aloof, realistic); overrides saved preference
+    /// The first cat's temperament (balanced, playful, lazy, aloof, realistic); overrides saved preference
     #[arg(short, long, value_enum)]
     temperament: Option<Temperament>,
 
@@ -87,14 +87,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut prefs = UserPrefs::load();
     if args.print_coat {
-        let coat = coats.resolve(cli_coat.as_ref().unwrap_or(&prefs.coat));
+        let coat = coats.resolve(cli_coat.as_ref().unwrap_or(&prefs.cats[0].coat));
         print!("{}", coat.to_toml_entry(&format!("My {}", coat.name)));
         return Ok(());
     }
 
+    // --coat and --temperament apply to the first cat
     let mut cli_overrode = false;
     if let Some(coat) = cli_coat {
-        prefs.coat = coat;
+        prefs.cats[0].coat = coat;
         cli_overrode = true;
     }
     if let Some(scale) = args.scale {
@@ -102,7 +103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli_overrode = true;
     }
     if let Some(temperament) = args.temperament {
-        prefs.behaviors.temperament = temperament;
+        prefs.cats[0].temperament = temperament;
         cli_overrode = true;
     }
     if cli_overrode {

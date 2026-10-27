@@ -1,6 +1,7 @@
 use crate::Args;
 use crate::autostart;
-use crate::cat::{CatSim, FeedPreset};
+use crate::cat::FeedPreset;
+use crate::cat::clowder::Clowder;
 use crate::coat::{Coat, CoatLibrary};
 use crate::designer::{DESIGNER_H, DESIGNER_TITLE, DESIGNER_W, Designer, DesignerInput};
 use crate::prefs::UserPrefs;
@@ -646,15 +647,25 @@ enum Flow {
     Quit,
 }
 
+/// A cat's overlay window. Windows outlive removed cats (unmapped) and are reused when cats
+/// are added again
+struct CatWindow {
+    overlay: OverlayWindow,
+    mapped: bool,
+}
+
 struct X11App {
     conn: RustConnection,
     env: OverlayEnv,
     gc: Gcontext,
-    cat: CatSim,
+    clowder: Clowder,
     /// Custom coats from `coats.toml`, reloaded when the file changes
     coats: CoatLibrary,
     designer: Option<DesignerWindow>,
-    cat_win: OverlayWindow,
+    /// Which cat the open designer puts its coat on
+    designer_cat: usize,
+    /// One window per cat, in the clowder's order (plus spare unmapped ones)
+    cat_wins: Vec<CatWindow>,
     /// Standalone bowl window shown while carrying or walking to the placed bowl
     bowl_win: OverlayWindow,
     bowl_mapped: bool,
@@ -710,7 +721,7 @@ fn monitor_at(monitors: &[(Vec2, Vec2)], p: Vec2) -> Option<(Vec2, Vec2)> {
 pub fn run(args: &Args, prefs: UserPrefs, coats: CoatLibrary) -> BoxResult<()> {
     let mut app = X11App::new(args, prefs, coats)?;
     if args.design_coat {
-        app.handle_tray_action(TrayAction::OpenDesigner)?;
+        app.handle_tray_action(TrayAction::OpenDesigner(0))?;
     }
     let frame_duration = Duration::from_secs_f64(1.0 / (args.fps.max(15) as f64));
     let mut last_tick = Instant::now();
@@ -732,8 +743,9 @@ pub fn run(args: &Args, prefs: UserPrefs, coats: CoatLibrary) -> BoxResult<()> {
         app.sync_tray(raise_counter.is_multiple_of(120))?;
 
         app.draw_bowl(needs_raise)?;
+        app.sync_cat_windows()?;
         if !app.cat_hidden {
-            app.draw_cat(needs_raise)?;
+            app.draw_cats(needs_raise)?;
         }
         if let Some(dw) = &mut app.designer
             && let Err(e) = dw.present(&app.conn)
@@ -763,49 +775,37 @@ impl X11App {
             &ChangeWindowAttributesAux::new().event_mask(EventMask::SUBSTRUCTURE_NOTIFY),
         );
 
-        // Query initial cursor location so the cat spawns nearby
+        // Query initial cursor location so the cats spawn nearby
         let pointer = conn.query_pointer(env.root)?.reply()?;
         let start_cursor = Vec2::new(pointer.root_x as f32, pointer.root_y as f32);
-        let mut cat = CatSim::new(start_cursor, prefs.scale, coats.resolve(&prefs.coat));
-        cat.behaviors = prefs.behaviors;
+        let clowder = Clowder::new(
+            &prefs.cats,
+            prefs.scale,
+            prefs.follow_cursor,
+            prefs.playful_quirks,
+            &coats,
+            start_cursor,
+        );
         let _ = conn.randr_query_version(1, 5).map(|cookie| cookie.reply());
         let monitors = query_monitors(&conn, env.root);
 
-        // Compact window bounding box around the cat (~108x108 at scale 1.0)
-        let win_dim = cat_window_dim(prefs.scale);
-        let init_center = cat.window_center();
-        let win_x = (init_center.x - (win_dim as f32) * 0.5).round() as i16;
-        let win_y = (init_center.y - (win_dim as f32) * 0.5).round() as i16;
-        let cat_win = OverlayWindow::create(&conn, &env, win_dim, win_x, win_y)?;
-        conn.change_property8(
-            PropMode::REPLACE,
-            cat_win.win,
-            AtomEnum::WM_NAME,
-            AtomEnum::STRING,
-            b"catsor",
+        let bowl_win = OverlayWindow::create(
+            &conn,
+            &env,
+            bowl_window_dim(prefs.scale),
+            start_cursor.x as i16,
+            start_cursor.y as i16,
         )?;
-        conn.change_property8(
-            PropMode::REPLACE,
-            cat_win.win,
-            AtomEnum::WM_CLASS,
-            AtomEnum::STRING,
-            b"catsor\0Catsor\0",
-        )?;
-
+        // Every overlay shares one graphics context, made on an overlay for their 32-bit depth
         let gc = conn.generate_id()?;
-        conn.create_gc(gc, cat_win.win, &CreateGCAux::new())?;
-        map_passthrough_window(&conn, cat_win.win, env.empty_region)?;
-        conn.flush()?;
-
-        let bowl_win =
-            OverlayWindow::create(&conn, &env, bowl_window_dim(prefs.scale), win_x, win_y)?;
+        conn.create_gc(gc, bowl_win.win, &CreateGCAux::new())?;
 
         let cat_hidden = false;
         let start_on_login = autostart::is_enabled();
         let tray = if args.no_tray {
             None
         } else {
-            let initial_state = TrayState::from_cat(&cat, cat_hidden, start_on_login);
+            let initial_state = TrayState::from_clowder(&clowder, cat_hidden, start_on_login);
             TrayController::new(
                 &conn,
                 screen_num,
@@ -817,14 +817,15 @@ impl X11App {
             .ok()
         };
 
-        Ok(Self {
+        let mut app = Self {
             conn,
             env,
             gc,
-            cat,
+            clowder,
             coats,
             designer: None,
-            cat_win,
+            designer_cat: 0,
+            cat_wins: Vec::new(),
             bowl_win,
             bowl_mapped: false,
             bowl_grabbed: false,
@@ -834,35 +835,97 @@ impl X11App {
             tray,
             monitors,
             monitors_checked: Instant::now(),
-        })
+        };
+        app.sync_cat_windows()?;
+        app.conn.flush()?;
+        Ok(app)
+    }
+
+    /// Gives every cat a mapped window of the right size (creating windows as cats are added)
+    /// and unmaps the windows of removed cats, or all of them while the cats are hidden
+    fn sync_cat_windows(&mut self) -> BoxResult<()> {
+        while self.cat_wins.len() < self.clowder.len() {
+            let cat = self.clowder.cat(self.cat_wins.len());
+            let dim = cat_window_dim(cat.scale);
+            let center = cat.window_center();
+            let x = (center.x - (dim as f32) * 0.5).round() as i16;
+            let y = (center.y - (dim as f32) * 0.5).round() as i16;
+            let overlay = OverlayWindow::create(&self.conn, &self.env, dim, x, y)?;
+            self.conn.change_property8(
+                PropMode::REPLACE,
+                overlay.win,
+                AtomEnum::WM_NAME,
+                AtomEnum::STRING,
+                b"catsor",
+            )?;
+            self.conn.change_property8(
+                PropMode::REPLACE,
+                overlay.win,
+                AtomEnum::WM_CLASS,
+                AtomEnum::STRING,
+                b"catsor\0Catsor\0",
+            )?;
+            self.cat_wins.push(CatWindow {
+                overlay,
+                mapped: false,
+            });
+        }
+        for (i, cw) in self.cat_wins.iter_mut().enumerate() {
+            let wanted = !self.cat_hidden && i < self.clowder.len();
+            if wanted {
+                cw.overlay.resize(
+                    &self.conn,
+                    &self.env,
+                    cat_window_dim(self.clowder.cat(i).scale),
+                )?;
+            }
+            if wanted && !cw.mapped {
+                map_passthrough_window(&self.conn, cw.overlay.win, self.env.empty_region)?;
+            } else if !wanted && cw.mapped {
+                self.conn.unmap_window(cw.overlay.win)?;
+            }
+            cw.mapped = wanted;
+        }
+        Ok(())
+    }
+
+    fn is_cat_window(&self, win: Window) -> bool {
+        self.cat_wins.iter().any(|cw| cw.overlay.win == win)
     }
 
     /// Processes pending X11 events, routing them to bowl placement and the tray icon / popup
     /// menu, and notes whether another window stacked above the cat.
     fn process_events(&mut self) -> BoxResult<Flow> {
         let mut needs_raise = false;
-        let win = self.cat_win.win;
         let overlay_atom = self.env.catsor_overlay;
         let open_menu_win = self.tray.as_ref().and_then(|t| t.open_menu_window());
         while let Some(event) = self.conn.poll_for_event()? {
-            if let Some(dw) = &mut self.designer
-                && let Some(close) = dw.handle_event(&event, &mut self.coats, &mut self.cat)
-            {
-                if close && let Some(dw) = self.designer.take() {
-                    dw.close(&self.conn);
+            if let Some(dw) = &mut self.designer {
+                let cat = self
+                    .clowder
+                    .cat_mut(self.designer_cat.min(self.clowder.len() - 1));
+                let coat_before = cat.coat.id.clone();
+                let handled = dw.handle_event(&event, &mut self.coats, cat);
+                if cat.coat.id != coat_before {
+                    UserPrefs::from_clowder(&self.clowder).save();
                 }
-                continue;
+                if let Some(close) = handled {
+                    if close && let Some(dw) = self.designer.take() {
+                        dw.close(&self.conn);
+                    }
+                    continue;
+                }
             }
             let conn = &self.conn;
             match &event {
                 Event::VisibilityNotify(ev)
-                    if ev.window == win && ev.state != Visibility::UNOBSCURED =>
+                    if self.is_cat_window(ev.window) && ev.state != Visibility::UNOBSCURED =>
                 {
                     needs_raise = true;
                 }
                 Event::MapNotify(ev) => {
-                    if ev.window == win {
-                        apply_input_passthrough(conn, win, self.env.empty_region)?;
+                    if self.is_cat_window(ev.window) {
+                        apply_input_passthrough(conn, ev.window, self.env.empty_region)?;
                         needs_raise = true;
                     } else if open_menu_win != Some(ev.window)
                         && !is_catsor_overlay(conn, overlay_atom, ev.window)
@@ -871,9 +934,9 @@ impl X11App {
                     }
                 }
                 Event::ConfigureNotify(ev)
-                    if ev.window != win
+                    if !self.is_cat_window(ev.window)
                         && open_menu_win != Some(ev.window)
-                        && (ev.above_sibling == win
+                        && (self.is_cat_window(ev.above_sibling)
                             || open_menu_win == Some(ev.above_sibling)
                             || is_catsor_overlay(conn, overlay_atom, ev.above_sibling))
                         && !is_catsor_overlay(conn, overlay_atom, ev.window) =>
@@ -883,17 +946,17 @@ impl X11App {
                 Event::ButtonPress(ev) if self.bowl_grabbed => {
                     self.release_bowl_grab();
                     if ev.detail == 1 {
-                        self.cat
+                        self.clowder
                             .place_bowl(Vec2::new(ev.root_x as f32, ev.root_y as f32));
                     } else {
-                        self.cat.stop_feeding();
+                        self.clowder.stop_feeding();
                     }
                     continue;
                 }
                 // Escape cancels bowl placement
                 Event::KeyPress(ev) if self.bowl_grabbed && ev.detail == 9 => {
                     self.release_bowl_grab();
-                    self.cat.stop_feeding();
+                    self.clowder.stop_feeding();
                     continue;
                 }
                 _ => {}
@@ -915,9 +978,24 @@ impl X11App {
 
     fn handle_tray_action(&mut self, action: TrayAction) -> BoxResult<Flow> {
         let mut needs_raise = false;
-        let Some(action) =
-            apply_shared_action(action, &mut self.cat, &self.coats, &mut self.start_on_login)
-        else {
+        // The designer follows its cat down the list, and closes if its cat goes
+        if let TrayAction::RemoveCat(i) = action
+            && self.clowder.len() > 1
+        {
+            if i == self.designer_cat
+                && let Some(dw) = self.designer.take()
+            {
+                dw.close(&self.conn);
+            } else if i < self.designer_cat {
+                self.designer_cat -= 1;
+            }
+        }
+        let Some(action) = apply_shared_action(
+            action,
+            &mut self.clowder,
+            &self.coats,
+            &mut self.start_on_login,
+        ) else {
             return Ok(Flow::Continue { needs_raise });
         };
         match action {
@@ -925,53 +1003,47 @@ impl X11App {
                 if self.bowl_grabbed {
                     self.release_bowl_grab();
                 }
-                self.cat.stop_feeding();
+                self.clowder.stop_feeding();
                 self.keep_awake.set_active(&self.conn, false);
             }
             TrayAction::SelectFeedPreset(preset) => {
                 if self.cat_hidden {
                     self.cat_hidden = false;
-                    map_passthrough_window(&self.conn, self.cat_win.win, self.env.empty_region)?;
                     needs_raise = true;
                 }
                 self.begin_bowl_placement(preset);
             }
-            TrayAction::SetScale(new_scale) => {
-                self.cat.set_scale(new_scale);
-                UserPrefs::from_cat(&self.cat).save();
-                if self
-                    .cat_win
-                    .resize(&self.conn, &self.env, cat_window_dim(self.cat.scale))?
-                {
-                    needs_raise = true;
-                }
-                self.bowl_win
-                    .resize(&self.conn, &self.env, bowl_window_dim(self.cat.scale))?;
-            }
             TrayAction::ToggleHidden => {
                 self.cat_hidden = !self.cat_hidden;
-                if self.cat_hidden {
-                    self.conn.unmap_window(self.cat_win.win)?;
-                } else {
-                    map_passthrough_window(&self.conn, self.cat_win.win, self.env.empty_region)?;
-                    needs_raise = true;
-                }
+                needs_raise = !self.cat_hidden;
             }
             TrayAction::OpenAbout => open_about_page(),
-            // The designer is optional: if its window fails, say so and keep the cat running
-            TrayAction::OpenDesigner => match &self.designer {
-                Some(dw) => {
-                    if let Err(e) = dw.activate(&self.conn, self.env.root) {
-                        eprintln!("catsor: failed to raise the coat designer: {e}");
-                    }
+            // The designer is optional: if its window fails, say so and keep the cats running.
+            // An open designer switches to the cat it was asked for
+            TrayAction::OpenDesigner(i) if i < self.clowder.len() => {
+                if self.designer_cat != i
+                    && let Some(dw) = self.designer.take()
+                {
+                    dw.close(&self.conn);
                 }
-                None => {
-                    match DesignerWindow::open(&self.conn, &self.env, &self.cat.coat, &self.coats) {
+                self.designer_cat = i;
+                match &self.designer {
+                    Some(dw) => {
+                        if let Err(e) = dw.activate(&self.conn, self.env.root) {
+                            eprintln!("catsor: failed to raise the coat designer: {e}");
+                        }
+                    }
+                    None => match DesignerWindow::open(
+                        &self.conn,
+                        &self.env,
+                        &self.clowder.cat(i).coat,
+                        &self.coats,
+                    ) {
                         Ok(dw) => self.designer = Some(dw),
                         Err(e) => eprintln!("catsor: failed to open the coat designer: {e}"),
-                    }
+                    },
                 }
-            },
+            }
             TrayAction::Quit => {
                 if let Some(dw) = self.designer.take() {
                     dw.close(&self.conn);
@@ -981,10 +1053,17 @@ impl X11App {
                 }
                 return Ok(Flow::Quit);
             }
-            // Handled by `apply_shared_action`
-            TrayAction::NextCoat
-            | TrayAction::RandomCoat
-            | TrayAction::SetTemperament(_)
+            // Handled by `apply_shared_action`, or a stale cat index
+            TrayAction::OpenCat(_)
+            | TrayAction::ShowMain
+            | TrayAction::NextCoat(_)
+            | TrayAction::RandomCoat(_)
+            | TrayAction::OpenDesigner(_)
+            | TrayAction::SetTemperament(..)
+            | TrayAction::AddCat
+            | TrayAction::AddKitten(_)
+            | TrayAction::RemoveCat(_)
+            | TrayAction::SetScale(_)
             | TrayAction::ToggleFollowCursor
             | TrayAction::TogglePlayfulQuirks
             | TrayAction::ToggleStartOnLogin => {}
@@ -1003,8 +1082,8 @@ impl X11App {
             .ok()
             .and_then(|c| c.reply().ok())
             .map(|r| Vec2::new(r.root_x as f32, r.root_y as f32))
-            .unwrap_or(self.cat.raw_cursor);
-        self.cat.begin_bowl_placement(preset, cur);
+            .unwrap_or(self.clowder.cat(0).raw_cursor);
+        self.clowder.begin_bowl_placement(preset, cur);
         if self
             .conn
             .grab_pointer(
@@ -1030,7 +1109,7 @@ impl X11App {
             );
             self.bowl_grabbed = true;
         } else {
-            self.cat.place_bowl(cur);
+            self.clowder.place_bowl(cur);
         }
     }
 
@@ -1041,36 +1120,40 @@ impl X11App {
 
     /// Drops the bowl grab once feeding ended some other way (e.g. the tray menu)
     fn release_stale_bowl_grab(&mut self) {
-        if self.bowl_grabbed && !self.cat.is_carrying_bowl() {
+        if self.bowl_grabbed && !self.clowder.is_carrying_bowl() {
             self.release_bowl_grab();
         }
     }
 
-    /// Advances the simulation from the root-window cursor. A hidden cat stays paused unless
-    /// it is feeding.
+    /// Advances the simulation from the root-window cursor. Hidden cats stay paused unless
+    /// they are feeding.
     fn step_cat(&mut self, dt: f32) {
-        self.coats.refresh(&mut self.cat);
+        for cat in self.clowder.cats_mut() {
+            self.coats.refresh(cat);
+        }
         self.update_roam_bounds();
-        if (!self.cat_hidden || self.cat.feeding_preset().is_some())
+        if (!self.cat_hidden || self.clowder.feeding_preset().is_some())
             && let Ok(cookie) = self.conn.query_pointer(self.env.root)
             && let Ok(reply) = cookie.reply()
         {
             let cursor_pos = Vec2::new(reply.root_x as f32, reply.root_y as f32);
-            self.cat.update(cursor_pos, dt);
-            self.keep_awake.tick(&self.conn, self.cat.keeps_awake());
+            self.clowder.update(cursor_pos, dt);
+            self.keep_awake.tick(&self.conn, self.clowder.keeps_awake());
         } else {
             self.keep_awake.set_active(&self.conn, false);
         }
     }
 
-    /// Keeps a roaming cat on the monitor it is on. The monitor layout is re-read every few
+    /// Keeps each roaming cat on the monitor it is on. The monitor layout is re-read every few
     /// seconds so plugging, unplugging or rearranging screens is picked up.
     fn update_roam_bounds(&mut self) {
         if self.monitors_checked.elapsed() >= Duration::from_secs(2) {
             self.monitors_checked = Instant::now();
             self.monitors = query_monitors(&self.conn, self.env.root);
         }
-        self.cat.roam_bounds = monitor_at(&self.monitors, self.cat.window_center());
+        for cat in self.clowder.cats_mut() {
+            cat.roam_bounds = monitor_at(&self.monitors, cat.window_center());
+        }
     }
 
     fn sync_tray(&mut self, retry_dock: bool) -> BoxResult<()> {
@@ -1080,7 +1163,7 @@ impl X11App {
             }
             tray_ctrl.sync_state(
                 &self.conn,
-                TrayState::from_cat(&self.cat, self.cat_hidden, self.start_on_login),
+                TrayState::from_clowder(&self.clowder, self.cat_hidden, self.start_on_login),
             )?;
         }
         Ok(())
@@ -1088,19 +1171,22 @@ impl X11App {
 
     /// Shows the bowl window at the detached bowl while there is one, and hides it otherwise
     fn draw_bowl(&mut self, needs_raise: bool) -> BoxResult<()> {
-        let Some(detached_pos) = self.cat.detached_bowl_pos() else {
+        let Some(detached_pos) = self.clowder.detached_bowl_pos() else {
             if self.bowl_mapped {
                 self.conn.unmap_window(self.bowl_win.win)?;
                 self.bowl_mapped = false;
             }
             return Ok(());
         };
+        let bowl_scale = self.clowder.bowl_scale();
+        self.bowl_win
+            .resize(&self.conn, &self.env, bowl_window_dim(bowl_scale))?;
         if !self.bowl_mapped {
             map_passthrough_window(&self.conn, self.bowl_win.win, self.env.empty_region)?;
             self.bowl_mapped = true;
         }
         let bowl = &mut self.bowl_win;
-        render_bowl_overlay(self.cat.scale, &mut bowl.pixmap.as_mut());
+        render_bowl_overlay(bowl_scale, &mut bowl.pixmap.as_mut());
         let bx = (detached_pos.x - (bowl.dim as f32) * 0.5).round() as i16;
         let by = (detached_pos.y - (bowl.dim as f32) * 0.5).round() as i16;
         if bx != bowl.x || by != bowl.y || needs_raise {
@@ -1117,23 +1203,9 @@ impl X11App {
         bowl.present(&self.conn, self.gc, self.env.depth)
     }
 
-    /// Renders the cat, moves its window to follow it and re-raises it when needed (kept
+    /// Renders each cat, moves its window to follow it and re-raises it when needed (kept
     /// just below an open tray menu)
-    fn draw_cat(&mut self, needs_raise: bool) -> BoxResult<()> {
-        let cat_win = &mut self.cat_win;
-        // Render relative to the continuous window anchor so the cat's torso never shifts
-        // inside the pixmap when integer window coordinates round or when the tail sways
-        let center = self.cat.window_center();
-        let origin = center - Vec2::splat((cat_win.dim as f32) * 0.5);
-        render_cat(
-            &self.cat,
-            &mut cat_win.pixmap.as_mut(),
-            &mut cat_win.mask,
-            origin,
-        );
-
-        let new_x = origin.x.round() as i16;
-        let new_y = origin.y.round() as i16;
+    fn draw_cats(&mut self, needs_raise: bool) -> BoxResult<()> {
         let open_menu_win = self.tray.as_ref().and_then(|t| t.open_menu_window());
         let stack_cfg = |cfg: ConfigureWindowAux| -> ConfigureWindowAux {
             if let Some(menu_win) = open_menu_win {
@@ -1142,22 +1214,33 @@ impl X11App {
                 cfg.stack_mode(StackMode::ABOVE)
             }
         };
+        for (cat, cw) in self.clowder.cats().zip(&mut self.cat_wins) {
+            let cat_win = &mut cw.overlay;
+            // Render relative to the continuous window anchor so the cat's torso never shifts
+            // inside the pixmap when integer window coordinates round or when the tail sways
+            let center = cat.window_center();
+            let origin = center - Vec2::splat((cat_win.dim as f32) * 0.5);
+            render_cat(cat, &mut cat_win.pixmap.as_mut(), &mut cat_win.mask, origin);
 
-        if new_x != cat_win.x || new_y != cat_win.y {
-            cat_win.x = new_x;
-            cat_win.y = new_y;
-            let mut cfg = ConfigureWindowAux::new()
-                .x(cat_win.x as i32)
-                .y(cat_win.y as i32);
-            if needs_raise {
-                cfg = stack_cfg(cfg);
+            let new_x = origin.x.round() as i16;
+            let new_y = origin.y.round() as i16;
+            if new_x != cat_win.x || new_y != cat_win.y {
+                cat_win.x = new_x;
+                cat_win.y = new_y;
+                let mut cfg = ConfigureWindowAux::new()
+                    .x(cat_win.x as i32)
+                    .y(cat_win.y as i32);
+                if needs_raise {
+                    cfg = stack_cfg(cfg);
+                }
+                self.conn.configure_window(cat_win.win, &cfg)?;
+            } else if needs_raise {
+                self.conn
+                    .configure_window(cat_win.win, &stack_cfg(ConfigureWindowAux::new()))?;
             }
-            self.conn.configure_window(cat_win.win, &cfg)?;
-        } else if needs_raise {
-            self.conn
-                .configure_window(cat_win.win, &stack_cfg(ConfigureWindowAux::new()))?;
+            cat_win.present(&self.conn, self.gc, self.env.depth)?;
         }
-        cat_win.present(&self.conn, self.gc, self.env.depth)
+        Ok(())
     }
 }
 

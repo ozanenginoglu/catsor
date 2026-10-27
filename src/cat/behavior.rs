@@ -31,6 +31,9 @@ struct Steering {
     dist_to_cursor: f32,
     /// The roaming cat has somewhere to go, which gets it up from any rest
     roam_errand: bool,
+    /// `Clowder` gave the place this cat rests in to another cat, which gets it up to shuffle
+    /// over to its new spot
+    make_way: bool,
     to_target: Vec2,
     dist_to_target: f32,
     /// Where the cat looks and turns to: the cursor, or while roaming where it is going
@@ -41,7 +44,7 @@ struct Steering {
 impl Steering {
     /// Whether the cat gets up from a rest that a cursor farther than `radius` would end
     fn wakes(&self, radius: f32) -> bool {
-        self.roam_errand || self.dist_to_cursor > radius
+        self.roam_errand || self.make_way || self.dist_to_cursor > radius
     }
 }
 
@@ -294,7 +297,7 @@ impl CatSim {
                 self.shake_energy = 0.0;
             }
         }
-        if self.is_feeding() {
+        if self.is_feeding() || self.is_waiting_for_bowl() {
             self.play_excitement = 0.0;
             self.shake_energy = 0.0;
             self.sprinting = false;
@@ -498,6 +501,34 @@ impl CatSim {
         self.flee_cooldown = 0.8;
     }
 
+    /// Where the cat wants a spot among other cats, if anywhere: the centre it gathers round
+    /// (the cursor, or the bowl it is carried to or waits for) and how far from it. `None`
+    /// while it roams, eats, hunts, or rests where it settled.
+    pub fn wants_slot(&self) -> Option<(Vec2, f32)> {
+        if self.roaming
+            || self.wake_anchor.is_some()
+            || matches!(
+                self.activity,
+                Activity::StalkWiggle { .. } | Activity::Pouncing { .. } | Activity::Eating { .. }
+            )
+        {
+            return None;
+        }
+        match self.feeding_phase {
+            Some(FeedingPhase::Waiting { bowl_pos, .. }) => {
+                Some((bowl_pos, Self::BOWL_WAIT_RADIUS * self.scale))
+            }
+            Some(FeedingPhase::Carrying { bowl_pos, .. }) => {
+                Some((bowl_pos, self.temperament_tuning().stop_radius))
+            }
+            Some(FeedingPhase::WalkingToBowl { .. } | FeedingPhase::Eating { .. }) => None,
+            None if self.behaviors.follow_cursor => {
+                Some((self.smooth_cursor, self.temperament_tuning().stop_radius))
+            }
+            None => None,
+        }
+    }
+
     fn temperament_tuning(&self) -> TemperamentTuning {
         let (
             stop_mult,
@@ -568,31 +599,39 @@ impl CatSim {
         tuning: &TemperamentTuning,
     ) -> Steering {
         let (effective_target_cursor, force_follow) = match self.feeding_phase {
-            Some(FeedingPhase::Carrying { bowl_pos, .. }) => (bowl_pos, true),
-            Some(FeedingPhase::WalkingToBowl { bowl_pos, .. }) => (bowl_pos, true),
+            Some(
+                FeedingPhase::Carrying { bowl_pos, .. }
+                | FeedingPhase::WalkingToBowl { bowl_pos, .. }
+                | FeedingPhase::Waiting { bowl_pos, .. },
+            ) => (bowl_pos, true),
             _ => (self.smooth_cursor, self.behaviors.follow_cursor),
         };
 
         let to_cursor = effective_target_cursor - head_pos;
         let raw_cursor_dist = to_cursor.length();
-        // A roaming cat is moved by having somewhere to go (`roam_errand`), not by the cursor
-        let dist_to_cursor = if force_follow && !self.roaming {
-            if let Some(anchor) = self.wake_anchor {
-                effective_target_cursor.distance(anchor)
-            } else {
-                raw_cursor_dist
-            }
-        } else {
-            0.0
+
+        let effective_stop_radius = match self.feeding_phase {
+            Some(FeedingPhase::WalkingToBowl { .. }) => 10.2 * self.scale,
+            // Close enough to watch the cat that is eating, not in its way
+            Some(FeedingPhase::Waiting { .. }) => Self::BOWL_WAIT_RADIUS * self.scale,
+            _ => tuning.stop_radius,
         };
 
-        let effective_stop_radius =
-            if matches!(self.feeding_phase, Some(FeedingPhase::WalkingToBowl { .. })) {
-                10.2 * self.scale
-            } else {
-                tuning.stop_radius
-            };
-
+        // Among other cats, this cat's own spot round the cursor or the bowl (from `Clowder`)
+        let slot_point = self
+            .slot
+            .filter(|_| self.wants_slot().is_some())
+            .map(|slot| effective_target_cursor + Vec2::from_angle(slot.angle) * slot.radius);
+        let settled = !matches!(
+            self.activity,
+            Activity::Walking | Activity::StandingUp { .. }
+        );
+        if !settled || slot_point.is_none() {
+            self.slot_bumped = false;
+            self.slot_settled_at = None;
+        } else if self.slot_settled_at.is_none() {
+            self.slot_settled_at = Some(effective_target_cursor);
+        }
         if matches!(
             self.activity,
             Activity::StalkWiggle { .. } | Activity::Pouncing { .. }
@@ -605,17 +644,57 @@ impl CatSim {
                 head_pos
             };
         } else if force_follow && self.wake_anchor.is_none() {
-            if !matches!(self.activity, Activity::Eating { .. }) {
-                if raw_cursor_dist > effective_stop_radius {
-                    let dir = to_cursor / raw_cursor_dist;
-                    self.rest_target = effective_target_cursor - dir * effective_stop_radius;
+            if matches!(self.activity, Activity::Eating { .. }) {
+                // Stays at the bowl
+            } else if let Some(point) = slot_point {
+                // Settled at its spot, a cat stays put however it turns or lies down. On its way
+                // there it comes in facing the middle: facing out, it walks a little past the
+                // spot and turns back, rather than stopping and turning round on the spot (which
+                // would swing its head back in)
+                let tolerance = Self::SLOT_ARRIVAL * self.scale;
+                let outward = (point - effective_target_cursor).normalize_or_zero();
+                let radial = (head_pos - effective_target_cursor).dot(outward);
+                let slot_radius = point.distance(effective_target_cursor);
+                let facing_out = Vec2::from_angle(self.body_angle).dot(outward) > 0.0;
+                self.rest_target = if self.slot_settled_at.is_some() && !self.slot_bumped {
+                    head_pos
+                } else if facing_out && radial < slot_radius + tolerance {
+                    point + outward * (2.0 * Self::BODY_SPACING_OFFSET * self.scale)
+                } else if head_pos.distance(point) > tolerance {
+                    point
                 } else {
-                    self.rest_target = head_pos;
-                }
+                    head_pos
+                };
+            } else if raw_cursor_dist > effective_stop_radius {
+                let dir = to_cursor / raw_cursor_dist;
+                self.rest_target = effective_target_cursor - dir * effective_stop_radius;
+            } else {
+                self.rest_target = head_pos;
             }
         } else {
             self.rest_target = head_pos;
         }
+        // Moved to a new spot to make room for another cat: get up and go there
+        let make_way = self.slot_bumped
+            && slot_point.is_some_and(|p| head_pos.distance(p) > Self::SLOT_ARRIVAL * self.scale);
+
+        // A roaming cat is moved by having somewhere to go (`roam_errand`), not by the cursor.
+        // A cat with a spot of its own measures from that spot, as if it were sitting
+        // `stop_radius` from the cursor; once settled there, only the cursor (or bowl) moving
+        // counts, not the cat turning round or lying down.
+        let dist_to_cursor = if force_follow && !self.roaming {
+            if let Some(anchor) = self.wake_anchor {
+                effective_target_cursor.distance(anchor)
+            } else if let Some(settled_at) = self.slot_settled_at {
+                tuning.stop_radius + effective_target_cursor.distance(settled_at)
+            } else if let Some(point) = slot_point {
+                tuning.stop_radius + head_pos.distance(point)
+            } else {
+                raw_cursor_dist
+            }
+        } else {
+            0.0
+        };
 
         let to_target = self.rest_target - head_pos;
         // A roaming cat pays the cursor no attention: it looks where it is going (or just looks
@@ -634,6 +713,7 @@ impl CatSim {
         // Only pounce when the user is actively wiggling the cursor like a laser toy at pounce range
         let in_pounce_range = |d: f32| d > 85.0 * self.scale && d < 230.0 * self.scale;
         let wants_to_pounce = !self.roaming
+            && !self.is_waiting_for_bowl()
             && self.behaviors.playful_quirks
             && self.play_excitement > 0.55
             && in_pounce_range(dist_to_cursor)
@@ -645,6 +725,7 @@ impl CatSim {
             raw_cursor_dist,
             dist_to_cursor,
             roam_errand: self.roaming && self.roam_going,
+            make_way,
             to_target,
             dist_to_target: to_target.length(),
             look_angle,
@@ -1149,6 +1230,7 @@ impl CatSim {
             && elapsed >= total
         {
             self.feeding_phase = None;
+            self.bowl_fill = None;
             let side = self.rand_side();
             self.smooth_cursor = self.raw_cursor;
             self.wake_anchor = Some(self.raw_cursor);
@@ -1265,11 +1347,30 @@ impl CatSim {
 
     fn steer_walk(&mut self, steer: &Steering, tuning: &TemperamentTuning, dt: f32) {
         let dist_to_target = steer.dist_to_target;
-        let desired_dir = if dist_to_target > 0.5 {
+        let mut desired_dir = if dist_to_target > 0.5 {
             steer.to_target / dist_to_target
         } else {
             Vec2::from_angle(self.body_angle)
         };
+        // Walk round other cats rather than through them: lean away from any cat close ahead
+        let my_radius = Self::PERSONAL_SPACE * self.scale;
+        if dist_to_target > my_radius {
+            let head = self.nodes[0];
+            let mut push = Vec2::ZERO;
+            for n in &self.neighbors {
+                for p in [n.head, n.center] {
+                    let away = head - p;
+                    let d = away.length();
+                    let reach = (my_radius + n.radius) * 1.3;
+                    if d > 0.01 && d < reach && desired_dir.dot(-away) > 0.0 {
+                        push += away / d * (1.0 - d / reach);
+                    }
+                }
+            }
+            if push != Vec2::ZERO {
+                desired_dir = (desired_dir + push * 1.5).normalize_or(desired_dir);
+            }
+        }
         let desired_angle = desired_dir.y.atan2(desired_dir.x);
         let angle_err = wrap_angle(desired_angle - self.body_angle);
 

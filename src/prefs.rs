@@ -1,4 +1,5 @@
-use crate::cat::{BehaviorConfig, CatSim, Temperament};
+use crate::cat::Temperament;
+use crate::cat::clowder::{CatProfile, Clowder};
 use crate::coat::{CoatId, strip_comment, unquote};
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
@@ -10,28 +11,32 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct UserPrefs {
-    /// A built-in coat, a custom coat from `coats.toml` by name, or a random coat's seed
-    pub coat: CoatId,
+    /// Every cat, in tray order; never empty after `parse_toml`
+    pub cats: Vec<CatProfile>,
+    /// The tray's Size, shared by all cats (kittens are a fraction of it)
     pub scale: f32,
-    pub behaviors: BehaviorConfig,
+    pub follow_cursor: bool,
+    pub playful_quirks: bool,
 }
 
 impl Default for UserPrefs {
     fn default() -> Self {
         Self {
-            coat: CoatId::default(),
+            cats: vec![CatProfile::default()],
             scale: 1.0,
-            behaviors: BehaviorConfig::default(),
+            follow_cursor: true,
+            playful_quirks: true,
         }
     }
 }
 
 impl UserPrefs {
-    pub fn from_cat(cat: &CatSim) -> Self {
+    pub fn from_clowder(clowder: &Clowder) -> Self {
         Self {
-            coat: cat.coat.id.clone(),
-            scale: cat.scale.clamp(0.5, 2.5),
-            behaviors: cat.behaviors,
+            cats: clowder.profiles(),
+            scale: clowder.scale().clamp(0.5, 2.5),
+            follow_cursor: clowder.follow_cursor(),
+            playful_quirks: clowder.playful_quirks(),
         }
     }
 
@@ -60,26 +65,61 @@ impl UserPrefs {
     }
 
     pub fn to_toml_string(&self) -> String {
-        format!(
+        let mut out = format!(
             "# Catsor user preferences\n\
-             coat = \"{}\"\n\
-             temperament = \"{}\"\n\
              scale = {:.2}\n\
              follow_cursor = {}\n\
              playful_quirks = {}\n",
-            self.coat.to_config_string(),
-            self.behaviors.temperament.as_config_str(),
             self.scale.clamp(0.5, 2.5),
-            self.behaviors.follow_cursor,
-            self.behaviors.playful_quirks,
-        )
+            self.follow_cursor,
+            self.playful_quirks,
+        );
+        for cat in &self.cats {
+            out.push_str(&format!(
+                "\n[[cat]]\n\
+                 name = \"{}\"\n\
+                 coat = \"{}\"\n\
+                 temperament = \"{}\"\n",
+                cat.name,
+                cat.coat.to_config_string(),
+                cat.temperament.as_config_str(),
+            ));
+            if (cat.size - 1.0).abs() > 1e-3 {
+                out.push_str(&format!("size = {:.2}\n", cat.size));
+            }
+            if cat.kitten {
+                out.push_str("kitten = true\n");
+            }
+            if let Some(mother) = &cat.mother {
+                out.push_str(&format!("mother = \"{mother}\"\n"));
+            }
+        }
+        out
     }
 
+    /// Reads the top-level keys and one `[[cat]]` table per cat. A file from before multiple
+    /// cats has `coat` and `temperament` at the top level instead; they become the one cat.
     pub fn parse_toml(input: &str) -> Self {
-        let mut prefs = Self::default();
+        let mut prefs = Self {
+            cats: Vec::new(),
+            ..Self::default()
+        };
+        // The pre-[[cat]] single cat, used only when there are no [[cat]] tables
+        let mut legacy = CatProfile::default();
+        let mut current: Option<CatProfile> = None;
         for raw_line in input.lines() {
             let line = strip_comment(raw_line).trim();
             if line.is_empty() {
+                continue;
+            }
+            if line.starts_with('[') {
+                prefs.cats.extend(current.take());
+                if line.replace(' ', "") == "[[cat]]" {
+                    current = Some(CatProfile {
+                        name: String::new(),
+                        ..CatProfile::default()
+                    });
+                }
                 continue;
             }
             let Some((raw_key, raw_val)) = line.split_once('=') else {
@@ -88,17 +128,12 @@ impl UserPrefs {
             let key = raw_key.trim();
             let val = unquote(raw_val).trim();
 
+            if let Some(cat) = &mut current {
+                parse_cat_key(cat, key, val);
+                continue;
+            }
             match key {
-                "coat" => {
-                    if let Some(c) = CoatId::parse(val) {
-                        prefs.coat = c;
-                    }
-                }
-                "temperament" => {
-                    if let Some(t) = Temperament::from_config_str(val) {
-                        prefs.behaviors.temperament = t;
-                    }
-                }
+                "coat" | "temperament" => parse_cat_key(&mut legacy, key, val),
                 "scale" => {
                     if let Ok(s) = val.parse::<f32>()
                         && s.is_finite()
@@ -108,18 +143,53 @@ impl UserPrefs {
                 }
                 "follow_cursor" => {
                     if let Some(b) = parse_bool(val) {
-                        prefs.behaviors.follow_cursor = b;
+                        prefs.follow_cursor = b;
                     }
                 }
                 "playful_quirks" => {
                     if let Some(b) = parse_bool(val) {
-                        prefs.behaviors.playful_quirks = b;
+                        prefs.playful_quirks = b;
                     }
                 }
                 _ => {}
             }
         }
+        prefs.cats.extend(current);
+        if prefs.cats.is_empty() {
+            prefs.cats.push(legacy);
+        }
         prefs
+    }
+}
+
+/// Applies one `key = value` line of a `[[cat]]` table; invalid values are ignored
+fn parse_cat_key(cat: &mut CatProfile, key: &str, val: &str) {
+    match key {
+        "name" => cat.name = val.to_string(),
+        "coat" => {
+            if let Some(c) = CoatId::parse(val) {
+                cat.coat = c;
+            }
+        }
+        "temperament" => {
+            if let Some(t) = Temperament::from_config_str(val) {
+                cat.temperament = t;
+            }
+        }
+        "size" => {
+            if let Ok(s) = val.parse::<f32>()
+                && s.is_finite()
+            {
+                cat.size = s.clamp(CatProfile::MIN_SIZE, CatProfile::MAX_SIZE);
+            }
+        }
+        "kitten" => {
+            if let Some(b) = parse_bool(val) {
+                cat.kitten = b;
+            }
+        }
+        "mother" => cat.mother = Some(val.to_string()).filter(|m| !m.is_empty()),
+        _ => {}
     }
 }
 
@@ -262,22 +332,35 @@ mod tests {
     use super::*;
     use crate::coat::CoatStyle;
 
+    fn kitten(name: &str, mother: &str) -> CatProfile {
+        CatProfile {
+            size: 0.6,
+            kitten: true,
+            mother: Some(mother.into()),
+            ..CatProfile::new(name, CoatId::Random(0x00c0_ffee), Temperament::Playful)
+        }
+    }
+
     #[test]
     fn roundtrips_all_user_preferences() {
         let prefs = UserPrefs {
-            coat: CoatId::Builtin(CoatStyle::Tuxedo),
+            cats: vec![
+                CatProfile::new(
+                    "Luna",
+                    CoatId::Builtin(CoatStyle::Tuxedo),
+                    Temperament::Aloof,
+                ),
+                kitten("Pip", "Luna"),
+            ],
             scale: 1.35,
-            behaviors: BehaviorConfig {
-                temperament: Temperament::Playful,
-                follow_cursor: false,
-                playful_quirks: true,
-            },
+            follow_cursor: false,
+            playful_quirks: true,
         };
-        let serialized = prefs.to_toml_string();
-        let parsed = UserPrefs::parse_toml(&serialized);
-        assert_eq!(parsed.coat, CoatId::Builtin(CoatStyle::Tuxedo));
+        let parsed = UserPrefs::parse_toml(&prefs.to_toml_string());
+        assert_eq!(parsed.cats, prefs.cats);
         assert!((parsed.scale - 1.35).abs() < 1e-4);
-        assert_eq!(parsed.behaviors, prefs.behaviors);
+        assert!(!parsed.follow_cursor);
+        assert!(parsed.playful_quirks);
 
         for coat in [
             CoatId::Custom("Mr. #1 Cat".into()),
@@ -286,10 +369,13 @@ mod tests {
             CoatId::Random(0xdead_beef),
         ] {
             let prefs = UserPrefs {
-                coat: coat.clone(),
+                cats: vec![CatProfile::new("Luna", coat.clone(), Temperament::Balanced)],
                 ..UserPrefs::default()
             };
-            assert_eq!(UserPrefs::parse_toml(&prefs.to_toml_string()).coat, coat);
+            assert_eq!(
+                UserPrefs::parse_toml(&prefs.to_toml_string()).cats[0].coat,
+                coat
+            );
         }
     }
 
@@ -300,39 +386,70 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
 
         let prefs = UserPrefs {
-            coat: CoatId::Builtin(CoatStyle::Silver),
+            cats: vec![CatProfile::new(
+                "Luna",
+                CoatId::Builtin(CoatStyle::Silver),
+                Temperament::Aloof,
+            )],
             scale: 0.80,
-            behaviors: BehaviorConfig {
-                temperament: Temperament::Aloof,
-                follow_cursor: true,
-                playful_quirks: false,
-            },
+            follow_cursor: true,
+            playful_quirks: false,
         };
         prefs.save_to_path(&path).unwrap();
+        assert_eq!(UserPrefs::load_from_path(&path), prefs);
 
-        let loaded = UserPrefs::load_from_path(&path);
-        assert_eq!(loaded.coat, CoatId::Builtin(CoatStyle::Silver));
-        assert!((loaded.scale - 0.80).abs() < 1e-4);
-        assert_eq!(loaded.behaviors, prefs.behaviors);
-
-        // Verify partial/hand-edited config with comments and out-of-range scale clamps cleanly
+        // Partial/hand-edited config with comments, unknown keys and out-of-range values
         let custom = "\
             # comment line
-            coat = Charcoal
-            temperament = 'LAZY'
             scale = 9.9
             follow_cursor = off
             unknown_key = 123
-            startle_enabled = true
+
+            [[cat]]
+            name = 'Mochi' # the old one
+            coat = Charcoal
+            temperament = 'LAZY'
+            size = 7
+            kitten = maybe
+            whiskers = 24
+
+            [other.table]
+            name = ignored
         ";
         let parsed = UserPrefs::parse_toml(custom);
-        assert_eq!(parsed.coat, CoatId::Builtin(CoatStyle::Charcoal));
-        assert_eq!(parsed.behaviors.temperament, Temperament::Lazy);
+        assert_eq!(parsed.cats.len(), 1);
+        let mochi = &parsed.cats[0];
+        assert_eq!(mochi.name, "Mochi");
+        assert_eq!(mochi.coat, CoatId::Builtin(CoatStyle::Charcoal));
+        assert_eq!(mochi.temperament, Temperament::Lazy);
+        assert!((mochi.size - CatProfile::MAX_SIZE).abs() < 1e-4);
+        assert!(!mochi.kitten);
         assert!((parsed.scale - 2.5).abs() < 1e-4);
-        assert!(!parsed.behaviors.follow_cursor);
-        assert!(parsed.behaviors.playful_quirks);
+        assert!(!parsed.follow_cursor);
+        assert!(parsed.playful_quirks);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn single_cat_config_from_before_multiple_cats_becomes_the_first_cat() {
+        let old = "\
+            # Catsor user preferences
+            coat = \"tuxedo\"
+            temperament = \"playful\"
+            scale = 1.35
+            follow_cursor = true
+            playful_quirks = false
+        ";
+        let parsed = UserPrefs::parse_toml(old);
+        assert_eq!(parsed.cats.len(), 1);
+        assert_eq!(parsed.cats[0].coat, CoatId::Builtin(CoatStyle::Tuxedo));
+        assert_eq!(parsed.cats[0].temperament, Temperament::Playful);
+        assert_eq!(parsed.cats[0].name, CatProfile::default().name);
+        assert!(!parsed.playful_quirks);
+
+        // An empty file still has one cat
+        assert_eq!(UserPrefs::parse_toml("").cats, vec![CatProfile::default()]);
     }
 
     #[test]
