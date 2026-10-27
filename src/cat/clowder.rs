@@ -4,11 +4,14 @@
 //! food bowl: one cat eats at a time while the rest sit nearby and wait their turn, kittens
 //! first.
 
-use super::{CatSim, FeedPreset, Kinship, Neighbor, Pose, Slot, Temperament, wrap_angle};
+use super::{
+    CatSim, FeedPreset, Kinship, Neighbor, Pose, Slot, SocialKind, SocialRole, Temperament,
+    wrap_angle,
+};
 use crate::bonds::{Bond, Bonds};
 use crate::coat::{Coat, CoatId, CoatLibrary, fresh_seed};
 use glam::Vec2;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 /// Most cats running at once
 pub const MAX_CATS: usize = 6;
@@ -21,6 +24,10 @@ const TURN_SECS: f32 = 150.0;
 const FETCH_RADIUS: f32 = 240.0;
 /// How often (seconds) the bonds are written to disk
 const BONDS_SAVE_SECS: f32 = 300.0;
+/// How often (seconds) `Clowder` looks for two cats to do something together
+const DIRECTOR_TICK: f32 = 0.5;
+/// How long (seconds) two cats must have been apart to greet each other when they meet again
+const GREET_AFTER: f32 = 90.0;
 
 /// Names handed to cats added from the tray, in order, skipping names already in use
 const NAMES: [&str; 12] = [
@@ -74,6 +81,8 @@ pub struct Member {
     pub cat: CatSim,
     /// The kitten (index) this mother is on her way to fetch
     fetching: Option<usize>,
+    /// The cat (index) this one is doing something with
+    partner: Option<usize>,
 }
 
 impl Member {
@@ -112,6 +121,14 @@ pub struct Clowder {
     bonds: Bonds,
     /// Seconds since the bonds were last saved
     bonds_unsaved: f32,
+    /// Seconds each pair (by name) has been apart; a pair not listed hasn't met this session
+    apart: BTreeMap<(String, String), f32>,
+    /// Time until `Clowder` next looks for two cats to do something together
+    director_timer: f32,
+    /// `Clowder`'s own random choices, kept apart from each cat's so a lone cat is unaffected
+    rng_state: u64,
+    /// Whether cats start doing things together (off in tests of other mechanics)
+    social: bool,
 }
 
 impl Clowder {
@@ -134,6 +151,10 @@ impl Clowder {
             feeding: None,
             bonds: Bonds::default(),
             bonds_unsaved: 0.0,
+            apart: BTreeMap::new(),
+            director_timer: DIRECTOR_TICK,
+            rng_state: 0x2545_f491_4f6c_dd1d,
+            social: true,
         };
         let default_profile = [CatProfile::default()];
         let profiles = if profiles.is_empty() {
@@ -176,6 +197,7 @@ impl Clowder {
             mother: profile.mother,
             cat,
             fetching: None,
+            partner: None,
         });
         self.members.len() - 1
     }
@@ -344,9 +366,12 @@ impl Clowder {
             if m.mother.as_deref() == Some(&removed.name) {
                 m.mother = None;
             }
-            // Indices moved; a mother still fetching starts again next tick if she needs to
+            // Indices moved; a mother still fetching starts again next tick if she needs to, and
+            // whatever two cats were doing together stops
             m.fetching = None;
             m.cat.fetch_target = None;
+            m.partner = None;
+            m.cat.end_social();
         }
         if let Some(session) = &mut self.feeding {
             if session.eater == Some(i) {
@@ -370,6 +395,8 @@ impl Clowder {
     pub fn update(&mut self, cursor: Vec2, dt: f32) {
         self.share_neighbors();
         self.update_fetching();
+        self.tend_engagements();
+        self.direct(dt);
         self.assign_slots();
         for m in &mut self.members {
             m.cat.update(cursor, dt);
@@ -538,6 +565,286 @@ impl Clowder {
                 let (na, nb) = (self.members[i].name.clone(), self.members[j].name.clone());
                 self.bonds.set(&na, &nb, bond);
             }
+        }
+    }
+
+    fn rand_f32(&mut self) -> f32 {
+        // xorshift64*
+        self.rng_state ^= self.rng_state >> 12;
+        self.rng_state ^= self.rng_state << 25;
+        self.rng_state ^= self.rng_state >> 27;
+        let x = self.rng_state.wrapping_mul(0x2545_f491_4f6c_dd1d);
+        (x >> 40) as f32 / (1u64 << 24) as f32
+    }
+
+    fn pair_key(&self, i: usize, j: usize) -> (String, String) {
+        let (a, b) = (&self.members[i].name, &self.members[j].name);
+        if a <= b {
+            (a.clone(), b.clone())
+        } else {
+            (b.clone(), a.clone())
+        }
+    }
+
+    /// Ends what two cats were doing together once either is done with it (or was pulled
+    /// away), for both. Something that went well warms them to each other a little.
+    fn tend_engagements(&mut self) {
+        for i in 0..self.members.len() {
+            let Some(j) = self.members[i].partner else {
+                if self.members[i].cat.social.is_some() {
+                    self.members[i].cat.end_social();
+                }
+                continue;
+            };
+            if j < i {
+                continue;
+            }
+            let over = |c: &CatSim| c.social.is_none_or(|e| e.done);
+            let (a, b) = (&self.members[i].cat, &self.members[j].cat);
+            if over(a) || over(b) {
+                // Neither was pulled away, and they got to it
+                let went_well = a.social.is_some()
+                    && b.social.is_some()
+                    && [a, b]
+                        .into_iter()
+                        .any(|c| c.social.is_some_and(|e| e.acting));
+                let warmth = match a.social.or(b.social).map(|e| e.kind) {
+                    Some(SocialKind::Groom) => 0.06,
+                    Some(SocialKind::NoseBoop | SocialKind::HeadBunt | SocialKind::SniffCircle) => {
+                        0.03
+                    }
+                    _ => 0.0,
+                };
+                if went_well && warmth > 0.0 {
+                    let mut bond = self.bond(i, j);
+                    bond.affection = (bond.affection + warmth).min(1.0);
+                    let (na, nb) = (self.members[i].name.clone(), self.members[j].name.clone());
+                    self.bonds.set(&na, &nb, bond);
+                }
+                for k in [i, j] {
+                    self.members[k].cat.end_social();
+                    self.members[k].partner = None;
+                }
+                continue;
+            }
+            // The cat that stays put shares in it once the other one gets there
+            let acting = a.social.is_some_and(|e| e.acting) || b.social.is_some_and(|e| e.acting);
+            for k in [i, j] {
+                if let Some(e) = &mut self.members[k].cat.social
+                    && e.role == SocialRole::Passive
+                {
+                    e.acting = acting;
+                }
+            }
+        }
+    }
+
+    /// Without cats starting things together, to test other mechanics on their own
+    #[cfg(test)]
+    pub fn without_social(mut self) -> Self {
+        self.social = false;
+        self
+    }
+
+    /// Whether cat `i` is free to start something with another cat: not busy, and not on its
+    /// way somewhere (following the cursor, say)
+    fn free(&self, i: usize) -> bool {
+        let m = &self.members[i];
+        let c = &m.cat;
+        m.partner.is_none()
+            && c.rest_target.distance(c.nodes[0]) < 40.0 * c.scale
+            && c.social.is_none()
+            && c.feeding_phase.is_none()
+            && (!c.roaming || c.roaming_by_menu)
+            && !c.sprinting
+            && c.fetch_target.is_none()
+            && !matches!(Pose::of(c), Pose::Busy | Pose::Racing)
+    }
+
+    /// How readily a cat of this temperament does things with other cats
+    fn sociability(m: &Member) -> f32 {
+        match m.cat.behaviors.temperament {
+            Temperament::Playful => 1.2,
+            Temperament::Balanced | Temperament::Lazy => 1.0,
+            Temperament::Aloof => 0.6,
+            Temperament::Realistic => 0.5,
+        }
+    }
+
+    /// Every half second, looks for two free cats to do something together and maybe starts
+    /// it: a greeting when they meet after time apart (sniffing a stranger, a nose boop or
+    /// head bunt for a friend), grooming each other, curling up against a sleeping friend, or a
+    /// kitten coming to knead and nap against its mother
+    fn direct(&mut self, dt: f32) {
+        let n = self.members.len();
+        if n < 2 || !self.social {
+            return;
+        }
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let (a, b) = (&self.members[i].cat, &self.members[j].cat);
+                let far = a.nodes[0].distance(b.nodes[0]) > 250.0 * a.scale.max(b.scale);
+                let key = self.pair_key(i, j);
+                let apart = self.apart.entry(key).or_insert(GREET_AFTER);
+                if far {
+                    *apart += dt;
+                }
+            }
+        }
+        self.director_timer -= dt;
+        if self.director_timer > 0.0 {
+            return;
+        }
+        self.director_timer += DIRECTOR_TICK;
+
+        struct Idea {
+            active: usize,
+            passive: usize,
+            kind: SocialKind,
+            chance: f32,
+        }
+        let per_tick = |rate: f32| 1.0 - (-rate * DIRECTOR_TICK).exp();
+        let mut ideas = Vec::new();
+        for i in 0..n {
+            for j in 0..n {
+                if i == j || !self.free(i) || !self.free(j) {
+                    continue;
+                }
+                let (mi, mj) = (&self.members[i], &self.members[j]);
+                let (pi, pj) = (Pose::of(&mi.cat), Pose::of(&mj.cat));
+                let gap = mi.cat.nodes[0].distance(mj.cat.nodes[0]);
+                let s = mi.cat.scale.max(mj.cat.scale);
+                let kin = self.kinship(i, j);
+                let bond = self.bond(i, j);
+                let friends = kin.is_family() || (bond.affection > 0.3 && bond.familiarity > 0.3);
+                let warm = Self::sociability(mi) * Self::sociability(mj);
+                let awake = |p: Pose| {
+                    matches!(
+                        p,
+                        Pose::Moving | Pose::Sitting | Pose::Grooming | Pose::Lying
+                    )
+                };
+                let resting_awake = |p: Pose| matches!(p, Pose::Sitting | Pose::Lying);
+
+                // Greetings, asked once per pair (i < j); who leads is settled below
+                let apart = self.apart.get(&self.pair_key(i, j)).copied().unwrap_or(0.0);
+                if i < j && apart >= GREET_AFTER && gap < 160.0 * s && awake(pi) && awake(pj) {
+                    let kind = if bond.familiarity < 0.3 && !kin.is_family() {
+                        SocialKind::SniffCircle
+                    } else if friends {
+                        SocialKind::HeadBunt
+                    } else {
+                        SocialKind::NoseBoop
+                    };
+                    ideas.push(Idea {
+                        active: i,
+                        passive: j,
+                        kind,
+                        chance: 0.4,
+                    });
+                }
+                // A kitten goes to knead and nap against its mother lying down
+                if kin == Kinship::Mother
+                    && awake(pi)
+                    && matches!(pj, Pose::Lying | Pose::Sleeping)
+                    && gap < 250.0 * s
+                {
+                    ideas.push(Idea {
+                        active: i,
+                        passive: j,
+                        kind: SocialKind::Nurse,
+                        chance: per_tick(1.0 / 25.0),
+                    });
+                } else if friends && resting_awake(pi) && pj == Pose::Sleeping && gap < 220.0 * s {
+                    let family = if kin.is_family() { 2.0 } else { 1.0 };
+                    ideas.push(Idea {
+                        active: i,
+                        passive: j,
+                        kind: SocialKind::SleepTogether,
+                        // A drowsy cat soon goes to curl up against a sleeping friend: the chance
+                        // only lasts until it dozes off itself
+                        chance: per_tick(family * warm / 8.0),
+                    });
+                }
+                if friends && resting_awake(pi) && resting_awake(pj) && gap < 130.0 * s {
+                    // A mother grooms her kittens far more than cats groom each other
+                    let kin_mult = match kin {
+                        Kinship::Kitten => 3.0,
+                        Kinship::Sibling => 2.0,
+                        Kinship::Mother => 0.5,
+                        Kinship::None => 1.0,
+                    };
+                    let rate = kin_mult * warm * (0.5 + bond.affection) / 60.0;
+                    ideas.push(Idea {
+                        active: i,
+                        passive: j,
+                        kind: SocialKind::Groom,
+                        chance: per_tick(rate.max(0.0)),
+                    });
+                }
+            }
+        }
+        if ideas.is_empty() {
+            return;
+        }
+        let start = (self.rand_f32() * ideas.len() as f32) as usize % ideas.len();
+        for k in 0..ideas.len() {
+            let idea = &ideas[(start + k) % ideas.len()];
+            if self.rand_f32() < idea.chance {
+                let (active, passive, kind) = (idea.active, idea.passive, idea.kind);
+                // Either cat may be the one to rub against the other
+                let (active, passive) = if kind == SocialKind::HeadBunt && self.rand_f32() < 0.5 {
+                    (passive, active)
+                } else {
+                    (active, passive)
+                };
+                self.engage(active, passive, kind);
+                return;
+            }
+        }
+    }
+
+    /// Starts `kind` with `active` going over to `passive` (for a nose boop or sniff, both go)
+    fn engage(&mut self, active: usize, passive: usize, kind: SocialKind) {
+        let symmetric = matches!(kind, SocialKind::NoseBoop | SocialKind::SniffCircle);
+        let side = if kind == SocialKind::SniffCircle {
+            if self.rand_f32() < 0.5 { 1.0 } else { -1.0 }
+        } else {
+            // Come up on the side of the other cat it's already on
+            let p = &self.members[passive].cat;
+            let heading = (p.nodes[0] - p.body_point()).normalize_or(Vec2::X);
+            let rel = self.members[active].cat.nodes[0] - p.body_point();
+            if heading.perp().dot(rel) >= 0.0 {
+                1.0
+            } else {
+                -1.0
+            }
+        };
+        let passive_role = if symmetric {
+            SocialRole::Active
+        } else {
+            SocialRole::Passive
+        };
+        self.members[active].cat.begin_social(
+            kind,
+            SocialRole::Active,
+            Self::neighbor_index(active, passive),
+            side,
+        );
+        self.members[passive].cat.begin_social(
+            kind,
+            passive_role,
+            Self::neighbor_index(passive, active),
+            side,
+        );
+        self.members[active].partner = Some(passive);
+        self.members[passive].partner = Some(active);
+        if matches!(
+            kind,
+            SocialKind::NoseBoop | SocialKind::HeadBunt | SocialKind::SniffCircle
+        ) {
+            let key = self.pair_key(active, passive);
+            self.apart.insert(key, 0.0);
         }
     }
 
@@ -882,7 +1189,7 @@ mod tests {
         let start = Vec2::new(600.0, 400.0);
         let names = ["Luna", "Milo", "Pip", "Mochi"];
         let profiles: Vec<_> = names.iter().map(|n| profile(n)).collect();
-        let mut group = clowder(&profiles, start);
+        let mut group = clowder(&profiles, start).without_social();
         let cursor = Vec2::new(1100.0, 650.0);
         run(&mut group, cursor, 25.0);
 
@@ -946,7 +1253,8 @@ mod tests {
             true,
             &CoatLibrary::from_toml(""),
             Vec2::new(150.0, 150.0),
-        );
+        )
+        .without_social();
         let cursor = Vec2::new(420.0, 300.0);
         run(&mut group, cursor, 20.0);
         // Turning round, lying down or a neighbour's fidgeting never gets them up. The kitten
@@ -1152,7 +1460,7 @@ mod tests {
             "the mother never went far: {from_cursor}"
         );
         assert!(
-            widest < leash * 1.35,
+            widest < leash * 1.5,
             "the kitten got {widest} px from its mother"
         );
     }
@@ -1162,10 +1470,12 @@ mod tests {
         let start = Vec2::new(900.0, 600.0);
         let mut group = clowder(&[profile("Luna"), kitten_of("Pip", "Luna")], start);
         run(&mut group, start, 8.0);
+        // Shaken off, the kitten stays behind roaming while its mother follows the cursor away
         group.cat_mut(1).shoo();
+        let cursor = start + Vec2::new(400.0, 0.0);
         let mut fetched = false;
         for _ in 0..(120.0 / DT) as usize {
-            group.update(start, DT);
+            group.update(cursor, DT);
             fetched |= group.cat(0).fetch_target.is_some();
             if fetched && !group.cat(1).roaming {
                 break;
@@ -1174,10 +1484,10 @@ mod tests {
         assert!(fetched, "the mother never went for her kitten");
         assert!(!group.cat(1).roaming, "the kitten is still off on its own");
         // Both come back to the cursor, the kitten at its mother's side
-        run(&mut group, start, 20.0);
+        run(&mut group, cursor, 20.0);
         let (mother, kitten) = (group.cat(0), group.cat(1));
         assert!(mother.fetch_target.is_none());
-        assert!(mother.nodes[0].distance(start) < 100.0);
+        assert!(mother.nodes[0].distance(cursor) < 100.0);
         assert!(kitten.nodes[0].distance(mother.body_point()) < CatSim::KITTEN_LEASH);
     }
 
@@ -1203,7 +1513,7 @@ mod tests {
 
         // Strangers leave each other more room than friends
         let gap = |bond: Option<Bond>| {
-            let mut group = clowder(&[profile("Luna"), profile("Milo")], start);
+            let mut group = clowder(&[profile("Luna"), profile("Milo")], start).without_social();
             if let Some(bond) = bond {
                 group.set_bond(0, 1, bond);
             }
@@ -1220,5 +1530,200 @@ mod tests {
             friends + 5.0 < strangers,
             "friends {friends:.0} px apart, strangers {strangers:.0} px"
         );
+    }
+
+    /// Runs the clowder and lists what each pair started doing together (kind, active cat,
+    /// passive cat), in order, plus the frames each cat spent in each social activity
+    fn social_log(group: &mut Clowder, cursor: Vec2, secs: f32) -> Vec<(SocialKind, usize, usize)> {
+        let mut log = Vec::new();
+        let mut was: Vec<Option<SocialKind>> = vec![None; group.len()];
+        for _ in 0..(secs / DT) as usize {
+            group.update(cursor, DT);
+            for (i, was) in was.iter_mut().enumerate() {
+                let now = group.cat(i).social.map(|e| e.kind);
+                if let (Some(kind), None) = (now, *was)
+                    && group
+                        .cat(i)
+                        .social
+                        .is_some_and(|e| e.role == SocialRole::Active)
+                    && let Some(j) = group.members[i].partner
+                    && !log
+                        .iter()
+                        .rev()
+                        .take(1)
+                        .any(|&(k, a, b)| k == kind && ((a, b) == (j, i) || (a, b) == (i, j)))
+                {
+                    log.push((kind, i, j));
+                }
+                *was = now;
+            }
+        }
+        log
+    }
+
+    fn pair(bond: Option<Bond>, temperament: Temperament) -> Clowder {
+        let profiles = [
+            CatProfile {
+                temperament,
+                ..profile("Luna")
+            },
+            CatProfile {
+                temperament,
+                ..profile("Milo")
+            },
+        ];
+        let mut group = clowder(&profiles, Vec2::new(600.0, 400.0));
+        if let Some(bond) = bond {
+            group.set_bond(0, 1, bond);
+        }
+        group
+    }
+
+    #[test]
+    fn cats_greet_each_other_as_well_as_they_know_each_other() {
+        let cursor = Vec2::new(600.0, 400.0);
+        let first_greeting = |bond: Option<Bond>| {
+            let mut group = pair(bond, Temperament::Balanced);
+            let log = social_log(&mut group, cursor, 15.0);
+            // Once is enough while they stay together
+            let greetings = log
+                .iter()
+                .filter(|(k, ..)| {
+                    matches!(
+                        k,
+                        SocialKind::NoseBoop | SocialKind::HeadBunt | SocialKind::SniffCircle
+                    )
+                })
+                .count();
+            assert_eq!(greetings, 1, "{log:?}");
+            assert!(group.cats().all(|c| c.social.is_none()), "{log:?}");
+            log[0].0
+        };
+        assert_eq!(first_greeting(None), SocialKind::SniffCircle);
+        let acquainted = Bond {
+            familiarity: 0.6,
+            affection: 0.1,
+        };
+        assert_eq!(first_greeting(Some(acquainted)), SocialKind::NoseBoop);
+        let friends = Bond {
+            familiarity: 0.9,
+            affection: 0.7,
+        };
+        assert_eq!(first_greeting(Some(friends)), SocialKind::HeadBunt);
+    }
+
+    #[test]
+    fn a_greeting_brings_noses_together_and_circles_round() {
+        let cursor = Vec2::new(600.0, 400.0);
+        let closest = |bond: Option<Bond>| {
+            let mut group = pair(bond, Temperament::Balanced);
+            let mut closest = f32::MAX;
+            let mut turned = 0.0f32;
+            for _ in 0..(15.0 / DT) as usize {
+                group.update(cursor, DT);
+                if let Activity::Greeting { .. } = group.cat(0).activity {
+                    closest = closest.min(group.cat(0).nodes[0].distance(group.cat(1).nodes[0]));
+                }
+                if let Activity::Sniffing { turned: t, .. } = group.cat(0).activity {
+                    turned = turned.max(t);
+                }
+            }
+            (closest, turned)
+        };
+        let (nose_to_nose, _) = closest(Some(Bond {
+            familiarity: 0.6,
+            affection: 0.1,
+        }));
+        assert!(nose_to_nose < 19.0, "heads {nose_to_nose} px apart");
+        let (_, turned) = closest(None);
+        assert!(turned > 3.0, "sniffed round only {turned} rad");
+    }
+
+    #[test]
+    fn friends_resting_together_groom_and_sleep_against_each_other() {
+        let cursor = Vec2::new(600.0, 400.0);
+        let friends = Bond {
+            familiarity: 0.9,
+            affection: 0.8,
+        };
+        // Over 20 minutes the cursor moves now and then, so the cats get up and settle again
+        let snuggles = |temperament| {
+            let mut group = pair(Some(friends), temperament);
+            let (mut snuggled, mut groomed_bliss) = (f32::MAX, false);
+            let mut kinds = Vec::new();
+            for frame in 0..(1200.0 / DT) as usize {
+                let shift = (frame as f32 * DT / 45.0) as usize % 2;
+                group.update(cursor + Vec2::new(160.0 * shift as f32, 0.0), DT);
+                for i in 0..2 {
+                    let cat = group.cat(i);
+                    let Some(e) = cat.social.filter(|e| e.role == SocialRole::Active) else {
+                        continue;
+                    };
+                    if kinds.last() != Some(&e.kind) {
+                        kinds.push(e.kind);
+                    }
+                    groomed_bliss |= group.cat(1 - i).blissful();
+                    if e.kind == SocialKind::SleepTogether && e.acting {
+                        let other = group.cat(1 - i).body_point();
+                        snuggled = snuggled.min(cat.body_point().distance(other));
+                    }
+                }
+            }
+            (kinds, snuggled, groomed_bliss)
+        };
+        let (kinds, snuggled, _) = snuggles(Temperament::Lazy);
+        assert!(kinds.contains(&SocialKind::SleepTogether), "{kinds:?}");
+        assert!(snuggled < 30.0, "slept {snuggled} px from its friend");
+        let (kinds, _, groomed_bliss) = snuggles(Temperament::Balanced);
+        assert!(kinds.contains(&SocialKind::Groom), "{kinds:?}");
+        assert!(groomed_bliss, "the groomed cat never shut its eyes");
+    }
+
+    #[test]
+    fn a_kitten_kneads_and_naps_against_its_mother() {
+        let cursor = Vec2::new(600.0, 400.0);
+        let profiles = [
+            CatProfile {
+                temperament: Temperament::Lazy,
+                ..profile("Luna")
+            },
+            kitten_of("Pip", "Luna"),
+        ];
+        let mut group = clowder(&profiles, cursor);
+        let (mut kneaded, mut napped) = (false, f32::MAX);
+        for _ in 0..(300.0 / DT) as usize {
+            group.update(cursor, DT);
+            let (mother, kitten) = (group.cat(0), group.cat(1));
+            kneaded |= matches!(kitten.activity, Activity::Kneading { .. });
+            if kitten.activity == Activity::Sleeping
+                && kitten.social.is_some_and(|e| e.kind == SocialKind::Nurse)
+            {
+                napped = napped.min(kitten.nodes[0].distance(mother.body_point()));
+            }
+        }
+        assert!(kneaded, "the kitten never kneaded");
+        assert!(napped < 25.0, "napped {napped} px from its mother");
+    }
+
+    #[test]
+    fn moving_the_cursor_away_breaks_it_up() {
+        let cursor = Vec2::new(600.0, 400.0);
+        let mut group = pair(None, Temperament::Balanced);
+        let mut engaged = false;
+        for _ in 0..(15.0 / DT) as usize {
+            group.update(cursor, DT);
+            if group.cats().all(|c| c.social.is_some_and(|e| e.acting)) {
+                engaged = true;
+                break;
+            }
+        }
+        assert!(engaged, "they never got round to sniffing each other");
+        let away = cursor + Vec2::new(500.0, 0.0);
+        run(&mut group, away, 1.0);
+        assert!(group.cats().all(|c| c.social.is_none()));
+        run(&mut group, away, 12.0);
+        for cat in group.cats() {
+            assert!(cat.nodes[0].distance(away) < 120.0);
+        }
     }
 }

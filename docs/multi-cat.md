@@ -1,6 +1,6 @@
 # Multiple cats (design)
 
-Status: **phases 1 and 2 are implemented** (multiple cats, slots, shared bowl, per-cat tray pages; awareness, kitten tuning, the leash, fetching and bonds; see `behavior.md` → "Several cats", "Sharing the bowl", "Kittens" and "Bonds"). Phases 3–5 are still a proposal. When a phase lands, move what it settles into `behavior.md` / `animation.md` / `platform-notes.md` and trim it from here.
+Status: **phases 1–3 are implemented** (multiple cats, slots, shared bowl, per-cat tray pages; awareness, kitten tuning, the leash, fetching and bonds; greetings, grooming each other, sleeping together and nursing; see `behavior.md` → "Several cats", "Sharing the bowl", "Kittens", "Doing things together" and "Bonds"). Phases 4–5 are still a proposal. When a phase lands, move what it settles into `behavior.md` / `animation.md` / `platform-notes.md` and trim it from here.
 
 Catsor today runs exactly one `CatSim` in one overlay window. This design covers two things: running several cats at once, and making them aware of each other: greeting, grooming, playing, squabbling, and mother cats raising kittens.
 
@@ -83,12 +83,12 @@ These are in roughly ascending cost. Each is a new `Activity` variant (or a role
 
 ### Greetings (after time apart)
 - **Nose boop:** walk up to each other, touch noses ~1 s, carry on.
-- **Head bunt / cheek rub:** one rubs along the other's flank, tail hooking over its back.
+- **Head bunt / cheek rub:** one rubs along the other's flank, tail hooking over its back. *(Done with the tail held up and hooked; it isn't drawn over the other cat's back.)*
 - **Sniff circle:** half a turn around each other.
 
 ### Bonding
-- **Grooming each other:** one licks the other's head and neck while both sit or lie. The groomed cat leans in, then may get up and leave in a huff.
-- **Sleeping together:** curl up together, nested head to tail. Several kittens make a pile.
+- **Grooming each other:** one licks the other's head and neck while both sit or lie. The groomed cat leans in, then may get up and leave in a huff. *(Done with a "huff" that is grooming itself afterwards rather than leaving.)*
+- **Sleeping together:** curl up together, nested head to tail. Several kittens make a pile. *(Done as lying down alongside a sleeping friend, side by side, one pair at a time: a cat already curled up against another can't be joined by a third, so there are no piles yet.)*
 
 ### Play
 - **Tail stalk:** StalkWiggle → Pouncing aimed at another cat's tail tip instead of the cursor. Mostly reuses existing code.
@@ -108,7 +108,7 @@ These are in roughly ascending cost. Each is a new `Activity` variant (or a role
 - **Watching over:** the mother tracks her kitten with her head while resting. If it strays past a larger radius, she gets up and fetches it (walks to it, nose boop, walks back with it following). *(Done without the nose boop, which comes with the greetings in phase 3.)*
 - **Carrying by the scruff** (stretch goal): if the kitten is very far, or asleep away from her, she picks it up by the scruff and carries it back. The kitten hangs limp from her mouth, with its chain anchored to her head node. This needs special handling for the render order and windows.
 - **Grooming:** the mother grooms her kitten much more often than adults groom each other. The kitten squirms and escapes after a while (mild friction that costs no affection).
-- **Nursing / naps:** when the mother lies on her side (DramaticFlop pose), her kittens curl into the curve of her belly. Awake kittens there knead (front paws alternating).
+- **Nursing / naps:** when the mother lies on her side (DramaticFlop pose), her kittens curl into the curve of her belly. Awake kittens there knead (front paws alternating). *(Done for the mother lying down in any pose or asleep: the kitten kneads 6–12 s against her side, then naps there.)*
 - **Tail lure:** the mother flicks her tail on purpose to get the kitten to play. She tolerates tail pounces far longer than other adults do, and ends it with a gentle head boop.
 - **Food:** her kittens eat first (see Shared bowl).
 - **Siblings** (same mother) start with a high bond: more wrestling, sleeping in piles, and more play escalation.
@@ -140,6 +140,6 @@ The Realistic temperament keeps the rule from `behavior.md`: social interactions
 
 1. **Multiple cats (done):** `[[cat]]` config with names, `kitten`, `mother` and migration; `Clowder` with slots and spacing; a window per cat on X11 and Win32; tray Cats section; shared bowl queue (with mother-first). Kittens use adult behaviour at a smaller size for now.
 2. **Awareness and kittens (done):** head tracking, tail-up, copying, startle; kitten tuning; the leash and the mother watching over her kitten; bonds with persistence.
-3. **Paired interactions:** nose boop, head bunt, sniff circle, grooming each other, sleeping together, nursing/kneading.
+3. **Paired interactions (done):** nose boop, head bunt, sniff circle, grooming each other, sleeping together, nursing/kneading.
 4. **Play and friction:** tail stalk, chase, wrestle, zoomies spreading, laser competition, play escalation and puffing up, pestering, bowl friction, tail lure.
 5. **Stretch:** carrying by the scruff, growing up, coat inheritance.

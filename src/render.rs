@@ -559,6 +559,14 @@ fn draw_paws(
             let shoulder_anchor = local[1] + side * (groom_side * 4.8 * s);
             pen.straight(shoulder_anchor, paw_pos, 2.4 * s);
         }
+        Activity::Kneading { timer, .. } => {
+            // Front paws treading in turn against its mother's belly
+            for (sign, phase) in [(1.0, 0.0), (-1.0, std::f32::consts::PI)] {
+                let push = (0.5 + 0.5 * (timer * 5.5 + phase).sin()) * 1.8 * s;
+                let paw = local[0] + fwd * (3.4 * s + push) + side * (sign * 4.4 * s);
+                pen.straight(local[1] + side * (sign * 4.2 * s), paw, 2.3 * s);
+            }
+        }
         Activity::Eating { .. } => {
             // Planted front paws flanking the chest while crouched in front of the food bowl
             let left_paw = local[0] + fwd * (3.2 * s) + side * (5.2 * s);
@@ -1487,6 +1495,7 @@ fn draw_upright_face(cat: &CatSim, h: &HeadFrame, pal: &Palette, pixmap: &mut Pi
     }
 
     let happy_closed_eyes = cat.activity == Activity::Sleeping
+        || cat.blissful()
         || matches!(cat.activity, Activity::Eating { elapsed, .. } if (elapsed % 16.0) < 13.2);
     if happy_closed_eyes {
         let eye_stroke = round_stroke((0.95 * s).max(0.8));

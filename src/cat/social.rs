@@ -1,9 +1,11 @@
 //! How a cat reacts to the other cats around it (`CatSim::neighbors`, filled in by `Clowder`):
 //! watching them, holding its tail up for friends, copying a friend's grooming and dozing,
-//! being startled awake, and a kitten keeping close to its mother. With no other cats none of
-//! this does anything.
+//! being startled awake, a kitten keeping close to its mother, and its half of what two cats do
+//! together (`Engagement`). With no other cats none of this does anything.
 
-use super::{Activity, CatSim, Kinship, Neighbor, Pose, wrap_angle};
+use super::{
+    Activity, CatSim, Engagement, Kinship, Neighbor, Pose, SocialKind, SocialRole, wrap_angle,
+};
 use glam::Vec2;
 
 impl CatSim {
@@ -42,6 +44,10 @@ impl CatSim {
     /// watches another one moving nearby, racing past, or one it doesn't know yet; a mother
     /// keeps an eye on her kittens; kittens watch everything.
     pub(super) fn watch_cats(&mut self) -> Option<f32> {
+        if let Some((_, p)) = self.social_partner() {
+            let to = p.head - self.nodes[0];
+            return Some(to.y.atan2(to.x));
+        }
         let at_rest = matches!(
             self.activity,
             Activity::Sitting
@@ -115,7 +121,7 @@ impl CatSim {
     /// Cats do what their friends do: one resting near a friend who lies down or sleeps grows
     /// drowsy sooner, and one sitting near a friend who grooms often grooms too
     pub(super) fn copy_friends(&mut self, dt: f32) {
-        if self.neighbors.is_empty() {
+        if self.neighbors.is_empty() || self.social.is_some() {
             return;
         }
         self.copy_cooldown = (self.copy_cooldown - dt).max(0.0);
@@ -178,6 +184,15 @@ impl CatSim {
                 }
             }
         }
+        // Tail up to say hello, and hooked over the other cat during a head bunt
+        if self.social.is_some_and(|e| {
+            matches!(
+                e.kind,
+                SocialKind::NoseBoop | SocialKind::HeadBunt | SocialKind::SniffCircle
+            )
+        }) {
+            raise = 1.0;
+        }
         let rate = 1.0 - (-dt * 3.0).exp();
         self.tail_raise += (raise - self.tail_raise) * rate;
         self.tail_still += (still - self.tail_still) * rate;
@@ -193,5 +208,228 @@ impl CatSim {
     /// of its idle wandering gaze
     pub(super) fn watch_yaw(&self, angle: f32, wander: f32) -> f32 {
         wrap_angle(angle - self.body_angle) * 0.8 + wander * 0.2
+    }
+
+    /// Starts this cat's half of something it does with another cat
+    pub(crate) fn begin_social(
+        &mut self,
+        kind: SocialKind,
+        role: SocialRole,
+        partner: usize,
+        side: f32,
+    ) {
+        self.social = Some(Engagement {
+            kind,
+            role,
+            partner,
+            side,
+            reached_side: false,
+            acting: false,
+            done: false,
+            anchor: self.smooth_cursor,
+            timer: 0.0,
+        });
+    }
+
+    /// Ends whatever the cat was doing with another cat; it then carries on as before (back to
+    /// its spot by the cursor). A groomed cat sometimes grooms itself straight after, as if to
+    /// set its fur right.
+    pub(crate) fn end_social(&mut self) {
+        let Some(e) = self.social.take() else {
+            return;
+        };
+        let groomed = e.kind == SocialKind::Groom && e.role == SocialRole::Passive && e.acting;
+        let huff = groomed && self.activity == Activity::Sitting && self.rand_f32() < 0.4;
+        match self.activity {
+            Activity::Greeting { .. } | Activity::Sniffing { .. } => {
+                self.activity = Activity::StandingIdle { timer: 0.0 };
+            }
+            Activity::GroomingOther { .. } => self.activity = Activity::Sitting,
+            Activity::Kneading { .. } => self.activity = Activity::Lying,
+            Activity::Sitting if huff => {
+                let side = self.rand_side();
+                self.activity = Activity::Grooming {
+                    side,
+                    timer: 0.0,
+                    duration: self.rand_range(1.8, 2.8),
+                };
+            }
+            _ => {}
+        }
+    }
+
+    /// The cat it's doing something with, as last seen
+    pub(super) fn social_partner(&self) -> Option<(Engagement, Neighbor)> {
+        let e = self.social?;
+        Some((e, *self.neighbors.get(e.partner)?))
+    }
+
+    /// Where an active cat heads for its half: up to the partner, then (for a head bunt) along
+    /// its flank. `None` while it does its part in place, and for the passive cat.
+    pub(super) fn social_target(&self) -> Option<Vec2> {
+        let (e, p) = self.social_partner()?;
+        if e.role == SocialRole::Passive || e.done {
+            return None;
+        }
+        let head = self.nodes[0];
+        let s = 0.5 * (self.scale + p.scale);
+        let heading = (p.head - p.center).normalize_or(Vec2::X);
+        let flank = heading.perp() * e.side;
+        let toward = (p.head - head).normalize_or(heading);
+        let point = match (e.kind, e.acting) {
+            // Aims a little inside touching distance, so stopping short still gets it there
+            (SocialKind::NoseBoop, false) => p.head - toward * ((Self::NOSE_GAP - 4.0) * s),
+            // Nose to the other cat's rear, on whichever side it's on: as both do, they end up
+            // side by side, head to tail
+            (SocialKind::SniffCircle, false) => {
+                let near_side = if heading.perp().dot(head - p.center) >= 0.0 {
+                    1.0
+                } else {
+                    -1.0
+                };
+                p.center - heading * (12.0 * s) + heading.perp() * (near_side * 9.0 * s)
+            }
+            // In front of the partner's face, a little to one side, then along its flank to its
+            // hips, cheek against its side
+            (SocialKind::HeadBunt, false) => p.head + heading * (14.0 * s) + flank * (9.0 * s),
+            (SocialKind::HeadBunt, true) => p.center - heading * (16.0 * s) + flank * (10.0 * s),
+            (SocialKind::Groom, false) => p.head + flank * (13.0 * s) - heading * (3.0 * s),
+            // Comes up from behind along its friend's side, so it lies down alongside it
+            (SocialKind::SleepTogether, false) if e.reached_side => {
+                p.head + flank * (13.0 * s) - heading * (2.0 * s)
+            }
+            (SocialKind::SleepTogether, false) => {
+                p.center - heading * (22.0 * s) + flank * (15.0 * s)
+            }
+            (SocialKind::Nurse, false) => p.center + flank * (18.0 * s),
+            _ => return None,
+        };
+        Some(point)
+    }
+
+    /// Advances this cat's half of what it does with another cat: notices getting there and
+    /// starts its part, and marks it done when it's over, given up, or the cat got up
+    pub(super) fn step_social(&mut self, dt: f32) {
+        let Some(mut e) = self.social else {
+            return;
+        };
+        e.timer += dt;
+        // Called away by something more pressing
+        e.done |= self.sprinting
+            || self.feeding_phase.is_some()
+            || (self.roaming && !self.roaming_by_menu)
+            || self.fetch_target.is_some();
+        let Some(p) = self.neighbors.get(e.partner).copied() else {
+            e.done = true;
+            self.social = Some(e);
+            return;
+        };
+        let resting = Pose::of(self).is_resting();
+        if e.role == SocialRole::Passive {
+            // The passive cat only has to stay put (an approaching cat counts, as for a sniff)
+            e.done |= match e.kind {
+                SocialKind::Groom | SocialKind::SleepTogether | SocialKind::Nurse => !resting,
+                SocialKind::HeadBunt => self.activity == Activity::Walking,
+                SocialKind::NoseBoop | SocialKind::SniffCircle => false,
+            };
+        } else if !e.acting {
+            let s = 0.5 * (self.scale + p.scale);
+            let arrived = if e.kind == SocialKind::NoseBoop {
+                self.nodes[0].distance(p.head) < (Self::NOSE_GAP + 2.0) * s
+            } else {
+                self.social_target()
+                    .is_some_and(|t| t.distance(self.nodes[0]) < 8.0 * self.scale)
+            };
+            if e.timer > Self::SOCIAL_GIVE_UP {
+                e.done = true;
+            } else if arrived && e.kind == SocialKind::SleepTogether && !e.reached_side {
+                e.reached_side = true;
+                self.social = Some(e);
+                return;
+            } else if arrived {
+                e.acting = true;
+                self.start_social_act(e, p);
+            }
+        } else {
+            e.done |= match e.kind {
+                SocialKind::HeadBunt => self
+                    .social_target()
+                    .is_none_or(|t| t.distance(self.nodes[0]) < 8.0 * self.scale),
+                SocialKind::SleepTogether | SocialKind::Nurse => !matches!(
+                    self.activity,
+                    Activity::Sleeping | Activity::Kneading { .. }
+                ),
+                // These finish in their own activity (or end if it was cut short)
+                SocialKind::NoseBoop => !matches!(self.activity, Activity::Greeting { .. }),
+                SocialKind::SniffCircle => !matches!(self.activity, Activity::Sniffing { .. }),
+                SocialKind::Groom => !matches!(self.activity, Activity::GroomingOther { .. }),
+            };
+        }
+        self.social = Some(e);
+    }
+
+    fn start_social_act(&mut self, e: Engagement, p: Neighbor) {
+        let head = self.nodes[0];
+        match e.kind {
+            SocialKind::NoseBoop => {
+                self.speed = 0.0;
+                self.activity = Activity::Greeting {
+                    timer: 0.0,
+                    duration: self.rand_range(0.9, 1.5),
+                };
+            }
+            SocialKind::SniffCircle => {
+                self.speed = 0.0;
+                // Both walk round the middle between their bodies
+                self.activity = Activity::Sniffing {
+                    center: 0.5 * (self.body_point() + p.center),
+                    dir: e.side,
+                    turned: 0.0,
+                };
+            }
+            // Carries on walking, slowly, along the partner's flank
+            SocialKind::HeadBunt => {}
+            SocialKind::Groom => {
+                self.speed = 0.0;
+                self.activity = Activity::GroomingOther {
+                    timer: 0.0,
+                    duration: self.rand_range(5.0, 9.0),
+                };
+            }
+            SocialKind::SleepTogether => {
+                self.speed = 0.0;
+                // Curls round toward the cat it sleeps against
+                let to_partner = p.center - head;
+                self.curl_side = if Vec2::from_angle(self.body_angle).perp().dot(to_partner) >= 0.0
+                {
+                    1.0
+                } else {
+                    -1.0
+                };
+                self.idle_time = self.idle_time.max(60.0);
+                self.activity = Activity::Sleeping;
+            }
+            SocialKind::Nurse => {
+                self.speed = 0.0;
+                self.activity = Activity::Kneading {
+                    timer: 0.0,
+                    duration: self.rand_range(6.0, 12.0),
+                };
+            }
+        }
+    }
+
+    /// Whether the cursor has moved far enough since the cats began to break it up
+    pub(super) fn social_interrupted(&self, radius: f32) -> bool {
+        self.social
+            .is_some_and(|e| self.smooth_cursor.distance(e.anchor) > radius)
+    }
+
+    /// Eyes shut in contentment: kneading, or being groomed
+    pub fn blissful(&self) -> bool {
+        matches!(self.activity, Activity::Kneading { .. })
+            || self.social.is_some_and(|e| {
+                e.kind == SocialKind::Groom && e.role == SocialRole::Passive && e.acting
+            })
     }
 }

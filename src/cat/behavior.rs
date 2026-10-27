@@ -1,6 +1,6 @@
 use super::{
-    Activity, BODY_NODES, CatSim, FeedPreset, FeedingPhase, Temperament, dist_to_segment,
-    pounce_stretch, pounce_travel, smoothstep, wrap_angle,
+    Activity, BODY_NODES, CatSim, FeedPreset, FeedingPhase, SocialKind, Temperament,
+    dist_to_segment, pounce_stretch, pounce_travel, smoothstep, wrap_angle,
 };
 use glam::Vec2;
 
@@ -36,6 +36,8 @@ struct Steering {
     make_way: bool,
     /// A mother on her way to fetch her kitten that wandered off
     fetching: bool,
+    /// On its way to another cat for something they do together
+    social_errand: bool,
     to_target: Vec2,
     dist_to_target: f32,
     /// Where the cat looks and turns to: the cursor, or while roaming where it is going
@@ -48,7 +50,11 @@ struct Steering {
 impl Steering {
     /// Whether the cat gets up from a rest that a cursor farther than `radius` would end
     fn wakes(&self, radius: f32) -> bool {
-        self.roam_errand || self.make_way || self.fetching || self.dist_to_cursor > radius
+        self.roam_errand
+            || self.make_way
+            || self.fetching
+            || self.social_errand
+            || self.dist_to_cursor > radius
     }
 }
 
@@ -94,6 +100,10 @@ impl CatSim {
         self.update_roaming(&tuning, dt);
         let head_pos = self.nodes[0];
         self.check_bowl_arrival(head_pos);
+        if self.social_interrupted(tuning.wake_radius_sit) {
+            self.abandon_social();
+        }
+        self.step_social(dt);
         let steer = self.steer(head_pos, cursor_delta, raw_dist_to_head, &tuning);
 
         // Reset transient modifiers before state machine applies them
@@ -401,6 +411,11 @@ impl CatSim {
             self.roam_going = false;
             return;
         }
+        if self.social.is_some() {
+            // Wandering waits while it's busy with another cat
+            self.roam_going = false;
+            return;
+        }
         if !self.behaviors.follow_cursor {
             if !self.roaming {
                 self.enter_roaming();
@@ -551,6 +566,7 @@ impl CatSim {
         if self.roaming
             || self.leashed
             || self.fetch_target.is_some()
+            || self.social.is_some()
             || self.wake_anchor.is_some()
             || matches!(
                 self.activity,
@@ -723,8 +739,14 @@ impl CatSim {
         } else if self.slot_settled_at.is_none() {
             self.slot_settled_at = Some(effective_target_cursor);
         }
+        let social_point = self.social_target();
         if hunting {
             // A crouch or leap under way keeps its own target
+        } else if let Some(point) = social_point {
+            self.rest_target = point;
+        } else if self.social.is_some() {
+            // Doing its part with another cat right here
+            self.rest_target = head_pos;
         } else if let Some(point) = fetch_point {
             self.rest_target = point;
         } else if self.roaming {
@@ -770,13 +792,17 @@ impl CatSim {
         let make_way = self.slot_bumped
             && slot_point.is_some_and(|p| head_pos.distance(p) > Self::SLOT_ARRIVAL * self.scale);
         let fetching = fetch_point.is_some_and(|p| head_pos.distance(p) > 8.0 * self.scale);
+        let social_errand = social_point.is_some_and(|p| head_pos.distance(p) > 8.0 * self.scale);
 
         // A roaming cat is moved by having somewhere to go (`roam_errand`), not by the cursor.
         // A cat with a spot of its own measures from that spot, as if it were sitting
         // `stop_radius` from the cursor; once settled there, only the cursor (or bowl) moving
         // counts, not the cat turning round or lying down.
         let dist_to_cursor = if force_follow && !self.roaming {
-            if let Some(anchor) = self.wake_anchor {
+            if let Some(e) = self.social {
+                // Busy with another cat: only the cursor moving off matters
+                self.smooth_cursor.distance(e.anchor)
+            } else if let Some(anchor) = self.wake_anchor {
                 effective_target_cursor.distance(anchor)
             } else if leash_point.is_some() || fetch_point.is_some() {
                 // Measured from where it is going, as for a spot of its own
@@ -810,6 +836,7 @@ impl CatSim {
         let in_pounce_range = |d: f32| d > 85.0 * self.scale && d < 230.0 * self.scale;
         let wants_to_pounce = !self.roaming
             && fetch_point.is_none()
+            && self.social.is_none()
             && !self.is_waiting_for_bowl()
             && self.behaviors.playful_quirks
             && self.play_excitement > 0.55
@@ -824,6 +851,7 @@ impl CatSim {
             roam_errand: self.roaming && self.roam_going,
             make_way,
             fetching,
+            social_errand,
             to_target,
             dist_to_target: to_target.length(),
             look_angle,
@@ -1097,7 +1125,98 @@ impl CatSim {
                 elapsed,
                 duration,
             } => self.step_eating(preset, elapsed + dt, duration, dt),
+            Activity::Greeting {
+                mut timer,
+                duration,
+            } => {
+                timer += dt;
+                self.ear_left_twitch = 0.22;
+                self.ear_right_twitch = 0.22;
+                self.activity = Activity::Greeting { timer, duration };
+                self.finish_social_act(timer >= duration);
+            }
+            Activity::Sniffing {
+                center,
+                dir,
+                mut turned,
+            } => {
+                let spin = Self::SNIFF_SPIN * dir;
+                turned += spin.abs() * dt;
+                self.sniff_step(center, spin, dt);
+                self.activity = Activity::Sniffing {
+                    center,
+                    dir,
+                    turned,
+                };
+                self.finish_social_act(turned >= std::f32::consts::PI);
+            }
+            Activity::GroomingOther {
+                mut timer,
+                duration,
+            } => {
+                timer += dt;
+                self.idle_time += dt;
+                self.activity = Activity::GroomingOther { timer, duration };
+                self.finish_social_act(timer >= duration);
+            }
+            Activity::Kneading {
+                mut timer,
+                duration,
+            } => {
+                timer += dt;
+                self.idle_time += dt;
+                if self.social.is_none() {
+                    self.activity = Activity::Lying;
+                } else if timer >= duration {
+                    // Kneaded itself sleepy: dozes off against its mother
+                    self.activity = Activity::Sleeping;
+                } else {
+                    self.activity = Activity::Kneading { timer, duration };
+                }
+            }
         }
+    }
+
+    /// Marks the cat's part with another cat done when `over`, and drops the pose if the cats
+    /// were separated, so `Clowder` ends it for both
+    fn finish_social_act(&mut self, over: bool) {
+        match &mut self.social {
+            Some(e) => e.done |= over,
+            None => self.abandon_social(),
+        }
+    }
+
+    /// Stops what it was doing with another cat straight away (the cursor moved off, or the
+    /// other cat is gone) and gets up to carry on
+    pub(super) fn abandon_social(&mut self) {
+        self.social = None;
+        if matches!(
+            self.activity,
+            Activity::Greeting { .. }
+                | Activity::Sniffing { .. }
+                | Activity::GroomingOther { .. }
+                | Activity::Kneading { .. }
+        ) {
+            self.activity = Activity::StandingUp { progress: 0.3 };
+        }
+    }
+
+    /// Walks round `center` at `spin` rad/s, facing along the circle, closing in to
+    /// `SNIFF_RADIUS`: half a lap is about a body length, so each nose stays at the other's rear
+    fn sniff_step(&mut self, center: Vec2, spin: f32, dt: f32) {
+        let rel = self.nodes[0] - center;
+        let r =
+            rel.length() + (Self::SNIFF_RADIUS * self.scale - rel.length()) * (dt * 3.0).min(1.0);
+        let angle = rel.y.atan2(rel.x) + spin * dt;
+        let tangent = angle + spin.signum() * std::f32::consts::FRAC_PI_2;
+        self.body_angle = wrap_angle(
+            self.body_angle + wrap_angle(tangent - self.body_angle) * (dt * 6.0).min(1.0),
+        );
+        self.angular_vel = spin;
+        self.nodes[0] = center + Vec2::from_angle(angle) * r;
+        self.speed = spin.abs() * r;
+        self.advance_gait_cycle(dt);
+        self.gait_weight = 0.6;
     }
 
     /// Lying, DramaticFlop and BellyUp: roll between the lying poses, wake when the cursor
@@ -1108,7 +1227,10 @@ impl CatSim {
             Activity::DramaticFlop { side, mut timer } => {
                 timer += dt;
                 // A realistic cat lying on its side stays there until it sleeps or wakes
-                if timer > 6.5 && self.behaviors.temperament != Temperament::Realistic {
+                if timer > 6.5
+                    && self.behaviors.temperament != Temperament::Realistic
+                    && self.social.is_none()
+                {
                     if self.rand_f32() < 0.45 {
                         self.activity = Activity::BellyUp { side, timer: 0.0 };
                     } else {
@@ -1170,7 +1292,7 @@ impl CatSim {
                 self.activity = Activity::StandingUp { progress: 0.0 };
             }
             self.idle_time = 0.0;
-        } else if self.idle_time > tuning.sit_to_lie_time {
+        } else if self.idle_time > tuning.sit_to_lie_time && self.social.is_none() {
             let roll = self.rand_f32();
             let side = self.rand_side();
             if self.behaviors.temperament == Temperament::Realistic {
@@ -1449,13 +1571,12 @@ impl CatSim {
     fn update_locomotion(&mut self, steer: &Steering, tuning: &TemperamentTuning, dt: f32) {
         if self.activity == Activity::Walking {
             self.steer_walk(steer, tuning, dt);
-        } else if !matches!(
-            self.activity,
-            Activity::TailChasing { .. }
-                | Activity::Circling { .. }
-                | Activity::Zoomies { .. }
-                | Activity::Pouncing { .. }
-        ) {
+        } else if !self.activity.is_spinning()
+            && !matches!(
+                self.activity,
+                Activity::Zoomies { .. } | Activity::Pouncing { .. }
+            )
+        {
             self.speed *= (-dt * 10.0).exp();
             self.angular_vel *= (-dt * 8.0).exp();
             self.gait_weight *= (-dt * 7.0).exp();
@@ -1482,7 +1603,13 @@ impl CatSim {
         if dist_to_target > my_radius {
             let head = self.nodes[0];
             let mut push = Vec2::ZERO;
-            for n in &self.neighbors {
+            let partner = self.social.map(|e| e.partner);
+            for (_, n) in self
+                .neighbors
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| Some(i) != partner)
+            {
                 for p in [n.head, n.center] {
                     let away = head - p;
                     let d = away.length();
@@ -1536,6 +1663,15 @@ impl CatSim {
                 * self.scale
         };
 
+        // Rubbing along another cat's flank is a slow, leaning walk that keeps its pace to the end
+        let rubbing = self
+            .social
+            .is_some_and(|e| e.kind == SocialKind::HeadBunt && e.acting);
+        let (cruise_speed, slow_radius) = if rubbing {
+            (cruise_speed.min(32.0 * self.scale), 12.0 * self.scale)
+        } else {
+            (cruise_speed, slow_radius)
+        };
         let brake_exp = if self.sprinting { 0.68 } else { 0.92 };
         let target_speed = if dist_to_target < slow_radius {
             cruise_speed * (dist_to_target / slow_radius).powf(brake_exp)
@@ -1618,7 +1754,13 @@ impl CatSim {
                 let stretch_bell = (progress * std::f32::consts::PI).sin();
                 (1.52 + 0.32 * stretch_bell, 0.0)
             }
-            Activity::StandingUp { .. } | Activity::Walking | Activity::StandingIdle { .. } => {
+            Activity::GroomingOther { .. } => (1.16, 0.09 * self.curl_side),
+            Activity::Kneading { .. } => (1.26, 0.07 * self.curl_side),
+            Activity::Sniffing { dir, .. } => (1.45, 0.22 * dir),
+            Activity::StandingUp { .. }
+            | Activity::Walking
+            | Activity::StandingIdle { .. }
+            | Activity::Greeting { .. } => {
                 // During a feline rotary gallop the spine is most flexed (~1.24) as the hind paws
                 // land under the belly (RH touchdown at cycle 0.03), uncoils through hind stance to full extension
                 // (~1.92) at hind lift-off / fore touchdown, then coils again through fore stance and
@@ -1642,6 +1784,10 @@ impl CatSim {
     }
 
     fn tick_relaxing_quirks(&mut self, dt: f32, cursor_delta: f32, dist_to_cursor: f32) {
+        if self.social.is_some() {
+            // Holds still for the other cat
+            return;
+        }
         // If cursor is close and twitches slightly, the cat might mischievously bat at it with a paw!
         if self.behaviors.playful_quirks
             && cursor_delta > 1.5

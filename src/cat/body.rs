@@ -50,6 +50,19 @@ impl CatSim {
             }
             // Looking down and into the circle at the spot it is about to lie on
             Activity::Circling { dir, .. } => dir * 0.3,
+            // Nose to nose with the other cat
+            Activity::Greeting { .. } => {
+                watch_angle.map_or(0.0, |a| wrap_angle(a - self.body_angle).clamp(-0.9, 0.9))
+            }
+            // Nose toward the other cat's rear, inside the circle
+            Activity::Sniffing { dir, .. } => dir * 0.4,
+            Activity::GroomingOther { timer, .. } => {
+                let lick = (timer * 7.5).sin() * 0.12;
+                watch_angle.map_or(0.0, |a| {
+                    wrap_angle(a - self.body_angle).clamp(-Self::MAX_HEAD_YAW, Self::MAX_HEAD_YAW)
+                }) + lick
+            }
+            Activity::Kneading { timer, .. } => (timer * 1.3).sin() * 0.05,
             Activity::StalkWiggle { .. } | Activity::Pouncing { .. } => {
                 // Dead-locked gaze on the target
                 wrap_angle(look_angle - self.body_angle).clamp(-0.65, 0.65)
@@ -107,11 +120,7 @@ impl CatSim {
         let stride = (walk + (gallop - walk) * self.gallop_weight) * self.scale;
         let step_scale = 0.5 + 0.5 * self.gait_weight.clamp(0.0, 1.0);
         let mut stride = (stride * step_scale).max(self.speed / Self::MAX_CADENCE);
-        if matches!(
-            self.activity,
-            Activity::TailChasing { .. } | Activity::Circling { .. }
-        ) && self.angular_vel.abs() > 0.1
-        {
+        if self.activity.is_spinning() && self.angular_vel.abs() > 0.1 {
             // Spinning on the spot takes quick little steps: the body turns at most
             // `MAX_SPIN_PER_STRIDE` per stride, so a planted paw isn't swept round with it
             stride = stride.min(self.speed * Self::MAX_SPIN_PER_STRIDE / self.angular_vel.abs());
@@ -143,12 +152,9 @@ impl CatSim {
 
         if matches!(
             self.activity,
-            Activity::Walking
-                | Activity::Pouncing { .. }
-                | Activity::Zoomies { .. }
-                | Activity::TailChasing { .. }
-                | Activity::Circling { .. }
-        ) {
+            Activity::Walking | Activity::Pouncing { .. } | Activity::Zoomies { .. }
+        ) || self.activity.is_spinning()
+        {
             self.solve_moving_spine(dt, len_scale, phase_rad);
         } else if matches!(self.activity, Activity::StandingIdle { .. }) {
             self.ease_spine_onto_carrier(dt);
@@ -186,15 +192,10 @@ impl CatSim {
                 self.gait_weight * 0.70 * (1.0 - 0.85 * self.gallop_weight),
                 7.0,
             ),
-            Activity::TailChasing { .. } | Activity::Circling { .. } => {
-                (self.gait_weight * 0.40, 0.0)
-            }
+            _ if self.activity.is_spinning() => (self.gait_weight * 0.40, 0.0),
             _ => (0.0, 7.5),
         };
-        let spinning = matches!(
-            self.activity,
-            Activity::TailChasing { .. } | Activity::Circling { .. }
-        );
+        let spinning = self.activity.is_spinning();
 
         if self.nodes[0].distance_squared(self.carrier_nodes[0]) > (24.0 * self.scale).powi(2) {
             self.carrier_nodes
@@ -343,7 +344,11 @@ impl CatSim {
             Activity::Sitting
             | Activity::AloofNotice { .. }
             | Activity::Grooming { .. }
+            | Activity::GroomingOther { .. }
             | Activity::Eating { .. } => (0.18, 1.15, -self.curl_side * 0.28),
+            Activity::Kneading { .. } => (0.14, 0.85, -self.curl_side * 0.24),
+            Activity::Greeting { .. } => (0.10, 1.0, 0.0),
+            Activity::Sniffing { .. } => (0.12, 0.9, turn_counterbalance),
             Activity::PawBatting { .. } => (0.28, 2.6, 0.0),
             Activity::TailChasing { dir, .. } => (0.25, 4.0, dir * 0.48),
             Activity::Circling { .. } => (0.12, 0.9, turn_counterbalance),
@@ -378,7 +383,10 @@ impl CatSim {
         // A settled sitting cat slowly wraps its tail along its flank and around its front paws
         let wraps_tail = matches!(
             self.activity,
-            Activity::Sitting | Activity::Grooming { .. } | Activity::AloofNotice { .. }
+            Activity::Sitting
+                | Activity::Grooming { .. }
+                | Activity::GroomingOther { .. }
+                | Activity::AloofNotice { .. }
         ) && !self.sit_turning;
         let wrap_rate = if wraps_tail { 1.6 } else { 5.0 };
         self.sit_tail_wrap += (f32::from(u8::from(wraps_tail)) - self.sit_tail_wrap)
@@ -510,10 +518,7 @@ impl CatSim {
 
         // When spinning on the spot, each socket moves at its own speed and direction, so each paw
         // lands half a stance ahead along its own socket's path instead of straight ahead
-        let spinning = matches!(
-            self.activity,
-            Activity::TailChasing { .. } | Activity::Circling { .. }
-        );
+        let spinning = self.activity.is_spinning();
         let half_stance_secs = if self.speed > 1.0 {
             0.5 * (1.0 - swing_window) * stride / self.speed
         } else {

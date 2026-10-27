@@ -197,7 +197,11 @@ impl Pose {
             Activity::Sleeping | Activity::Circling { .. } => Self::Sleeping,
             Activity::Eating { .. }
             | Activity::StalkWiggle { .. }
-            | Activity::TailChasing { .. } => Self::Busy,
+            | Activity::TailChasing { .. }
+            | Activity::Greeting { .. }
+            | Activity::Sniffing { .. }
+            | Activity::GroomingOther { .. } => Self::Busy,
+            Activity::Kneading { .. } => Self::Lying,
         }
     }
 
@@ -371,6 +375,83 @@ pub enum Activity {
         elapsed: f32,
         duration: Option<f32>,
     },
+    /// Standing nose to nose with another cat, a brief hello
+    Greeting {
+        timer: f32,
+        duration: f32,
+    },
+    /// Walking half a turn round another cat, each sniffing the other's rear
+    Sniffing {
+        center: Vec2,
+        dir: f32,
+        turned: f32,
+    },
+    /// Sitting beside another cat, licking its head and neck
+    GroomingOther {
+        timer: f32,
+        duration: f32,
+    },
+    /// Lying against its mother's belly, front paws treading
+    Kneading {
+        timer: f32,
+        duration: f32,
+    },
+}
+
+impl Activity {
+    /// Turning round on the spot (or round a close partner) with quick little steps
+    pub fn is_spinning(&self) -> bool {
+        matches!(
+            self,
+            Self::TailChasing { .. } | Self::Circling { .. } | Self::Sniffing { .. }
+        )
+    }
+}
+
+/// Something two cats do together, started by `Clowder` on both of them
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SocialKind {
+    /// Walk up to each other and touch noses
+    NoseBoop,
+    /// One walks along the other's flank, rubbing its cheek and hooking its tail over
+    HeadBunt,
+    /// Half a turn round each other, sniffing
+    SniffCircle,
+    /// One licks the other's head while both rest
+    Groom,
+    /// One curls up against the other, which is asleep
+    SleepTogether,
+    /// A kitten kneads against its mother's belly, then falls asleep there
+    Nurse,
+}
+
+/// Which half of a `SocialKind` a cat does: the one that goes over and acts, or the one that
+/// stays where it is (and leans in)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SocialRole {
+    Active,
+    Passive,
+}
+
+/// A cat's half of something it does with another cat
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Engagement {
+    pub kind: SocialKind,
+    pub role: SocialRole,
+    /// The other cat, as an index into `neighbors`
+    pub partner: usize,
+    /// Which side of the partner to come up on (+1 / -1), or which way to circle
+    pub side: f32,
+    /// Came round to the partner's side on the way (to lie down alongside it)
+    pub reached_side: bool,
+    /// There and doing it (false while still on the way)
+    pub acting: bool,
+    /// Finished, given up or interrupted: `Clowder` ends it for both
+    pub done: bool,
+    /// Where the cursor was when it began; moving it away breaks it up
+    pub anchor: Vec2,
+    /// Seconds since it began
+    pub timer: f32,
 }
 
 /// World-space articulated paw state for realistic 4-beat walk & 2-beat trot
@@ -604,6 +685,8 @@ pub struct CatSim {
     pub tail_raise: f32,
     /// 0..1: how still the tail is held near a cat this one dislikes
     tail_still: f32,
+    /// What this cat is doing with another cat, set up and ended by `Clowder`
+    pub social: Option<Engagement>,
 }
 
 impl CatSim {
@@ -768,6 +851,7 @@ impl CatSim {
             copy_cooldown: 0.0,
             tail_raise: 0.0,
             tail_still: 0.0,
+            social: None,
         }
     }
 
@@ -791,6 +875,14 @@ impl CatSim {
     const COPY_RANGE: f32 = 150.0;
     /// How close (unscaled px) a racing cat has to pass to wake a sleeping one
     const STARTLE_RANGE: f32 = 55.0;
+    /// Head-centre distance (unscaled px) of two cats touching noses
+    const NOSE_GAP: f32 = 15.5;
+    /// Seconds a cat keeps trying to reach another cat for something they do together
+    const SOCIAL_GIVE_UP: f32 = 20.0;
+    /// How fast (rad/s) two cats sniffing each other walk round
+    const SNIFF_SPIN: f32 = 1.3;
+    /// Radius (unscaled px) of the circle two cats walk round sniffing each other
+    const SNIFF_RADIUS: f32 = 12.0;
 
     /// Dynamically rescales the cat in-place without teleporting or kinking the spine
     pub fn set_scale(&mut self, new_scale: f32) {

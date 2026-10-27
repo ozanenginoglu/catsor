@@ -238,6 +238,34 @@ Each `Neighbor` also carries the other cat's scale, speed and `Pose` (Moving, Ra
 - **Leash:** a kitten following the cursor stays within `KITTEN_LEASH` (150 px × its mother's scale) of its mother's body. When the place it wants (its slot, or `stop_radius` from the cursor) is further than that from her, it goes to the point 0.7 × leash from her in that direction instead, so there's slack when she moves (`leashed`; it lets go below 0.85 × leash). A leashed kitten has no slot and trots to catch up when it falls more than ~20 px behind. With Follow Cursor off, a roaming kitten wanders round its mother (0.3–0.75 × leash from her) and heads back when it's further than the leash.
 - **Fetching:** a kitten shaken off by the cursor roams on its own. If it gets further than 240 px (× her scale) from its mother while she is free (following the cursor, not feeding, hunting or racing), `Clowder` sends her to it (`fetch_target`). She walks up to it, and when they're close, the kitten stops roaming (`call_back`) and comes back on its leash while she returns to the cursor.
 
+### Doing things together
+
+`Clowder` decides when two cats do something together. Each cat then plays its half as an `Engagement` (`CatSim::social`): a `SocialKind`, a role (`Active` goes over and acts; `Passive` stays where it is), the partner (an index into `neighbors`), which side to come up on, and whether it has got there (`acting`). `src/cat/social.rs` has the cat's half; `Clowder::direct` and `tend_engagements` in `clowder.rs` start and end them.
+
+**Starting.** Twice a second (`DIRECTOR_TICK`), `direct` lists what each pair of **free** cats could start and rolls for each, starting at most one. A cat is free when it isn't engaged, feeding, sprinting, fetching, shaken off (roaming with Follow Cursor off is fine), hunting, racing or busy, and is within 40 px of where it's heading (so not following a moving cursor). Rates are per second and scale with each cat's sociability: Playful 1.2, Balanced and Lazy 1.0, Aloof 0.6, Realistic 0.5 (both cats' factors multiply).
+
+| Kind | When | Who does what |
+|---|---|---|
+| Greeting | Two awake cats within 160 px that have been more than 250 px apart for 90 s (`GREET_AFTER`; pairs that haven't met this session count as apart, so cats greet at startup and when one is added). 40% per tick | Strangers (familiarity < 0.3, not family) do a **sniff circle**, friends a **head bunt**, others a **nose boop**. Afterwards the pair isn't greeted again until it has been apart again |
+| **Grooming** | Two friends, both Sitting or Lying awake, within 130 px | Rate (0.5 + affection) / 60, × 3 for a mother grooming her kitten, × 2 for siblings, × 0.5 for a kitten grooming its mother |
+| **Sleeping together** | A friend resting awake within 220 px of a friend asleep | Rate 1/8 (× 2 for family): a drowsy cat soon goes to curl up against it, while it still can |
+| **Nursing** | A kitten awake within 250 px of its mother lying down or asleep | Rate 1/25 |
+
+**The acts.** The active cat walks to a point next to the partner (`social_target`), recomputed each tick from the partner's snapshot, and starts its part once within 8 px (a nose boop: once their heads are within `NOSE_GAP` + 2 px).
+
+| Kind | Approach | Act |
+|---|---|---|
+| Nose boop | Both walk toward each other's heads | `Greeting`: standing nose to nose (head centres ~15.5 px apart), ears forward, heads locked on each other, 0.9–1.5 s |
+| Head bunt | In front of the partner's face, a little to the side | Walks slowly (32 px/s, braking only in the last 12 px) along its flank to beside its hips, tail up and hooked over; the partner holds still |
+| Sniff circle | Both head for the other's rear, on the side they're on, ending up side by side, head to tail | `Sniffing`: both walk half a turn round the middle between their bodies at 1.3 rad/s, closing in to a 12 px radius (half a lap ≈ a body length, so each nose stays at the other's rear) |
+| Grooming | Beside the partner's head | `GroomingOther`: sits licking the partner's head (head turned to it, lick bob) for 5–9 s; the groomed cat leans its head toward the groomer with its eyes shut (`blissful`). Afterwards the groomed cat grooms itself 40% of the time, as if setting its fur right |
+| Sleeping together | First to a point behind and beside the sleeper, then forward along its side, so it lies down alongside | Falls straight asleep, curled toward its friend |
+| Nursing | To the mother's side, 18 px out | `Kneading`: lying, front paws treading in turn, eyes shut, for 6–12 s, then falls asleep there |
+
+While engaged, a cat takes no spot round the cursor, ignores its partner when steering round other cats, doesn't do quirks, copy, pounce or go roaming, and the passive cat doesn't lie down from sitting (or roll off its side onto its back) mid-act. Its "distance to the cursor" is how far the cursor has moved since the engagement began.
+
+**Ending.** A cat marks its half done when its act is over, when it gives up getting there (20 s, `SOCIAL_GIVE_UP`), when its part is interrupted (a sleeper wakes, a resting partner gets up), or when something more pressing comes up (sprinting, feeding, being shaken off, fetching a kitten). `tend_engagements` then ends it for **both** cats (`end_social`): a social pose turns into standing, sitting or lying, and they carry on as before (back to their spots by the cursor). If the cursor moves more than the sit wake radius from where it was when they began, each cat drops it at once (`abandon_social`) and gets up. A greeting or grooming that both cats saw through adds 0.03 or 0.06 to their affection. Removing a cat ends everything under way.
+
 ### Bonds
 
 `Clowder` keeps a `Bond` for every pair of cats, by name (`src/bonds.rs`):

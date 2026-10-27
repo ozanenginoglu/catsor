@@ -47,6 +47,10 @@ Each activity has a target `(posture_extension, curl_amount)`. Both values are a
 | Pouncing | 1.50 + 0.42·`pounce_stretch(p)`: extends during push-off, stays long in the air, gathers on landing | 0 |
 | Zoomies | gallop flex wave (zoomies are a gallop) | 0 |
 | Circling | 1.45 | 0.22 × turn direction (curved around the circle) |
+| Sniffing | 1.45 | 0.22 × turn direction |
+| Greeting | as standing | 0 |
+| GroomingOther | 1.16 | 0.09 × side |
+| Kneading | 1.26 | 0.07 × side |
 
 Values blended in alongside posture:
 - `belly_roll` (0–1, roll-on at 2.4/s and roll-off at 2.8/s): once it passes 0.35 the paws are drawn **on top of** the torso, and the belly is shown.
@@ -109,13 +113,17 @@ Each tail segment chases a target angle. The follow rate is 16/s at the base and
 
 - while greeting a friend (or for a kitten on the move), a **raised tail** (`tail_raise`, 0–1): seen from above, each segment is foreshortened by up to `TAIL_RAISE_FORESHORTEN` (most at the upright base) and the tip hooks to the curl side by `TAIL_RAISE_HOOK`; the sway is cut by up to 60%. Near a cat it dislikes, `tail_still` cuts the sway by up to 70%. See [behavior.md](behavior.md#what-each-cat-sees-of-the-others).
 
+TailChasing, Circling and Sniffing are "spinning" activities (`Activity::is_spinning`): they use the moving spine with a gentler sway, short spinning strides, and paws that land along each socket's own path.
+
 The tail is always drawn **under** the body and head, so it never covers the face. It shares the body's outline, so no line separates it from the rump.
 
 ### Head & ears
 
-`update_head_and_ears` sets `head_yaw` per activity. Normally the head follows the cursor up to `MAX_HEAD_YAW` (1.4 rad, ~80°) to either side. When the cursor is still and near (so it holds little attention) and the cat is watching another cat, the head turns 80% of the way toward that cat instead, and the idle wander makes up the rest. It stays within about ±0.6 rad during PawBatting, StalkWiggle and Pouncing. If the cursor goes more than ~100° behind a sitting cat, the cat shuffles round on the spot to face it (`SIT_TURN_RATE`, 1.8 rad/s, pivoting around its torso) instead of standing up. It looks back toward the tail while chasing it, tucks around (2.38 rad × curl side) when sleeping, and bobs into the bowl while eating. The ears are separate angles. Negative is flattened back ("airplane ears": stalking, zoomies) and positive is pricked forward.
+`update_head_and_ears` sets `head_yaw` per activity. A cat greeting nose to nose locks its head on the other cat (±0.9 rad), one grooming another turns its head to it with a licking bob, one sniffing turns its nose into the circle, and a kneading kitten barely moves its head. Normally the head follows the cursor up to `MAX_HEAD_YAW` (1.4 rad, ~80°) to either side. When the cursor is still and near (so it holds little attention) and the cat is watching another cat, the head turns 80% of the way toward that cat instead, and the idle wander makes up the rest. It stays within about ±0.6 rad during PawBatting, StalkWiggle and Pouncing. If the cursor goes more than ~100° behind a sitting cat, the cat shuffles round on the spot to face it (`SIT_TURN_RATE`, 1.8 rad/s, pivoting around its torso) instead of standing up. It looks back toward the tail while chasing it, tucks around (2.38 rad × curl side) when sleeping, and bobs into the bowl while eating. The ears are separate angles. Negative is flattened back ("airplane ears": stalking, zoomies) and positive is pricked forward.
 
 ## Rendering (`render.rs`)
+
+Two social touches in the renderer: a kneading kitten's front legs tread in turn (`Activity::Kneading`), and `CatSim::blissful()` (kneading, or being groomed) closes the eyes like sleeping does.
 
 `render_cat(cat, pixmap, clip_mask, window_origin)` draws into a premultiplied-RGBA tiny-skia `Pixmap` the same size as the overlay window. World positions are converted to window space by subtracting `window_origin`. Each node gets a tangent and a normal vector, and outlines are built by offsetting along the normals.
 

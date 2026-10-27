@@ -98,7 +98,7 @@ A cat's page (**Back** returns to the main page):
 - **Shake the mouse right over the cat** to shoo it off. It goes its own way: it wanders around the screen, naps, and keeps away from the cursor. Shake the mouse again (anywhere) to call it back. It gallops over and goes back to following you.
 - **Turn off Follow Cursor** in the tray menu and the cat roams the same way, until you turn it back on.
 - **Leave it alone.** It sits, then lies down, then curls up and sleeps.
-- **Add a second cat** (or a kitten). Each cat finds its own spot round the cursor, and they keep out of each other's way. They watch each other, hold their tails up for friends, and grow fond of each other the more time they spend together. Shake a kitten off and watch its mother fetch it back.
+- **Add a second cat** (or a kitten). Each cat finds its own spot round the cursor, and they keep out of each other's way. They watch each other, hold their tails up for friends, and grow fond of each other the more time they spend together. Shake a kitten off and watch its mother fetch it back. Leave them be and they greet each other (strangers sniff each other round in a circle; friends rub against each other), groom each other, curl up together to sleep, and a kitten comes to knead and nap against its mother.
 
 ### Feeding mode (keep-awake)
 
