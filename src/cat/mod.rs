@@ -480,12 +480,12 @@ impl SocialKind {
     }
 
     /// How far (unscaled px) the two cats' bodies may press into each other while doing it:
-    /// rubbing, cuddling, tangling and tagging squash fur together, the rest only touch
+    /// rubbing, cuddling, sniffing, tangling and tagging squash fur together, the rest only touch
     pub fn contact(self) -> f32 {
         match self {
             // A chaser that catches up bumps into the other
             Self::HeadBunt | Self::Wrestle | Self::Chase => 6.0,
-            Self::Groom | Self::SleepTogether | Self::Nurse => 4.0,
+            Self::Groom | Self::SleepTogether | Self::Nurse | Self::SniffCircle => 4.0,
             _ => 2.0,
         }
     }
@@ -716,6 +716,9 @@ pub struct CatSim {
     carrier_nodes: [Vec2; BODY_NODES],
     /// Transient lateral head-bob offset applied on the last spine solve step
     prev_head_offset: Vec2,
+    /// How fast (px/s) a walking cat's turn sweeps its legs round, eased so the paws go on
+    /// stepping round for a moment as a turn on the spot ends (see `CatSim::step_speed`)
+    pivot_sweep: f32,
     /// Stable screen-space torso anchor for positioning the overlay window without jitter
     window_anchor: Vec2,
 
@@ -925,6 +928,7 @@ impl CatSim {
             pinned_rest: false,
             carrier_nodes,
             prev_head_offset: Vec2::ZERO,
+            pivot_sweep: 0.0,
             window_anchor: carrier_nodes[3],
             neighbors: Vec::new(),
             slot: None,
@@ -991,6 +995,9 @@ impl CatSim {
     const SNIFF_SPIN: f32 = 1.3;
     /// Radius (unscaled px) of the circle two cats walk round sniffing each other
     const SNIFF_RADIUS: f32 = 12.0;
+    /// How far (unscaled px) out to the side of the other cat's spine a nose has to be to have
+    /// come up beside its hindquarters for a sniff circle
+    const SNIFF_FLANK: f32 = 8.0;
     /// How far (unscaled px) from another cat's tail tip a cat crouches to pounce on it
     const TAIL_STALK_RANGE: f32 = 55.0;
     /// Radius (unscaled px) round the cursor of the circle a chased cat runs
@@ -1454,9 +1461,12 @@ impl CatSim {
     const WIGGLE_RATE: f32 = 19.0;
     /// Most the body turns (rad) during one stride when spinning on the spot
     const MAX_SPIN_PER_STRIDE: f32 = 1.6;
+    /// How far (unscaled px) from the turning point a walking cat's paws are, on average, when it
+    /// turns about on the spot: sets how fast they step round
+    const PIVOT_STEP_REACH: f32 = 14.0;
     /// Highest stride frequency (strides/s) when moving forward; faster speeds lengthen the stride
     /// instead
-    const MAX_CADENCE: f32 = 4.2;
+    pub(crate) const MAX_CADENCE: f32 = 4.2;
     /// How close (unscaled px) the cursor may come to a roaming cat before it moves away
     const ROAM_FLEE_RADIUS: f32 = 110.0;
     /// How far (unscaled px) from the cursor a roaming cat prefers to wander to

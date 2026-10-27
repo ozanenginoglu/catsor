@@ -794,6 +794,63 @@ fn zoomies_gallop_and_spinning_paws_stay_planted() {
 }
 
 #[test]
+fn turning_about_on_the_spot_steps_round_instead_of_sliding() {
+    let start = Vec2::new(300.0, 300.0);
+    let dt = 1.0 / 120.0;
+    let mut cat = CatSim::new(start, 1.0, CoatStyle::Calico);
+    let ahead = start + Vec2::new(400.0, 0.0);
+    for _ in 0..240 {
+        cat.update(ahead, dt);
+    }
+    assert_eq!(cat.activity, Activity::Walking);
+    // The cursor jumps to just behind it: it turns about where it stands, walks over and stops.
+    // Planted paws stay put throughout, as the turn starts, while it lasts and as it ends.
+    let behind = cat.nodes[0] - Vec2::new(70.0, 0.0);
+    let mut prev_pos = cat.paws.map(|p| p.world_pos);
+    let mut prev_swing = cat.paws.map(|p| p.swing_progress);
+    let (mut turned, mut pivot_secs, mut pivot_steps) = (0.0, 0.0, 0);
+    let (mut slip, mut worst_slip, mut steps) = (0.0, 0.0_f32, 0);
+    for _ in 0..480 {
+        cat.update(behind, dt);
+        let pivoting = cat.activity == Activity::Walking && cat.pivot_blend() > 0.5;
+        if pivoting {
+            turned += cat.angular_vel.abs() * dt;
+            pivot_secs += dt;
+        }
+        if cat.gait_weight > 0.05 {
+            for i in 0..4 {
+                let swing = cat.paws[i].swing_progress;
+                if swing == 0.0 && prev_swing[i] == 0.0 {
+                    let d = cat.paws[i].world_pos.distance(prev_pos[i]);
+                    slip += d;
+                    worst_slip = worst_slip.max(d);
+                }
+                if swing > 0.0 && prev_swing[i] == 0.0 {
+                    steps += 1;
+                    pivot_steps += usize::from(pivoting);
+                }
+            }
+        }
+        prev_pos = cat.paws.map(|p| p.world_pos);
+        prev_swing = cat.paws.map(|p| p.swing_progress);
+    }
+    assert!(turned > 2.0, "turned only {turned} rad on the spot");
+    assert!(
+        pivot_steps >= 4,
+        "turned {turned:.1} rad in {pivot_steps} steps"
+    );
+    // Quick little steps, but no faster than it ever steps (4 paws a stride)
+    let cadence = pivot_steps as f32 / 4.0 / pivot_secs;
+    assert!(
+        cadence < CatSim::MAX_CADENCE * 1.15,
+        "stepped round at {cadence:.1} strides/s"
+    );
+    let per_step = slip / steps.max(1) as f32;
+    assert!(per_step < 2.0, "planted paws slid {per_step:.2}px per step");
+    assert!(worst_slip < 1.0, "a planted paw jumped {worst_slip:.2}px");
+}
+
+#[test]
 fn butt_wiggle_shifts_weight_a_few_times_per_second() {
     let start = Vec2::new(300.0, 300.0);
     let cursor = start + Vec2::new(150.0, 0.0);

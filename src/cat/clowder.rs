@@ -2649,6 +2649,30 @@ mod tests {
     }
 
     #[test]
+    fn six_strangers_get_round_to_sniffing_rather_than_circling_on() {
+        let names = ["Luna", "Milo", "Pip", "Mochi", "Nori", "Tofu"];
+        let profiles: Vec<_> = names.iter().map(|n| profile(n)).collect();
+        let cursor = Vec2::new(600.0, 400.0);
+        let mut group = clowder(&profiles, cursor);
+        let (mut longest, mut sniffs) = (0.0_f32, 0);
+        for _ in 0..(60.0 / DT) as usize {
+            group.update(cursor, DT);
+            for cat in group.cats() {
+                if let Some(e) = cat
+                    .social
+                    .filter(|e| e.kind == SocialKind::SniffCircle && !e.acting)
+                {
+                    longest = longest.max(e.timer);
+                }
+                sniffs += usize::from(matches!(cat.activity, Activity::Sniffing { .. }));
+            }
+        }
+        // Walking round each other's rear until giving up kept the whole group on its feet
+        assert!(longest < 10.0, "circled {longest:.0} s before sniffing");
+        assert!(sniffs > 0, "never sniffed");
+    }
+
+    #[test]
     fn friends_resting_together_groom_and_sleep_against_each_other() {
         let cursor = Vec2::new(600.0, 400.0);
         let friends = Bond {
@@ -2995,7 +3019,8 @@ mod tests {
                     duration: 1.8,
                 };
                 let mut zoomed = false;
-                // Joining in, not a fit of its own later on
+                // Joining in, not a fit of its own
+                group.members[1].cat.next_quirk_timer = 60.0;
                 for _ in 0..(1.0 / DT) as usize {
                     group.update(cursor, DT);
                     zoomed |= matches!(group.cat(1).activity, Activity::Zoomies { .. });

@@ -4,7 +4,8 @@
 //! together (`Engagement`). With no other cats none of this does anything.
 
 use super::{
-    Activity, CatSim, Engagement, Kinship, Neighbor, Pose, SocialKind, SocialRole, wrap_angle,
+    Activity, CatSim, Engagement, Kinship, Neighbor, Pose, SocialKind, SocialRole, dist_to_segment,
+    wrap_angle,
 };
 use glam::Vec2;
 
@@ -453,14 +454,18 @@ impl CatSim {
                 self.nodes[0].distance(p.head) < (Self::NOSE_GAP + 2.0) * s
             } else {
                 // A twitching tail tip is a moving target: near enough will do. Two cats sniffing
-                // each other's rear chase each other round, so a nose by the other's flank will do.
+                // each other's rear chase each other round, so a nose by the other's flank will
+                // do: anywhere along its hindquarters, but beside them, not right behind, where
+                // circling round would take it through the other cat.
                 let reach = if e.kind == SocialKind::TailStalk {
                     14.0
                 } else {
                     8.0
                 };
+                let across = (p.head - p.center).normalize_or(Vec2::X).perp();
                 let sniffing = e.kind == SocialKind::SniffCircle
-                    && self.nodes[0].distance(p.center) < 18.0 * s;
+                    && dist_to_segment(self.nodes[0], p.center, p.rump) < 18.0 * s
+                    && (self.nodes[0] - p.center).dot(across).abs() > Self::SNIFF_FLANK * s;
                 sniffing
                     || self
                         .social_target()

@@ -1420,7 +1420,7 @@ impl CatSim {
     /// Advances the normalized gait cycle [0, 1) in proportion to the ground covered, so each
     /// planted paw's stance sweep matches how far the body travels over it.
     fn advance_gait_cycle(&mut self, dt: f32) {
-        self.gait_cycle = (self.gait_cycle + self.speed / self.stride_length() * dt).fract();
+        self.gait_cycle = (self.gait_cycle + self.step_speed() / self.stride_length() * dt).fract();
     }
 
     /// Pre-pounce crouch. `timer` already includes this tick.
@@ -1516,15 +1516,20 @@ impl CatSim {
         let radius = 30.0 * self.scale;
         let target = center + Vec2::new(phase.cos() * radius, (phase * 2.0).sin() * radius * 0.55);
         let to_z = target - self.nodes[0];
+        let mut crowded = 0.0;
         if to_z.length_squared() > 1.0 {
-            // Tearing round, but not through another cat
-            let (to_z, _) = self.steer_clear(to_z.normalize(), f32::INFINITY);
-            let desired_angle = to_z.y.atan2(to_z.x);
+            // Tearing round, but not through another cat, and checking for one in the way
+            let clear;
+            (clear, crowded) = self.steer_clear(to_z.normalize(), f32::INFINITY);
+            let desired_angle = clear.y.atan2(clear.x);
             let diff = wrap_angle(desired_angle - self.body_angle);
             self.body_angle = wrap_angle(self.body_angle + diff * dt * 14.0);
             self.angular_vel = diff * 6.0;
         }
-        self.speed = 175.0 * self.scale;
+        // Off flat out from the first stride, easing off only for a cat in the way
+        let top_speed = 175.0 * self.scale * (1.0 - Self::AVOID_BRAKE * crowded);
+        let rate = if top_speed > self.speed { 30.0 } else { 12.0 };
+        self.speed += (top_speed - self.speed) * (1.0 - (-dt * rate).exp());
         self.nodes[0] += Vec2::from_angle(self.body_angle) * (self.speed * dt);
         // Zoomies are a flat-out gallop, not a trot
         self.gallop_weight += (1.0 - self.gallop_weight) * (1.0 - (-dt * 12.0).exp());
@@ -1659,6 +1664,7 @@ impl CatSim {
         } else if !matches!(self.activity, Activity::Zoomies { .. }) {
             self.gallop_weight *= (-dt * 10.0).exp();
         }
+        self.ease_pivot_sweep(dt);
     }
 
     fn steer_walk(&mut self, steer: &Steering, tuning: &TemperamentTuning, dt: f32) {
@@ -1690,7 +1696,13 @@ impl CatSim {
             1.0 + ((90.0 * self.scale - dist_to_target).max(0.0) / (90.0 * self.scale)) * 0.65;
         let base_turn = if racing { 10.5 } else { 5.6 };
         let turn_gain = if racing { 13.5 } else { 7.5 };
-        let max_turn_rate = base_turn * proximity_boost;
+        // Turning about faster than its paws can step round would sweep them along the ground,
+        // so a slow cat turns at most as fast as quick little steps allow; moving on, the
+        // stride carries the turn
+        let max_turn_rate = (base_turn * proximity_boost).min(
+            (Self::MAX_CADENCE * Self::MAX_SPIN_PER_STRIDE)
+                .max(self.speed / (Self::PIVOT_STEP_REACH * self.scale)),
+        );
         let desired_turn =
             (angle_err * turn_gain * proximity_boost).clamp(-max_turn_rate, max_turn_rate);
         let turn_smooth = 1.0 - (-dt * if racing { 18.0 } else { 14.0 }).exp();
@@ -1762,7 +1774,8 @@ impl CatSim {
 
         // Smooth S-curve speed envelope: keeps full lively sway during normal walks (>60 px/s)
         // while tapering smoothly down as the cat decelerates to a stop (<45 px/s)
-        let speed_norm = (self.speed / (78.0 * self.scale)).clamp(0.0, 1.0);
+        // Turning about on the spot steps too
+        let speed_norm = (self.step_speed() / (78.0 * self.scale)).clamp(0.0, 1.0);
         let target_gait_weight = smoothstep(speed_norm);
         let gw_rate = if target_gait_weight < self.gait_weight {
             12.0

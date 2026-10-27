@@ -126,18 +126,63 @@ impl CatSim {
     /// (down to half length as `gait_weight` fades). Both the gait cycle and the paw sweep use it,
     /// so planted paws stay put while the cat starts, stops or changes gait.
     pub(super) fn stride_length(&self) -> f32 {
-        let v = self.speed / self.scale;
+        let speed = self.step_speed();
+        let stride = self.forward_stride_length();
+        let pivot = self.pivot_blend();
+        if pivot > 0.0 && self.angular_vel.abs() > 0.1 {
+            // Spinning on the spot takes quick little steps: the body turns at most
+            // `MAX_SPIN_PER_STRIDE` per stride, so a planted paw isn't swept round with it
+            let spin_stride =
+                stride.min(speed * Self::MAX_SPIN_PER_STRIDE / self.angular_vel.abs());
+            stride + (spin_stride - stride) * pivot
+        } else {
+            stride
+        }
+    }
+
+    /// `stride_length` without the quick little steps of turning on the spot, which sets how
+    /// far a leg can reach
+    fn forward_stride_length(&self) -> f32 {
+        let speed = self.step_speed();
+        let v = speed / self.scale;
         let walk = 30.0 + 0.155 * v;
         let gallop = 40.0 + 0.16 * v;
         let stride = (walk + (gallop - walk) * self.gallop_weight) * self.scale;
         let step_scale = 0.5 + 0.5 * self.gait_weight.clamp(0.0, 1.0);
-        let mut stride = (stride * step_scale).max(self.speed / Self::MAX_CADENCE);
-        if self.activity.is_spinning() && self.angular_vel.abs() > 0.1 {
-            // Spinning on the spot takes quick little steps: the body turns at most
-            // `MAX_SPIN_PER_STRIDE` per stride, so a planted paw isn't swept round with it
-            stride = stride.min(self.speed * Self::MAX_SPIN_PER_STRIDE / self.angular_vel.abs());
+        (stride * step_scale).max(speed / Self::MAX_CADENCE)
+    }
+
+    /// How much the body is turning round on the spot rather than going forward (0–1), so the
+    /// paws step round with it and the spine follows the turn: 1 for spinning activities, and
+    /// for a walking cat, eased in as its turn outpaces its forward speed and out again as it
+    /// sets off or stops
+    pub(super) fn pivot_blend(&self) -> f32 {
+        if self.activity.is_spinning() {
+            return if self.angular_vel.abs() > 0.1 {
+                1.0
+            } else {
+                0.0
+            };
         }
-        stride
+        let share = self.pivot_sweep / (self.pivot_sweep + self.speed).max(1e-3);
+        smoothstep((share - 0.35) / 0.3)
+    }
+
+    /// How fast the paws have to step (px/s): the forward speed, or how fast a walking cat's
+    /// turn on the spot sweeps its legs round, whichever is more
+    pub(super) fn step_speed(&self) -> f32 {
+        self.speed.max(self.pivot_sweep)
+    }
+
+    /// Eases `pivot_sweep` toward how fast the turn now sweeps a walking cat's legs round (none
+    /// once it stops walking), so a turn on the spot fades out instead of stopping dead
+    pub(super) fn ease_pivot_sweep(&mut self, dt: f32) {
+        let sweep = if self.activity == Activity::Walking {
+            self.angular_vel.abs() * Self::PIVOT_STEP_REACH * self.scale
+        } else {
+            0.0
+        };
+        self.pivot_sweep += (sweep - self.pivot_sweep) * (1.0 - (-dt * 10.0).exp());
     }
 
     #[inline]
@@ -198,6 +243,8 @@ impl CatSim {
                 let gallop_suppress = 1.0 - 0.85 * self.gallop_weight;
                 let sw =
                     self.gait_weight.min(speed_env) * (1.0 - 0.22 * trot_blend) * gallop_suppress;
+                // Turning about on the spot sways like spinning, with the legs stepping round
+                let sw = sw + (self.gait_weight * 0.40 - sw) * self.pivot_blend();
                 (sw, 1.5 + speed_norm * 6.0 + self.gallop_weight * 6.0)
             }
             Activity::Zoomies { .. } => (
@@ -207,7 +254,15 @@ impl CatSim {
             _ if self.activity.is_spinning() => (self.gait_weight * 0.40, 0.0),
             _ => (0.0, 7.5),
         };
-        let spinning = self.activity.is_spinning();
+        // How much the spine follows the head round a turn on the spot rather than straightening
+        // out behind it: fully while spinning, and as much as a walking cat turns about
+        let pivot = if self.activity.is_spinning() {
+            1.0
+        } else if self.activity == Activity::Walking {
+            self.pivot_blend()
+        } else {
+            0.0
+        };
 
         if self.nodes[0].distance_squared(self.carrier_nodes[0]) > (24.0 * self.scale).powi(2) {
             self.carrier_nodes
@@ -233,11 +288,8 @@ impl CatSim {
             } else {
                 0.35
             };
-            let align_decay = if spinning {
-                1.0
-            } else {
-                (-dt * align_rate).exp()
-            };
+            let walk_decay = (-dt * align_rate).exp();
+            let align_decay = walk_decay + (1.0 - walk_decay) * pivot;
             let raw_diff =
                 wrap_angle(seg_angle - prev_carrier_angle) * align_decay + self.curl_amount * 0.35;
             let diff = raw_diff.clamp(-max_bend, max_bend);
@@ -252,11 +304,7 @@ impl CatSim {
         // 2. Superimpose exact biomechanical feline spinal S-wave onto the carrier spine
         let forward = Vec2::from_angle(self.body_angle);
         let side = Vec2::new(-forward.y, forward.x);
-        let head_bob = if spinning {
-            0.0
-        } else {
-            phase_rad.sin() * 0.32 * self.scale * sway_weight
-        };
+        let head_bob = phase_rad.sin() * 0.32 * self.scale * sway_weight * (1.0 - pivot);
         self.prev_head_offset = side * head_bob;
         self.nodes[0] = self.carrier_nodes[0] + self.prev_head_offset;
         for i in 1..BODY_NODES {
@@ -651,14 +699,18 @@ impl CatSim {
         let half_sweep = 0.5 * (1.0 - swing_window) * stride;
         // Safety clamp sized for the longest stance of any gait, so a stance that started in a
         // slower gait isn't cut short while the swing fraction slides toward a faster one
-        let mut max_reach =
-            (1.0 - Gait::Walk.pattern().1) * stride * Self::HIND_LEAD_SHARE * 1.3 + 2.0 * s;
+        let mut max_reach = (1.0 - Gait::Walk.pattern().1)
+            * self.forward_stride_length()
+            * Self::HIND_LEAD_SHARE
+            * 1.3
+            + 2.0 * s;
 
         // When spinning on the spot, each socket moves at its own speed and direction, so each paw
         // lands half a stance ahead along its own socket's path instead of straight ahead
-        let spinning = self.activity.is_spinning();
-        let half_stance_secs = if self.speed > 1.0 {
-            0.5 * (1.0 - swing_window) * stride / self.speed
+        let pivot = self.pivot_blend();
+        let step_speed = self.step_speed();
+        let half_stance_secs = if step_speed > 1.0 {
+            0.5 * (1.0 - swing_window) * stride / step_speed
         } else {
             0.0
         };
@@ -674,15 +726,13 @@ impl CatSim {
             };
             paw.prev_socket = sockets[i];
             paw.socket_vel += (vel - paw.socket_vel) * vel_rate;
-            leads[i] = if spinning {
-                paw.socket_vel * half_stance_secs
-            } else {
-                // A hind paw lands well ahead under the belly and pushes off only a little behind
-                // the haunch; a forepaw sweeps evenly about its shoulder
-                let share = if i >= 2 { Self::HIND_LEAD_SHARE } else { 0.5 };
-                forwards[i] * (2.0 * half_sweep * share)
-            };
-            if spinning {
+            // A hind paw lands well ahead under the belly and pushes off only a little behind
+            // the haunch; a forepaw sweeps evenly about its shoulder. Turning on the spot, it
+            // lands along its socket's path, blending between the two as a turn starts or ends.
+            let share = if i >= 2 { Self::HIND_LEAD_SHARE } else { 0.5 };
+            let ahead = forwards[i] * (2.0 * half_sweep * share);
+            leads[i] = ahead.lerp(paw.socket_vel * half_stance_secs, pivot);
+            if pivot > 0.0 {
                 max_reach = max_reach.max(leads[i].length() * 1.3 + 2.0 * s);
             }
         }
