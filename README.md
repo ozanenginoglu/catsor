@@ -1,10 +1,10 @@
 # Catsor
 
-A small cat that lives on your desktop. It's drawn from above, animated procedurally, and wanders after your mouse cursor. It sits, grooms, flops over, falls asleep, pounces when you wiggle the cursor like a laser pointer, and sprints when you shake the mouse. You can also feed it, which keeps your screen awake.
+A small cat that lives on your desktop. It's drawn from above, animated procedurally, and wanders after your mouse cursor. It sits, grooms, flops over, falls asleep, pounces when you wiggle the cursor like a laser pointer, and sprints when you shake the mouse. You can also feed it, which keeps your screen awake, and give it company: more cats, or kittens of its own that chase, wrestle and get carried back by the scruff.
 
 Runs on **Linux (X11)** and **Windows**. It's a single binary written in Rust, with no GUI toolkit.
 
-![Demo: the cat walks over to the cursor and sits, stalks and pounces when the cursor is flicked like a laser dot, and gallops over after a left-right mouse shake](docs/demo.gif)
+![Demo: a calico mother and her two kittens follow the cursor across the screen and sit round it; a kitten chases its tail, one kitten stalks and pounces when the cursor is flicked like a laser dot while the others watch, all three gallop over after a left-right mouse shake, and the mother grooms a kitten](docs/demo.gif)
 
 ### Coats and poses
 

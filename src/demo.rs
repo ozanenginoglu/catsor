@@ -1,11 +1,13 @@
-//! Renders the README demo GIF (`docs/demo.gif`): a scripted, human-like cursor drives the real
-//! `CatSim`, and each frame is drawn on a white background with a mouse pointer on top.
+//! Renders the README demo GIF (`docs/demo.gif`): a scripted, human-like cursor drives a real
+//! `Clowder` of a mother cat and her two kittens, and each frame is drawn on a white background
+//! with a mouse pointer on top.
 //!
 //! `cargo test regenerate_demo_gif -- --ignored --nocapture` (needs `ffmpeg` on `PATH`)
 
-use crate::cat::{Activity, CatSim, smoothstep};
-use crate::coat::CoatStyle;
-use crate::render::{cat_window_dim, render_cat};
+use crate::cat::clowder::{CatProfile, Clowder, KITTEN_SIZE};
+use crate::cat::{Activity, CatSim, Temperament, smoothstep};
+use crate::coat::{CoatId, CoatLibrary};
+use crate::render::{cat_window_dim, render_cats};
 use glam::Vec2;
 use std::f32::consts::TAU;
 use std::path::Path;
@@ -16,11 +18,11 @@ use tiny_skia::{
 
 const WIDTH: u32 = 960;
 const HEIGHT: u32 = 540;
-const SCALE: f32 = 1.8;
+const SCALE: f32 = 1.4;
 const SIM_HZ: f32 = 60.0;
 const GIF_FPS: u32 = 30;
 /// Simulated seconds before the first recorded frame, so the cat starts out settled
-const PRE_ROLL: f32 = 6.0;
+const PRE_ROLL: f32 = 8.0;
 
 /// One piece of the scripted cursor path. Every move is a deliberate pointing motion.
 enum Gesture {
@@ -30,8 +32,8 @@ enum Gesture {
     /// (smooth start, smooth stop), undershooting slightly and finishing with a small correction,
     /// like a real aimed hand movement
     Move { to: Vec2, secs: f32, bend: f32 },
-    /// Teasing the cat like a laser dot: an aimed move out to `dist` px (unscaled) in front of
-    /// its face, then flicking the pointer side to side. Aimed relative to where the cat is, as
+    /// Teasing the mother like a laser dot: an aimed move out to `dist` px (unscaled) in front
+    /// of her face, then flicking the pointer side to side. Aimed relative to where the cat is, as
     /// a person would
     Tease {
         secs: f32,
@@ -178,24 +180,61 @@ fn draw_pointer(frame: &mut Pixmap, tip: Vec2) {
     frame.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
 }
 
-fn render_frame(cat: &CatSim, cursor: Vec2, frame: &mut Pixmap, sub: &mut Pixmap, mask: &mut Mask) {
+/// Draws the frame and returns how many pixels show one cat's body drawn over another's
+fn render_frame(clowder: &Clowder, cursor: Vec2, frame: &mut Pixmap, mask: &mut Mask) -> usize {
     frame.fill(Color::WHITE);
-    let origin = (cat.window_center() - Vec2::splat(sub.width() as f32 * 0.5)).round();
-    render_cat(cat, &mut sub.as_mut(), mask, origin);
-    frame.draw_pixmap(
-        origin.x as i32,
-        origin.y as i32,
-        sub.as_ref(),
-        &PixmapPaint::default(),
-        Transform::identity(),
-        None,
-    );
+    let mut covered = vec![false; (WIDTH * HEIGHT) as usize];
+    let mut overlap = 0;
+    for (i, cat) in clowder.cats().enumerate() {
+        let dim = cat_window_dim(cat.scale) as u32;
+        let mut sub = Pixmap::new(dim, dim).unwrap();
+        if mask.width() != dim {
+            *mask = Mask::new(dim, dim).unwrap();
+        }
+        let origin = (cat.window_center() - Vec2::splat(dim as f32 * 0.5)).round();
+        render_cats(clowder.drawn_in(i), &mut sub.as_mut(), mask, origin);
+        // Only solid fur counts, not the soft shadows
+        for (k, px) in sub.pixels().iter().enumerate() {
+            let x = origin.x as i64 + (k as u32 % dim) as i64;
+            let y = origin.y as i64 + (k as u32 / dim) as i64;
+            if px.alpha() < 200
+                || !(0..WIDTH as i64).contains(&x)
+                || !(0..HEIGHT as i64).contains(&y)
+            {
+                continue;
+            }
+            let c = &mut covered[(y * WIDTH as i64 + x) as usize];
+            overlap += *c as usize;
+            *c = true;
+        }
+        frame.draw_pixmap(
+            origin.x as i32,
+            origin.y as i32,
+            sub.as_ref(),
+            &PixmapPaint::default(),
+            Transform::identity(),
+            None,
+        );
+    }
     draw_pointer(frame, cursor);
+    overlap
 }
 
 fn activity_name(a: &Activity) -> String {
     let s = format!("{a:?}");
     s.split([' ', '{']).next().unwrap_or_default().to_string()
+}
+
+fn describe(clowder: &Clowder, i: usize) -> String {
+    let cat = clowder.cat(i);
+    let mut s = activity_name(&cat.activity);
+    if cat.sprinting {
+        s += " (sprint)";
+    }
+    if let Some(e) = cat.social {
+        s += &format!(" [{:?}]", e.kind);
+    }
+    s
 }
 
 #[test]
@@ -204,33 +243,33 @@ fn regenerate_demo_gif() {
     use Gesture::*;
     let v = Vec2::new;
 
-    let home = v(250.0, 190.0);
+    let home = v(250.0, 200.0);
     let script = [
         Hold(1.6),
-        // Over to the right: the cat gets up and walks across
+        // Over to the right: the mother gets up and walks across, the kittens trotting after
         Move {
-            to: v(640.0, 330.0),
+            to: v(640.0, 320.0),
             secs: 0.9,
             bend: 0.10,
         },
-        Hold(6.2),
-        // Point a little way off and flick the pointer like a laser dot: the cat gets up,
-        // crouches, wiggles its rear and pounces
+        Hold(7.0),
+        // Point a little way off the mother and flick the pointer like a laser dot: one cat
+        // crouches, wiggles its rear and pounces while the others watch
         Tease {
-            secs: 1.9,
+            secs: 2.0,
             amp: 14.0,
             hz: 4.5,
             dist: 135.0,
         },
         Hold(0.4),
-        // The "dot" escapes a little, then rests while the cat recovers
+        // The "dot" escapes a little, then rests while they recover
         Move {
-            to: v(700.0, 460.0),
+            to: v(690.0, 430.0),
             secs: 0.5,
             bend: -0.15,
         },
-        Hold(4.0),
-        // Far away, then a quick left-right shake: the cat gallops over
+        Hold(4.5),
+        // Far away, then a quick left-right shake: they all gallop over
         Move {
             to: home,
             secs: 0.85,
@@ -245,12 +284,37 @@ fn regenerate_demo_gif() {
         Hold(5.0),
     ];
 
+    let profile = |name: &str, coat: &str, temperament| {
+        CatProfile::new(name, CoatId::parse(coat).unwrap(), temperament)
+    };
+    let kitten = |name: &str, coat: &str| CatProfile {
+        size: KITTEN_SIZE,
+        kitten: true,
+        mother: Some("Luna".into()),
+        ..profile(name, coat, Temperament::Playful)
+    };
+    let profiles = [
+        profile("Luna", "calico", Temperament::Balanced),
+        kitten("Pip", "litter:00c0ffee:calico"),
+        kitten("Miso", "litter:5eed1e55:calico"),
+    ];
+    let mut clowder = Clowder::new(
+        &profiles,
+        SCALE,
+        true,
+        true,
+        &CoatLibrary::from_toml(""),
+        home + v(60.0, 40.0),
+    );
+    let bounds = (v(0.0, 0.0), v(WIDTH as f32, HEIGHT as f32));
     let dt = 1.0 / SIM_HZ;
-    let mut cat = CatSim::new(home + v(60.0, 40.0), SCALE, CoatStyle::Calico);
-    // Pre-roll with the pointer resting where the GIF starts, so the cat sits beside it
+    // Pre-roll with the pointer resting where the GIF starts, so the cats settle beside it
     let mut pre = 0.0;
     while pre < PRE_ROLL {
-        cat.update(home, dt);
+        for cat in clowder.cats_mut() {
+            cat.roam_bounds = Some(bounds);
+        }
+        clowder.update(home, dt);
         pre += dt;
     }
 
@@ -258,30 +322,37 @@ fn regenerate_demo_gif() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
-    let dim = cat_window_dim(SCALE) as u32;
-    let mut sub = Pixmap::new(dim, dim).unwrap();
-    let mut mask = Mask::new(dim, dim).unwrap();
+    let mut mask = Mask::new(1, 1).unwrap();
     let mut frame = Pixmap::new(WIDTH, HEIGHT).unwrap();
     let every = (SIM_HZ as u32 / GIF_FPS) as usize;
-    let mut last = String::new();
+    let mut last = vec![String::new(); clowder.len()];
     let mut cursor = home;
     let mut step = 0;
+    let mut overlapping = 0;
     for gesture in &script {
-        for p in gesture_track(gesture, cursor, &cat) {
+        for p in gesture_track(gesture, cursor, clowder.cat(0)) {
             cursor = p;
-            cat.update(cursor, dt);
-            let name = activity_name(&cat.activity) + if cat.sprinting { " (sprint)" } else { "" };
-            if name != last {
-                let dist = cursor.distance(cat.nodes[0]) / SCALE;
-                println!(
-                    "{:6.2}s  {name}  cursor {dist:.0} px from head, excitement {:.2}",
-                    step as f32 * dt,
-                    cat.play_excitement
-                );
-                last = name;
+            for cat in clowder.cats_mut() {
+                cat.roam_bounds = Some(bounds);
+            }
+            clowder.update(cursor, dt);
+            for (i, last) in last.iter_mut().enumerate() {
+                let name = describe(&clowder, i);
+                if name != *last {
+                    let cat = clowder.cat(i);
+                    let dist = cursor.distance(cat.nodes[0]) / SCALE;
+                    println!(
+                        "{:6.2}s  {:5} {name}  cursor {dist:.0} px from head",
+                        step as f32 * dt,
+                        clowder.members()[i].name,
+                    );
+                    *last = name;
+                }
             }
             if step % every == 0 {
-                render_frame(&cat, cursor, &mut frame, &mut sub, &mut mask);
+                if render_frame(&clowder, cursor, &mut frame, &mut mask) > 0 {
+                    overlapping += 1;
+                }
                 frame
                     .save_png(dir.join(format!("{:05}.png", step / every)))
                     .unwrap();
@@ -289,6 +360,12 @@ fn regenerate_demo_gif() {
             step += 1;
         }
     }
+    // Cats drawn over each other are hard to follow; pick names, coats or a script that keep
+    // this low
+    println!(
+        "{overlapping} of {} frames show cats overlapping",
+        step / every
+    );
 
     let out = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/demo.gif");
     let status = Command::new("ffmpeg")

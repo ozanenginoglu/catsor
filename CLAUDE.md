@@ -24,7 +24,7 @@ cargo run -- --preview-sheet /tmp/sheet.png --scale 1.5
 cargo run -- --preview-sheet /tmp/sheet.png --coat random:00c0ffee   # one coat (built-in, custom or random) in every cell
 cargo run -- --coat tuxedo --print-coat                                # a coat as a coats.toml entry
 
-# Regenerate the README images: the coats-and-poses sheet, and the demo GIF (scripted human-like cursor driving CatSim; needs ffmpeg)
+# Regenerate the README images: the coats-and-poses sheet, and the demo GIF (scripted human-like cursor driving a Clowder of a mother and two kittens; needs ffmpeg)
 cargo run -- --preview-sheet docs/preview.png --scale 1.5
 cargo test regenerate_demo_gif -- --ignored --nocapture
 
