@@ -1780,3 +1780,167 @@ fn ordinary_pointing_near_the_cat_never_starts_a_stalk() {
         );
     }
 }
+
+/// A cat that has walked up to `cursor` and settled there
+fn settled_cat(cursor: Vec2, kitten: bool) -> CatSim {
+    let mut cat = CatSim::new(cursor, if kitten { 0.6 } else { 1.0 }, CoatStyle::Calico);
+    cat.kitten = kitten;
+    for _ in 0..(60 * 6) {
+        cat.update(cursor, 1.0 / 60.0);
+    }
+    cat
+}
+
+fn friend(mut n: Neighbor) -> Neighbor {
+    n.familiarity = 0.8;
+    n.affection = 0.6;
+    n
+}
+
+#[test]
+fn a_resting_cat_watches_another_cat_walk_past() {
+    let start = Vec2::new(500.0, 500.0);
+    let mut cat = settled_cat(start, false);
+    let head = cat.nodes[0];
+    let ahead = Vec2::from_angle(cat.body_angle);
+    let across = ahead.perp();
+    let (mut sampled, mut watching) = (0, 0);
+    for frame in 0..240 {
+        let t = frame as f32 / 60.0;
+        let other = head + ahead * 90.0 + across * (-120.0 + 60.0 * t);
+        cat.neighbors = vec![Neighbor {
+            speed: 60.0,
+            pose: Pose::Moving,
+            ..Neighbor::at(other, across.to_angle(), 1.0)
+        }];
+        cat.update(start, 1.0 / 60.0);
+        if t > 0.5 && matches!(cat.activity, Activity::Sitting | Activity::Lying) {
+            sampled += 1;
+            let to_other = (other - cat.nodes[0]).to_angle();
+            if wrap_angle(cat.body_angle + cat.head_yaw - to_other).abs() < 0.35 {
+                watching += 1;
+            }
+        }
+    }
+    assert!(sampled > 30, "only {sampled} calm frames");
+    assert!(
+        watching * 10 >= sampled * 8,
+        "watched the passing cat in {watching} of {sampled} frames"
+    );
+}
+
+#[test]
+fn a_cat_racing_past_wakes_a_sleeper_partway() {
+    let start = Vec2::new(500.0, 500.0);
+    let mut cat = settled_cat(start, false);
+    cat.trigger(TriggerKind::Sleep);
+    let body = cat.body_point();
+    let pass = |cat: &mut CatSim, pose: Pose| {
+        for frame in 0..60 {
+            let other = body + Vec2::new(-90.0 + 3.0 * frame as f32, 30.0);
+            cat.neighbors = vec![Neighbor {
+                speed: 180.0,
+                pose,
+                ..Neighbor::at(other, 0.0, 1.0)
+            }];
+            cat.update(start, 1.0 / 60.0);
+        }
+        cat.neighbors.clear();
+    };
+    pass(&mut cat, Pose::Moving);
+    assert_eq!(
+        cat.activity,
+        Activity::Sleeping,
+        "a cat walking by doesn't wake it"
+    );
+    pass(&mut cat, Pose::Racing);
+    assert_eq!(
+        cat.activity,
+        Activity::Lying,
+        "a galloping cat does, halfway"
+    );
+    // ...and it dozes off again
+    for _ in 0..(60 * 30) {
+        cat.update(start, 1.0 / 60.0);
+    }
+    assert_eq!(cat.activity, Activity::Sleeping);
+}
+
+#[test]
+fn a_friend_lying_nearby_makes_a_cat_drowsy() {
+    let start = Vec2::new(500.0, 500.0);
+    let time_to_lie_down = |with_friend: bool| {
+        let mut cat = CatSim::new(start, 1.0, CoatStyle::Calico);
+        for frame in 0..(60 * 40) {
+            if with_friend {
+                let spot = cat.nodes[0] + Vec2::new(0.0, 70.0);
+                cat.neighbors = vec![friend(Neighbor {
+                    pose: Pose::Sleeping,
+                    ..Neighbor::at(spot, 0.0, 1.0)
+                })];
+            }
+            cat.update(start, 1.0 / 60.0);
+            if matches!(
+                cat.activity,
+                Activity::Lying | Activity::DramaticFlop { .. } | Activity::BellyUp { .. }
+            ) {
+                return frame as f32 / 60.0;
+            }
+        }
+        f32::INFINITY
+    };
+    let alone = time_to_lie_down(false);
+    let together = time_to_lie_down(true);
+    assert!(
+        together + 2.0 < alone,
+        "lay down after {together:.1} s next to a friend, {alone:.1} s alone"
+    );
+}
+
+#[test]
+fn a_cat_raises_its_tail_walking_up_to_a_friend_and_holds_it_still_near_a_foe() {
+    let start = Vec2::new(300.0, 500.0);
+    let walk_past = |other: Neighbor| {
+        let mut cat = CatSim::new(start, 1.0, CoatStyle::Calico);
+        let (mut raised, mut still) = (0.0f32, 0.0f32);
+        let spot = start + Vec2::new(180.0, 50.0);
+        for _ in 0..(60 * 4) {
+            cat.neighbors = vec![Neighbor {
+                pose: Pose::Sitting,
+                ..other
+            }];
+            cat.neighbors[0].head = spot;
+            cat.update(start + Vec2::new(400.0, 0.0), 1.0 / 60.0);
+            raised = raised.max(cat.tail_raise);
+            still = still.max(cat.tail_still);
+        }
+        (raised, still)
+    };
+    let stranger = Neighbor::at(Vec2::ZERO, 0.0, 1.0);
+    assert_eq!(walk_past(stranger), (0.0, 0.0));
+    let (raised, _) = walk_past(friend(stranger));
+    assert!(raised > 0.6, "tail up to {raised} for a friend");
+    let (raised, still) = walk_past(Neighbor {
+        affection: -0.5,
+        ..stranger
+    });
+    assert!(
+        raised == 0.0 && still > 0.6,
+        "tail held still ({still}) near a foe"
+    );
+}
+
+#[test]
+fn a_kitten_naps_and_wakes_by_itself() {
+    let start = Vec2::new(500.0, 500.0);
+    for kitten in [false, true] {
+        let mut cat = settled_cat(start, kitten);
+        cat.trigger(TriggerKind::Sleep);
+        let mut woke = false;
+        for _ in 0..(60 * 80) {
+            cat.update(start, 1.0 / 60.0);
+            woke |= cat.activity != Activity::Sleeping;
+        }
+        assert_eq!(woke, kitten, "kitten: {kitten}");
+    }
+}

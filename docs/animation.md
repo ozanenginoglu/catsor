@@ -107,11 +107,13 @@ Each tail segment chases a target angle. The follow rate is 16/s at the base and
 - extra noise and a hook at the tip,
 - while Sitting, Grooming or AloofNotice, a **sitting wrap** (`sit_tail_wrap`, eases in over ~1 s): extra bend per segment (`SIT_TAIL_WRAP`) turns the tail sideways off the rump, runs it forward along the flank and hooks it in toward the front paws. Only the tip keeps flicking. It unwraps quickly when the cat moves or turns.
 
+- while greeting a friend (or for a kitten on the move), a **raised tail** (`tail_raise`, 0–1): seen from above, each segment is foreshortened by up to `TAIL_RAISE_FORESHORTEN` (most at the upright base) and the tip hooks to the curl side by `TAIL_RAISE_HOOK`; the sway is cut by up to 60%. Near a cat it dislikes, `tail_still` cuts the sway by up to 70%. See [behavior.md](behavior.md#what-each-cat-sees-of-the-others).
+
 The tail is always drawn **under** the body and head, so it never covers the face. It shares the body's outline, so no line separates it from the rump.
 
 ### Head & ears
 
-`update_head_and_ears` sets `head_yaw` per activity. Normally the head follows the cursor up to `MAX_HEAD_YAW` (1.4 rad, ~80°) to either side. It stays within about ±0.6 rad during PawBatting, StalkWiggle and Pouncing. If the cursor goes more than ~100° behind a sitting cat, the cat shuffles round on the spot to face it (`SIT_TURN_RATE`, 1.8 rad/s, pivoting around its torso) instead of standing up. It looks back toward the tail while chasing it, tucks around (2.38 rad × curl side) when sleeping, and bobs into the bowl while eating. The ears are separate angles. Negative is flattened back ("airplane ears": stalking, zoomies) and positive is pricked forward.
+`update_head_and_ears` sets `head_yaw` per activity. Normally the head follows the cursor up to `MAX_HEAD_YAW` (1.4 rad, ~80°) to either side. When the cursor is still and near (so it holds little attention) and the cat is watching another cat, the head turns 80% of the way toward that cat instead, and the idle wander makes up the rest. It stays within about ±0.6 rad during PawBatting, StalkWiggle and Pouncing. If the cursor goes more than ~100° behind a sitting cat, the cat shuffles round on the spot to face it (`SIT_TURN_RATE`, 1.8 rad/s, pivoting around its torso) instead of standing up. It looks back toward the tail while chasing it, tucks around (2.38 rad × curl side) when sleeping, and bobs into the bowl while eating. The ears are separate angles. Negative is flattened back ("airplane ears": stalking, zoomies) and positive is pricked forward.
 
 ## Rendering (`render.rs`)
 

@@ -1,6 +1,6 @@
 # Multiple cats (design)
 
-Status: **phase 1 is implemented** (multiple cats, slots, shared bowl, per-cat tray pages; see `behavior.md` → "Several cats" and "Sharing the bowl"). Phases 2–5 are still a proposal. When a phase lands, move what it settles into `behavior.md` / `animation.md` / `platform-notes.md` and trim it from here.
+Status: **phases 1 and 2 are implemented** (multiple cats, slots, shared bowl, per-cat tray pages; awareness, kitten tuning, the leash, fetching and bonds; see `behavior.md` → "Several cats", "Sharing the bowl", "Kittens" and "Bonds"). Phases 3–5 are still a proposal. When a phase lands, move what it settles into `behavior.md` / `animation.md` / `platform-notes.md` and trim it from here.
 
 Catsor today runs exactly one `CatSim` in one overlay window. This design covers two things: running several cats at once, and making them aware of each other: greeting, grooming, playing, squabbling, and mother cats raising kittens.
 
@@ -57,7 +57,7 @@ Kitten tuning (on top of temperament, which they still have; default Playful):
 All cats follow. Instead of one `rest_target` per cat at `stop_radius` from the cursor, the `Clowder` (see Architecture) hands out **rest slots** on an arc around the cursor:
 
 - Slots are spaced by body size and assigned by approach angle, so cats don't cross paths to reach them. Assignments are sticky, so they don't swap every frame.
-- A kitten's slot is next to its mother's (phase 2; phase 1 assigns grown cats first, then kittens, with no pairing).
+- A kitten's slot is next to its mother's. *(Not done: kittens take their own slots after the grown cats; the leash keeps them within reach of their mother.)*
 - Temperament keeps working per cat: an Aloof cat can still hang back or take its AloofNotice pause, and a Lazy cat may stay asleep while the others move.
 - **Spacing:** separation steering while walking, plus a personal-space radius by temperament (Aloof large, Playful small, kitten↔mother almost zero). Cats only overlap during joint activities.
 - **Laser wiggle:** every cat in range gets excited, but only one gets to pounce on the cursor. The losers sit and flick their tails, or pounce on the winner's tail.
@@ -105,7 +105,7 @@ These are in roughly ascending cost. Each is a new `Activity` variant (or a role
 ## Mother and kitten
 
 - **Leash:** the kitten follows the cursor but stays within a leash radius of its mother. If she's too far, it trots over to her first, tail up.
-- **Watching over:** the mother tracks her kitten with her head while resting. If it strays past a larger radius, she gets up and fetches it (walks to it, nose boop, walks back with it following).
+- **Watching over:** the mother tracks her kitten with her head while resting. If it strays past a larger radius, she gets up and fetches it (walks to it, nose boop, walks back with it following). *(Done without the nose boop, which comes with the greetings in phase 3.)*
 - **Carrying by the scruff** (stretch goal): if the kitten is very far, or asleep away from her, she picks it up by the scruff and carries it back. The kitten hangs limp from her mouth, with its chain anchored to her head node. This needs special handling for the render order and windows.
 - **Grooming:** the mother grooms her kitten much more often than adults groom each other. The kitten squirms and escapes after a while (mild friction that costs no affection).
 - **Nursing / naps:** when the mother lies on her side (DramaticFlop pose), her kittens curl into the curve of her belly. Awake kittens there knead (front paws alternating).
@@ -121,7 +121,7 @@ Every pair of cats has a bond:
 - `affection` (−1–1): goes up with positive interactions (greeting, grooming each other, sleeping together, play that ends well) and down with friction. Drifts back toward a baseline over time.
 - Baseline comes from temperaments (Playful+Playful high, Aloof+anyone low). **Mother↔kitten and siblings have a high fixed floor.** A newly added adult starts unfamiliar and a little wary: more sniffing, fewer greetings, more personal space.
 
-Bonds scale how likely each interaction is and how much personal space a pair keeps. They're stored in `bonds.toml` next to `config.toml`, keyed by cat names, and written atomically (like prefs) every few minutes and on exit. Renaming a cat in the tray carries its bonds over; removing it keeps its rows so re-adding the same name restores them.
+Bonds scale how likely each interaction is and how much personal space a pair keeps. They're stored in `bonds.toml` next to `config.toml`, keyed by cat names, and written atomically (like prefs) every few minutes and on exit. Removing a cat keeps its rows so re-adding the same name restores them. *(The rows are `a`/`b`/`familiarity`/`affection` tables. There's no renaming in the tray yet; when there is, it should carry the bonds over.)*
 
 The Realistic temperament keeps the rule from `behavior.md`: social interactions there are rarer and slower, the other temperaments show them more often.
 
@@ -139,7 +139,7 @@ The Realistic temperament keeps the rule from `behavior.md`: social interactions
 ## Phases
 
 1. **Multiple cats (done):** `[[cat]]` config with names, `kitten`, `mother` and migration; `Clowder` with slots and spacing; a window per cat on X11 and Win32; tray Cats section; shared bowl queue (with mother-first). Kittens use adult behaviour at a smaller size for now.
-2. **Awareness and kittens:** head tracking, tail-up, copying, startle; kitten tuning; the leash and the mother watching over her kitten; bonds with persistence.
+2. **Awareness and kittens (done):** head tracking, tail-up, copying, startle; kitten tuning; the leash and the mother watching over her kitten; bonds with persistence.
 3. **Paired interactions:** nose boop, head bunt, sniff circle, grooming each other, sleeping together, nursing/kneading.
 4. **Play and friction:** tail stalk, chase, wrestle, zoomies spreading, laser competition, play escalation and puffing up, pestering, bowl friction, tail lure.
 5. **Stretch:** carrying by the scruff, growing up, coat inheritance.

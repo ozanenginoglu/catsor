@@ -114,4 +114,6 @@ Login registration is OS state, not a preference, so it is **not** stored in `co
 
 ## Preferences file
 
-`prefs.rs` writes `config.toml` **atomically**. It writes a uniquely named temp file in the same directory, then renames it over the old file, so a crash in the middle of a write can't leave a half-written config. A relative `$XDG_CONFIG_HOME` is ignored, as the XDG spec requires (there's a test for this). Every tray change that affects a saved setting calls `UserPrefs::from_cat(&cat).save()` straight away.
+`prefs.rs` writes `config.toml` **atomically**. It writes a uniquely named temp file in the same directory, then renames it over the old file, so a crash in the middle of a write can't leave a half-written config. A relative `$XDG_CONFIG_HOME` is ignored, as the XDG spec requires (there's a test for this). Every tray change that affects a saved setting calls `UserPrefs::from_clowder(&clowder).save()` straight away.
+
+`bonds.toml` (`src/bonds.rs`) sits next to `config.toml` and is written the same atomic way. Each backend loads it at startup (`Clowder::with_bonds(Bonds::load())`), calls `save_bonds_if_due` every frame (it writes every 5 minutes of running time) and `save_bonds` on Quit (Win32: in `shutdown`). Killing the process loses at most the last 5 minutes. With a single cat there are no pairs and nothing is written.

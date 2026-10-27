@@ -1,5 +1,6 @@
 use crate::Args;
 use crate::autostart;
+use crate::bonds::Bonds;
 use crate::cat::CatSim;
 use crate::cat::clowder::Clowder;
 use crate::coat::{Coat, CoatLibrary};
@@ -1209,7 +1210,8 @@ impl WinApp {
             prefs.playful_quirks,
             &coats,
             start_cursor,
-        );
+        )
+        .with_bonds(Bonds::load());
 
         let overlay_title = to_wide_null("Catsor");
         let bowl_win = LayeredWindow::create(
@@ -1461,6 +1463,7 @@ impl WinApp {
             }
         }
         self.clowder.update(cursor_pos, dt);
+        self.clowder.save_bonds_if_due();
         self.keep_awake.tick(self.clowder.keeps_awake());
     }
 
@@ -1521,6 +1524,7 @@ impl WinApp {
     }
 
     fn shutdown(&mut self) {
+        self.clowder.save_bonds();
         self.designer = None;
         if let Some(tray_ctrl) = &mut self.tray {
             tray_ctrl.close_menu();

@@ -34,17 +34,21 @@ struct Steering {
     /// `Clowder` gave the place this cat rests in to another cat, which gets it up to shuffle
     /// over to its new spot
     make_way: bool,
+    /// A mother on her way to fetch her kitten that wandered off
+    fetching: bool,
     to_target: Vec2,
     dist_to_target: f32,
     /// Where the cat looks and turns to: the cursor, or while roaming where it is going
     look_angle: f32,
+    /// Where (world angle) another cat the cat is watching is, when nothing else holds its eye
+    watch_angle: Option<f32>,
     wants_to_pounce: bool,
 }
 
 impl Steering {
     /// Whether the cat gets up from a rest that a cursor farther than `radius` would end
     fn wakes(&self, radius: f32) -> bool {
-        self.roam_errand || self.make_way || self.dist_to_cursor > radius
+        self.roam_errand || self.make_way || self.fetching || self.dist_to_cursor > radius
     }
 }
 
@@ -127,12 +131,14 @@ impl CatSim {
         // 5. Head Gaze & Ear Twitches
         self.update_head_and_ears(
             steer.look_angle,
+            steer.watch_angle,
             steer.dist_to_cursor,
             steer.cursor_delta,
             dt,
         );
 
         // 6. Solve Spine, Scapular/Pelvic Sway, Tail Counterbalance, and 4-Paw Kinematics
+        self.update_social_tail(dt);
         self.solve_spine_and_tail(dt);
         self.update_paws(dt);
     }
@@ -346,6 +352,21 @@ impl CatSim {
     }
 
     /// Shaken off: the cat stops following, walks away from the cursor and roams on its own.
+    /// Ends roaming started by a shake (a mother came to fetch her kitten); the cat follows the
+    /// cursor again
+    pub(crate) fn call_back(&mut self) {
+        if self.roaming && !self.roaming_by_menu {
+            self.roaming = false;
+            self.roam_going = false;
+        }
+    }
+
+    /// Shakes the cat off, as a shake over it does
+    #[cfg(test)]
+    pub(crate) fn shoo(&mut self) {
+        self.start_roaming();
+    }
+
     fn start_roaming(&mut self) {
         self.reset_sprint();
         self.shake_lockout = true;
@@ -405,6 +426,12 @@ impl CatSim {
                 self.roam_going = false;
                 self.roam_timer = self.roam_rest_duration(tuning);
             }
+        } else if self.roaming_by_menu
+            && self.strayed_from_mother()
+            && self.activity != Activity::Walking
+        {
+            // A kitten roaming with everyone keeps close to its mother
+            self.pick_roam_target(false);
         } else if self.roam_timer <= 0.0 && self.activity != Activity::Walking {
             let deep_rest = matches!(
                 self.activity,
@@ -466,7 +493,23 @@ impl CatSim {
         let spread = 0.75 * std::f32::consts::PI;
         let mut best = None;
         let mut best_score = f32::MIN;
-        for _ in 0..16 {
+        // A kitten roaming with everyone wanders round its mother rather than off on its own
+        let mother = self
+            .mother()
+            .filter(|_| self.kitten && self.roaming_by_menu && !flee)
+            .map(|m| (m.center, Self::KITTEN_LEASH * m.scale));
+        if let Some((mother, leash)) = mother {
+            for _ in 0..16 {
+                let angle = self.rand_range(-std::f32::consts::PI, std::f32::consts::PI);
+                let dist = self.rand_range(0.3, 0.75) * leash;
+                let spot = (mother + Vec2::from_angle(angle) * dist).clamp(lo, hi);
+                if spot.distance(head) > 25.0 * s && !self.route_blocked(head, spot) {
+                    best = Some(spot);
+                    break;
+                }
+            }
+        }
+        for _ in 0..if best.is_some() { 0 } else { 16 } {
             let (angle, dist) = if flee {
                 (
                     away_angle + self.rand_range(-spread, spread),
@@ -506,6 +549,8 @@ impl CatSim {
     /// while it roams, eats, hunts, or rests where it settled.
     pub fn wants_slot(&self) -> Option<(Vec2, f32)> {
         if self.roaming
+            || self.leashed
+            || self.fetch_target.is_some()
             || self.wake_anchor.is_some()
             || matches!(
                 self.activity,
@@ -552,13 +597,19 @@ impl CatSim {
             Temperament::Realistic => (66.0, 135.0),
             _ => (104.0 * speed_mult, 152.0 * speed_mult),
         };
+        // Kittens nap often but wake easily, and scamper along a little quicker for their size
+        let (nap_mult, light_sleep, scamper) = if self.kitten {
+            (0.6, 0.85, 1.08)
+        } else {
+            (1.0, 1.0, 1.0)
+        };
         TemperamentTuning {
-            sit_to_lie_time,
-            lie_to_sleep_time,
+            sit_to_lie_time: sit_to_lie_time * nap_mult,
+            lie_to_sleep_time: lie_to_sleep_time * nap_mult,
             aloof_chance,
             speed_mult,
-            walk_cruise,
-            trot_cruise,
+            walk_cruise: walk_cruise * scamper,
+            trot_cruise: trot_cruise * scamper,
             roam_rest_mult: match self.behaviors.temperament {
                 Temperament::Balanced => 1.0,
                 Temperament::Playful => 0.6,
@@ -568,7 +619,7 @@ impl CatSim {
             },
             stop_radius: 38.0 * self.scale * stop_mult,
             wake_radius_sit: 72.0 * self.scale * sit_mult,
-            wake_radius_sleep: 92.0 * self.scale * sleep_mult,
+            wake_radius_sleep: 92.0 * self.scale * sleep_mult * light_sleep,
         }
     }
 
@@ -618,10 +669,50 @@ impl CatSim {
         };
 
         // Among other cats, this cat's own spot round the cursor or the bowl (from `Clowder`)
-        let slot_point = self
+        let mut slot_point = self
             .slot
             .filter(|_| self.wants_slot().is_some())
             .map(|slot| effective_target_cursor + Vec2::from_angle(slot.angle) * slot.radius);
+        // A kitten following the cursor keeps within reach of its mother
+        let hunting = matches!(
+            self.activity,
+            Activity::StalkWiggle { .. } | Activity::Pouncing { .. }
+        );
+        let leash_point = if self.kitten
+            && force_follow
+            && !self.roaming
+            && !hunting
+            && self.feeding_phase.is_none()
+            && self.wake_anchor.is_none()
+        {
+            let desired = slot_point.unwrap_or_else(|| {
+                if raw_cursor_dist > effective_stop_radius {
+                    effective_target_cursor - to_cursor / raw_cursor_dist * effective_stop_radius
+                } else {
+                    head_pos
+                }
+            });
+            self.leash(desired)
+        } else {
+            self.leashed = false;
+            None
+        };
+        if leash_point.is_some() {
+            slot_point = None;
+        }
+        // A mother fetching her kitten goes to it, stopping a little short
+        let fetch_point = self
+            .fetch_target
+            .filter(|_| !self.roaming && !hunting && self.feeding_phase.is_none())
+            .map(|kitten| {
+                let stop = 2.0 * Self::PERSONAL_SPACE * self.scale;
+                let to_kitten = kitten - head_pos;
+                if to_kitten.length() > stop {
+                    kitten - to_kitten.normalize() * stop
+                } else {
+                    head_pos
+                }
+            });
         let settled = !matches!(
             self.activity,
             Activity::Walking | Activity::StandingUp { .. }
@@ -632,11 +723,10 @@ impl CatSim {
         } else if self.slot_settled_at.is_none() {
             self.slot_settled_at = Some(effective_target_cursor);
         }
-        if matches!(
-            self.activity,
-            Activity::StalkWiggle { .. } | Activity::Pouncing { .. }
-        ) {
+        if hunting {
             // A crouch or leap under way keeps its own target
+        } else if let Some(point) = fetch_point {
+            self.rest_target = point;
         } else if self.roaming {
             self.rest_target = if self.roam_going {
                 self.roam_target
@@ -646,6 +736,8 @@ impl CatSim {
         } else if force_follow && self.wake_anchor.is_none() {
             if matches!(self.activity, Activity::Eating { .. }) {
                 // Stays at the bowl
+            } else if let Some(point) = leash_point {
+                self.rest_target = point;
             } else if let Some(point) = slot_point {
                 // Settled at its spot, a cat stays put however it turns or lies down. On its way
                 // there it comes in facing the middle: facing out, it walks a little past the
@@ -677,6 +769,7 @@ impl CatSim {
         // Moved to a new spot to make room for another cat: get up and go there
         let make_way = self.slot_bumped
             && slot_point.is_some_and(|p| head_pos.distance(p) > Self::SLOT_ARRIVAL * self.scale);
+        let fetching = fetch_point.is_some_and(|p| head_pos.distance(p) > 8.0 * self.scale);
 
         // A roaming cat is moved by having somewhere to go (`roam_errand`), not by the cursor.
         // A cat with a spot of its own measures from that spot, as if it were sitting
@@ -685,6 +778,9 @@ impl CatSim {
         let dist_to_cursor = if force_follow && !self.roaming {
             if let Some(anchor) = self.wake_anchor {
                 effective_target_cursor.distance(anchor)
+            } else if leash_point.is_some() || fetch_point.is_some() {
+                // Measured from where it is going, as for a spot of its own
+                tuning.stop_radius + head_pos.distance(self.rest_target)
             } else if let Some(settled_at) = self.slot_settled_at {
                 tuning.stop_radius + effective_target_cursor.distance(settled_at)
             } else if let Some(point) = slot_point {
@@ -713,6 +809,7 @@ impl CatSim {
         // Only pounce when the user is actively wiggling the cursor like a laser toy at pounce range
         let in_pounce_range = |d: f32| d > 85.0 * self.scale && d < 230.0 * self.scale;
         let wants_to_pounce = !self.roaming
+            && fetch_point.is_none()
             && !self.is_waiting_for_bowl()
             && self.behaviors.playful_quirks
             && self.play_excitement > 0.55
@@ -726,9 +823,11 @@ impl CatSim {
             dist_to_cursor,
             roam_errand: self.roaming && self.roam_going,
             make_way,
+            fetching,
             to_target,
             dist_to_target: to_target.length(),
             look_angle,
+            watch_angle: self.watch_cats(),
             wants_to_pounce,
         }
     }
@@ -736,16 +835,36 @@ impl CatSim {
     fn step_activity(&mut self, steer: &Steering, tuning: &TemperamentTuning, dt: f32) {
         let dist_to_cursor = steer.dist_to_cursor;
         let wake_radius_sit = tuning.wake_radius_sit;
+        if self.activity != Activity::Sleeping {
+            self.nap_left = None;
+        }
+        self.copy_friends(dt);
         match self.activity {
             Activity::Sleeping => {
                 self.idle_time += dt;
-                if steer.wakes(tuning.wake_radius_sleep) {
+                // A kitten naps: it wakes up by itself after a while
+                let nap_over = self.kitten && {
+                    let left = match self.nap_left {
+                        Some(left) => left - dt,
+                        None => self.rand_range(25.0, 70.0),
+                    };
+                    self.nap_left = Some(left);
+                    left <= 0.0
+                };
+                if steer.wakes(tuning.wake_radius_sleep) || nap_over {
                     // Waking from sleep: do an anterior wake-up stretch before standing & walking
                     self.activity = Activity::Stretching {
                         progress: 0.0,
                         after_walk: true,
                     };
                     self.idle_time = 0.0;
+                } else if self.startled() {
+                    // Half woken by a cat racing past: lifts its head, ears up, and dozes off
+                    // again a while later
+                    self.activity = Activity::Lying;
+                    self.ear_left_twitch = 0.3;
+                    self.ear_right_twitch = 0.3;
+                    self.idle_time = tuning.lie_to_sleep_time * 0.5;
                 }
             }
             Activity::Lying | Activity::DramaticFlop { .. } | Activity::BellyUp { .. } => {
@@ -1170,7 +1289,13 @@ impl CatSim {
 
         if progress >= 1.0 {
             self.speed = 25.0 * self.scale;
-            if self.behaviors.follow_cursor
+            if self.kitten && self.rand_f32() < 0.3 {
+                // Overshot it and tumbled over: a moment on its back before getting up
+                let side = self.rand_side();
+                self.curl_side = side;
+                self.rest_target = self.nodes[0];
+                self.activity = Activity::BellyUp { side, timer: 7.8 };
+            } else if self.behaviors.follow_cursor
                 && self.rest_target.distance(self.nodes[0]) > 22.0 * self.scale
             {
                 self.activity = Activity::Walking;
@@ -1396,7 +1521,14 @@ impl CatSim {
         } else {
             95.0 * self.scale
         };
-        let trot_ramp = smoothstep(((dist_to_target / self.scale - 220.0) / 140.0).clamp(0.0, 1.0));
+        let mut trot_ramp =
+            smoothstep(((dist_to_target / self.scale - 220.0) / 140.0).clamp(0.0, 1.0));
+        if self.leashed {
+            // A kitten left behind trots to catch up with its mother
+            trot_ramp = trot_ramp.max(smoothstep(
+                ((dist_to_target / self.scale - 20.0) / 40.0).clamp(0.0, 1.0),
+            ));
+        }
         let cruise_speed = if self.sprinting {
             (290.0 + 75.0 * trot_ramp) * self.scale * tuning.speed_mult
         } else {
@@ -1549,7 +1681,7 @@ impl CatSim {
             Temperament::Lazy => 0.55,
             Temperament::Aloof => 0.75,
             Temperament::Realistic => 0.45,
-        };
+        } * if self.kitten { 1.5 } else { 1.0 };
         self.next_quirk_timer -= dt * quirk_rate;
         if self.next_quirk_timer <= 0.0 {
             let roll = self.rand_f32();

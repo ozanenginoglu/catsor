@@ -1,6 +1,7 @@
 mod behavior;
 mod body;
 pub mod clowder;
+mod social;
 
 use crate::coat::Coat;
 use glam::Vec2;
@@ -142,6 +143,73 @@ pub enum FeedingPhase {
     Waiting { preset: FeedPreset, bowl_pos: Vec2 },
 }
 
+/// What another cat is to this one
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Kinship {
+    #[default]
+    None,
+    /// This cat's mother
+    Mother,
+    /// One of this cat's kittens
+    Kitten,
+    /// A kitten of the same mother
+    Sibling,
+}
+
+impl Kinship {
+    pub fn is_family(self) -> bool {
+        self != Self::None
+    }
+}
+
+/// What a cat is doing, as the cats around it see it
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pose {
+    /// Walking, standing or shifting about
+    Moving,
+    /// Galloping, pouncing or racing round with the zoomies
+    Racing,
+    Sitting,
+    Grooming,
+    /// Lying down awake (also on its side or back)
+    Lying,
+    Sleeping,
+    /// Busy with something that holds its attention (eating, hunting, chasing its tail)
+    Busy,
+}
+
+impl Pose {
+    pub fn of(cat: &CatSim) -> Self {
+        match cat.activity {
+            Activity::Walking if cat.sprinting || cat.gallop_weight > 0.4 => Self::Racing,
+            Activity::Pouncing { .. } | Activity::Zoomies { .. } => Self::Racing,
+            Activity::Walking | Activity::StandingUp { .. } | Activity::StandingIdle { .. } => {
+                Self::Moving
+            }
+            Activity::Sitting | Activity::AloofNotice { .. } | Activity::PawBatting { .. } => {
+                Self::Sitting
+            }
+            Activity::Grooming { .. } => Self::Grooming,
+            Activity::Lying
+            | Activity::DramaticFlop { .. }
+            | Activity::BellyUp { .. }
+            | Activity::Stretching { .. } => Self::Lying,
+            Activity::Sleeping | Activity::Circling { .. } => Self::Sleeping,
+            Activity::Eating { .. }
+            | Activity::StalkWiggle { .. }
+            | Activity::TailChasing { .. } => Self::Busy,
+        }
+    }
+
+    /// Resting: settled in one place, not about to go anywhere
+    pub fn is_resting(self) -> bool {
+        matches!(
+            self,
+            Self::Sitting | Self::Grooming | Self::Lying | Self::Sleeping
+        )
+    }
+}
+
 /// What a cat knows about another cat this tick: a snapshot from the previous frame, so the
 /// order cats are updated in never changes the outcome
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -151,6 +219,59 @@ pub struct Neighbor {
     pub center: Vec2,
     /// Personal-space radius (already scaled)
     pub radius: f32,
+    pub scale: f32,
+    pub speed: f32,
+    pub pose: Pose,
+    pub roaming: bool,
+    /// What the other cat is to this one
+    pub kin: Kinship,
+    /// How well the two know each other (0–1) and how much they like each other (-1–1)
+    pub familiarity: f32,
+    pub affection: f32,
+}
+
+impl Neighbor {
+    /// A stranger: no kin, never met, neutral
+    #[cfg(test)]
+    pub fn at(head: Vec2, body_angle: f32, scale: f32) -> Self {
+        Self {
+            head,
+            center: head - Vec2::from_angle(body_angle) * (CatSim::BODY_SPACING_OFFSET * scale),
+            radius: CatSim::PERSONAL_SPACE * scale,
+            scale,
+            speed: 0.0,
+            pose: Pose::Sitting,
+            roaming: false,
+            kin: Kinship::None,
+            familiarity: 0.0,
+            affection: 0.0,
+        }
+    }
+
+    /// How much room the two cats keep between them, as a multiple of their personal space:
+    /// family stays close, cats that barely know each other keep further apart, and liking
+    /// each other brings them a little closer
+    pub fn space_mult(kin: Kinship, familiarity: f32, affection: f32) -> f32 {
+        if kin.is_family() {
+            0.75
+        } else {
+            (1.3 - 0.3 * familiarity.clamp(0.0, 1.0)) * (1.0 - 0.15 * affection.clamp(-1.0, 1.0))
+        }
+    }
+
+    pub fn space(&self) -> f32 {
+        Self::space_mult(self.kin, self.familiarity, self.affection)
+    }
+
+    /// A cat this one is glad to see: family, or a cat it knows and likes
+    pub fn is_friend(&self) -> bool {
+        self.kin.is_family() || (self.affection > 0.3 && self.familiarity > 0.3)
+    }
+
+    /// A cat this one would rather keep clear of
+    pub fn is_disliked(&self) -> bool {
+        !self.kin.is_family() && self.affection < -0.15
+    }
 }
 
 /// A cat's own spot among others: `radius` from the cursor (or the shared bowl it waits for)
@@ -462,6 +583,27 @@ pub struct CatSim {
     /// How long the next turn at the bowl lasts, set by `Clowder` when cats take turns (`None`:
     /// the whole feed preset)
     eat_turn: Option<f32>,
+
+    /// A kitten: naps often but briefly, plays more, tumbles now and then, and stays near its
+    /// mother. Set by `Clowder`
+    pub kitten: bool,
+    /// Whether this kitten's mother was too far from where it wanted to go last tick, so it
+    /// kept close to her instead (`Clowder` gives it no spot round the cursor then)
+    pub(crate) leashed: bool,
+    /// Where this mother's kitten that wandered off is; she goes and fetches it. Set by
+    /// `Clowder` every tick while she fetches
+    pub fetch_target: Option<Vec2>,
+    /// Time left in a kitten's nap before it wakes up by itself
+    nap_left: Option<f32>,
+    /// The other cat (index into `neighbors`) the head is turned toward, kept for a while so the
+    /// gaze doesn't flit between cats
+    gaze_neighbor: Option<usize>,
+    /// Time before this cat copies another cat's grooming again
+    copy_cooldown: f32,
+    /// 0..1: how far the tail is held up (greeting a friend, or a kitten trotting along)
+    pub tail_raise: f32,
+    /// 0..1: how still the tail is held near a cat this one dislikes
+    tail_still: f32,
 }
 
 impl CatSim {
@@ -477,6 +619,11 @@ impl CatSim {
     /// Extra bend per tail segment (rad) when fully wrapped while sitting: turn sideways off the
     /// rump, run forward along the flank, then hook in toward the front paws
     const SIT_TAIL_WRAP: [f32; TAIL_NODES] = [0.78, 0.74, 0.36, 0.24, 0.22, 0.40];
+    /// How much shorter each tail segment looks from above when the tail is held straight up:
+    /// the upright base most, the tip that hooks over least
+    const TAIL_RAISE_FORESHORTEN: [f32; TAIL_NODES] = [0.75, 0.7, 0.6, 0.45, 0.3, 0.2];
+    /// Extra bend per tail segment (rad) for the hooked tip of a raised tail
+    const TAIL_RAISE_HOOK: [f32; TAIL_NODES] = [0.0, 0.0, 0.0, 0.25, 0.45, 0.6];
 
     pub fn new(start_pos: Vec2, scale: f32, coat: impl Into<Coat>) -> Self {
         let initial_offset = Vec2::new(-42.0 * scale, 24.0 * scale);
@@ -613,6 +760,14 @@ impl CatSim {
             slot_settled_at: None,
             bowl_fill: None,
             eat_turn: None,
+            kitten: false,
+            leashed: false,
+            fetch_target: None,
+            nap_left: None,
+            gaze_neighbor: None,
+            copy_cooldown: 0.0,
+            tail_raise: 0.0,
+            tail_still: 0.0,
         }
     }
 
@@ -628,6 +783,14 @@ impl CatSim {
     pub const BODY_SPACING_OFFSET: f32 = 24.0;
     /// How close (unscaled px) a cat must be to its spot to count as there
     const SLOT_ARRIVAL: f32 = 12.0;
+    /// How far (unscaled px, times the mother's scale) a kitten goes from its mother
+    pub const KITTEN_LEASH: f32 = 150.0;
+    /// How far (unscaled px) away another cat can be for this one to watch it
+    const WATCH_RANGE: f32 = 170.0;
+    /// How close (unscaled px) a friend has to be for this cat to copy it
+    const COPY_RANGE: f32 = 150.0;
+    /// How close (unscaled px) a racing cat has to pass to wake a sleeping one
+    const STARTLE_RANGE: f32 = 55.0;
 
     /// Dynamically rescales the cat in-place without teleporting or kinking the spine
     pub fn set_scale(&mut self, new_scale: f32) {

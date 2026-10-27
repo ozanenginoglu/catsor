@@ -214,6 +214,41 @@ With more than one cat, `Clowder` runs one feeding session (`FeedSession`) for o
 
 Shakes, wiggles and Follow Cursor work per cat as before; Follow Cursor and Playful Hunting are one switch for every cat.
 
+### What each cat sees of the others
+
+Each `Neighbor` also carries the other cat's scale, speed and `Pose` (Moving, Racing, Sitting, Grooming, Lying, Sleeping, Busy), whether it roams, what it is to this cat (`Kinship`: Mother, Kitten, Sibling or none), and their bond (familiarity and affection, see [Bonds](#bonds)). A neighbour is a **friend** when it's family, or when affection and familiarity are both above 0.3. It's **disliked** when it isn't family and affection is below −0.15. The reactions live in `src/cat/social.rs`:
+
+| Reaction | Rule |
+|---|---|
+| **Watching** | A cat Sitting, Lying, on its side or standing still looks at another cat within 170 px (×1.3 for a kitten) instead of letting its gaze wander, while the cursor is still and near. The pick is scored: a racing cat beats a moving one, a still one doesn't count, a stranger counts up to 1.5×, nearer counts more, and the cat it already watches counts 1.4×. A mother watches her kittens out to twice the range, still or not. The head then turns 80% of the way toward it |
+| **Tail up** | Walking up to a friend within 140 px (or standing near one), the tail eases up over ~⅓ s (`tail_raise`): segments look shorter from above (`TAIL_RAISE_FORESHORTEN`), the tip hooks over (`TAIL_RAISE_HOOK`) and it sways less. A kitten on the move keeps its tail half up, fully up when trotting after its mother |
+| **Still tail** | Within 110 px of a disliked cat, the tail's sway drops by up to 70% (`tail_still`) |
+| **Drowsiness** | Sitting, Lying or standing within 150 px of a friend who is lying down or asleep, `idle_time` runs 1.6× as fast, so the cat lies down and dozes off sooner |
+| **Copying** | Sitting near a friend who is grooming, a cat starts grooming too (about once every 3 s on average while it lasts), then won't copy again for 20 s |
+| **Startle** | A cat racing past within 55 px of a sleeper's head or body wakes it partway: Sleeping → Lying, ears up, with `idle_time` at half the lie → sleep time, so it dozes off again a little later. A cat walking past doesn't |
+
+### Kittens
+
+`CatSim::kitten` (set by `Clowder` from the profile) changes the tuning on top of the temperament (kittens added from the tray are Playful):
+
+- Sit → lie and lie → sleep take 0.6× as long, and the sleep wake radius is 0.85×.
+- **Naps:** a sleeping kitten wakes by itself after 25–70 s, stretches, stands, then sits down again and starts over.
+- Quirks come 1.5× as often, and walking and trotting are 1.08× quicker for their size.
+- **Tumbles:** 30% of a kitten's pounces end in a tumble: about 1.7 s on its back (`BellyUp`) before it rolls over and gets up.
+- **Leash:** a kitten following the cursor stays within `KITTEN_LEASH` (150 px × its mother's scale) of its mother's body. When the place it wants (its slot, or `stop_radius` from the cursor) is further than that from her, it goes to the point 0.7 × leash from her in that direction instead, so there's slack when she moves (`leashed`; it lets go below 0.85 × leash). A leashed kitten has no slot and trots to catch up when it falls more than ~20 px behind. With Follow Cursor off, a roaming kitten wanders round its mother (0.3–0.75 × leash from her) and heads back when it's further than the leash.
+- **Fetching:** a kitten shaken off by the cursor roams on its own. If it gets further than 240 px (× her scale) from its mother while she is free (following the cursor, not feeding, hunting or racing), `Clowder` sends her to it (`fetch_target`). She walks up to it, and when they're close, the kitten stops roaming (`call_back`) and comes back on its leash while she returns to the cursor.
+
+### Bonds
+
+`Clowder` keeps a `Bond` for every pair of cats, by name (`src/bonds.rs`):
+
+- **Familiarity** (0–1) grows by 1 per 3 hours while both are running, plus 1 per 45 minutes while their heads are within 150 px.
+- **Affection** (−1–1) grows by 1 per 25 minutes while they rest within 150 px of each other, and drifts back toward a **baseline** with a 2-hour time constant. The baseline is the average of each cat's warmth: Playful 0.35, Balanced and Lazy 0.2, Realistic 0.15, Aloof −0.1, plus 0.15 for a kitten.
+- A pair that has never met starts at familiarity 0 and affection 0.1 below the baseline. A mother and her kitten never drop below familiarity 0.9 and affection 0.8; siblings never below 0.8 and 0.6.
+- **Spacing:** how far apart two cats keep (in slot assignment and while walking) is their personal spaces × `Neighbor::space_mult`: 0.75 for family, otherwise 1.3 for strangers down to 1.0 when fully familiar, then up to 15% less (or more) by affection.
+
+The bonds are saved to `bonds.toml` next to `config.toml` every 5 minutes and on quit, atomically like the prefs. Rows stay when a cat is removed, so adding a cat with the same name brings its bonds back.
+
 ## Determinism
 
 `CatSim` uses its own PCG-style RNG with a fixed seed (`rng_state`), and `update` clamps `dt` to [0.001, 0.05]. The same cursor path at the same `dt` always produces the same behavior. The tests in `src/cat/tests.rs` rely on this.

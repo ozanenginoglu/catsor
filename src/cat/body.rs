@@ -5,6 +5,7 @@ impl CatSim {
     pub(super) fn update_head_and_ears(
         &mut self,
         look_angle: f32,
+        watch_angle: Option<f32>,
         dist_to_cursor: f32,
         cursor_delta: f32,
         dt: f32,
@@ -72,7 +73,11 @@ impl CatSim {
                 } else {
                     0.35
                 };
-                let raw_yaw = rel_cursor * cursor_attention + wander * (1.0 - cursor_attention);
+                let raw_yaw = match watch_angle {
+                    // Calm, with the cursor still nearby: watches the other cat instead
+                    Some(angle) if cursor_attention < 0.5 => self.watch_yaw(angle, wander),
+                    _ => rel_cursor * cursor_attention + wander * (1.0 - cursor_attention),
+                };
                 // Cats turn their heads up to ~80° to either side
                 raw_yaw.clamp(-Self::MAX_HEAD_YAW, Self::MAX_HEAD_YAW)
             }
@@ -357,6 +362,12 @@ impl CatSim {
             Activity::StandingUp { .. } | Activity::StandingIdle { .. } => (0.12, 1.35, 0.0),
         };
 
+        // Held up (to greet a friend) it sways less; held still near a cat it dislikes, hardly at all
+        let sway_amp = if self.tail_raise > 0.0 || self.tail_still > 0.0 {
+            sway_amp * (1.0 - 0.6 * self.tail_raise) * (1.0 - 0.7 * self.tail_still)
+        } else {
+            sway_amp
+        };
         let is_sleeping = self.activity == Activity::Sleeping;
         let is_tail_chasing = matches!(self.activity, Activity::TailChasing { .. });
         let tail_rate = 1.0 - (-dt * 8.0).exp();
@@ -384,7 +395,13 @@ impl CatSim {
 
         for i in 0..TAIL_NODES {
             let idx = BODY_NODES + i;
-            let seg_len = Self::TAIL_LENGTHS[i] * tail_seg_scale;
+            let mut seg_len = Self::TAIL_LENGTHS[i] * tail_seg_scale;
+            // Seen from above, a tail held up looks short, with its tip hooked over
+            let mut raised_hook = 0.0;
+            if self.tail_raise > 0.0 {
+                seg_len *= 1.0 - self.tail_raise * Self::TAIL_RAISE_FORESHORTEN[i];
+                raised_hook = self.tail_raise * Self::TAIL_RAISE_HOOK[i] * self.curl_side;
+            }
             let phase_delay = (i as f32) * 0.42;
             let gait_tail_wave = if self.activity == Activity::Walking {
                 (phase_rad - 1.8 - (i as f32) * 0.55).sin() * 0.065 * self.gait_weight
@@ -420,7 +437,8 @@ impl CatSim {
             };
 
             let sit_wrap = sit_wrap_side * Self::SIT_TAIL_WRAP[i] * self.sit_tail_wrap;
-            let target_seg_angle = wrap_angle(tail_angle + wave + tip_hook + sit_wrap);
+            let target_seg_angle =
+                wrap_angle(tail_angle + wave + tip_hook + sit_wrap + raised_hook);
             let desired_pos = self.nodes[idx - 1] + Vec2::from_angle(target_seg_angle) * seg_len;
 
             let follow_rate = 1.0 - (-dt * (16.0 - (i as f32) * 1.4)).exp();

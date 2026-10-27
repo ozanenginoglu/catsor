@@ -98,7 +98,7 @@ A cat's page (**Back** returns to the main page):
 - **Shake the mouse right over the cat** to shoo it off. It goes its own way: it wanders around the screen, naps, and keeps away from the cursor. Shake the mouse again (anywhere) to call it back. It gallops over and goes back to following you.
 - **Turn off Follow Cursor** in the tray menu and the cat roams the same way, until you turn it back on.
 - **Leave it alone.** It sits, then lies down, then curls up and sleeps.
-- **Add a second cat** (or a kitten). Each cat finds its own spot round the cursor, and they keep out of each other's way.
+- **Add a second cat** (or a kitten). Each cat finds its own spot round the cursor, and they keep out of each other's way. They watch each other, hold their tails up for friends, and grow fond of each other the more time they spend together. Shake a kitten off and watch its mother fetch it back.
 
 ### Feeding mode (keep-awake)
 
@@ -142,7 +142,9 @@ mother = "Luna"
 
 Lines that are unknown or invalid are skipped, and the default is used for those settings. Feeding sessions and hide/show are not saved; they reset when Catsor restarts.
 
-Each `[[cat]]` table is one cat, up to 6. `name` identifies the cat and must be unique. `size` (optional, 0.4–1.5) multiplies `scale`; kittens added from the tray get 0.6. `mother` must name another cat that isn't a kitten, otherwise it's ignored. A kitten's mother lets it eat first. Kittens behave like grown cats for now, only smaller. A config from an older version, with `coat` and `temperament` at the top level, is read as a single cat named Luna.
+Each `[[cat]]` table is one cat, up to 6. `name` identifies the cat and must be unique. `size` (optional, 0.4–1.5) multiplies `scale`; kittens added from the tray get 0.6. `mother` must name another cat that isn't a kitten, otherwise it's ignored. A kitten's mother lets it eat first. Kittens nap often but briefly, play more, and stay close to their mother; if one wanders off, its mother goes and fetches it. A config from an older version, with `coat` and `temperament` at the top level, is read as a single cat named Luna.
+
+How well the cats know and like each other is kept in `bonds.toml` in the same directory, so friendships carry across restarts.
 
 `coat` is a built-in coat, the name of a custom coat, or `random:<seed>` for a random coat, so the same random cat comes back after a restart.
 

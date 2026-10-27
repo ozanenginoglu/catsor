@@ -1,8 +1,11 @@
 //! Several cats at once (a group of cats is a "clowder"). `Clowder` owns every `CatSim`, tells
-//! each one where the others are, and runs the shared food bowl: one cat eats at a time while
-//! the rest sit nearby and wait their turn, kittens first.
+//! each one where the others are and what they are to it, keeps track of how well each pair
+//! gets on (`Bonds`), sends a mother to fetch a kitten that wandered off, and runs the shared
+//! food bowl: one cat eats at a time while the rest sit nearby and wait their turn, kittens
+//! first.
 
-use super::{CatSim, FeedPreset, Neighbor, Slot, Temperament, wrap_angle};
+use super::{CatSim, FeedPreset, Kinship, Neighbor, Pose, Slot, Temperament, wrap_angle};
+use crate::bonds::{Bond, Bonds};
 use crate::coat::{Coat, CoatId, CoatLibrary, fresh_seed};
 use glam::Vec2;
 use std::collections::VecDeque;
@@ -13,6 +16,11 @@ pub const MAX_CATS: usize = 6;
 pub const KITTEN_SIZE: f32 = 0.6;
 /// Longest single turn at the shared bowl (seconds) when more than one cat is eating
 const TURN_SECS: f32 = 150.0;
+/// How far (unscaled px, times the mother's scale) a kitten that wandered off can get before
+/// its mother goes and fetches it
+const FETCH_RADIUS: f32 = 240.0;
+/// How often (seconds) the bonds are written to disk
+const BONDS_SAVE_SECS: f32 = 300.0;
 
 /// Names handed to cats added from the tray, in order, skipping names already in use
 const NAMES: [&str; 12] = [
@@ -64,6 +72,8 @@ pub struct Member {
     pub kitten: bool,
     pub mother: Option<String>,
     pub cat: CatSim,
+    /// The kitten (index) this mother is on her way to fetch
+    fetching: Option<usize>,
 }
 
 impl Member {
@@ -99,6 +109,9 @@ pub struct Clowder {
     follow_cursor: bool,
     playful_quirks: bool,
     feeding: Option<FeedSession>,
+    bonds: Bonds,
+    /// Seconds since the bonds were last saved
+    bonds_unsaved: f32,
 }
 
 impl Clowder {
@@ -119,6 +132,8 @@ impl Clowder {
             follow_cursor,
             playful_quirks,
             feeding: None,
+            bonds: Bonds::default(),
+            bonds_unsaved: 0.0,
         };
         let default_profile = [CatProfile::default()];
         let profiles = if profiles.is_empty() {
@@ -149,6 +164,7 @@ impl Clowder {
         cat.behaviors.temperament = profile.temperament;
         cat.behaviors.follow_cursor = self.follow_cursor;
         cat.behaviors.playful_quirks = self.playful_quirks;
+        cat.kitten = profile.kitten;
         // The first cat keeps the default seed, so a lone cat behaves exactly as it always has
         if !self.members.is_empty() {
             cat.seed_rng(name_seed(&profile.name));
@@ -159,6 +175,7 @@ impl Clowder {
             kitten: profile.kitten,
             mother: profile.mother,
             cat,
+            fetching: None,
         });
         self.members.len() - 1
     }
@@ -327,6 +344,9 @@ impl Clowder {
             if m.mother.as_deref() == Some(&removed.name) {
                 m.mother = None;
             }
+            // Indices moved; a mother still fetching starts again next tick if she needs to
+            m.fetching = None;
+            m.cat.fetch_target = None;
         }
         if let Some(session) = &mut self.feeding {
             if session.eater == Some(i) {
@@ -346,31 +366,179 @@ impl Clowder {
         true
     }
 
-    /// Advances every cat by `dt` toward the cursor, then the shared bowl
+    /// Advances every cat by `dt` toward the cursor, then the shared bowl and the bonds
     pub fn update(&mut self, cursor: Vec2, dt: f32) {
-        let snapshots: Vec<Neighbor> = self
-            .cats()
-            .map(|cat| Neighbor {
-                head: cat.nodes[0],
-                center: cat.body_point(),
-                radius: CatSim::PERSONAL_SPACE * cat.scale,
-            })
-            .collect();
-        for (i, m) in self.members.iter_mut().enumerate() {
-            m.cat.neighbors.clear();
-            m.cat.neighbors.extend(
-                snapshots
-                    .iter()
-                    .enumerate()
-                    .filter(|&(j, _)| j != i)
-                    .map(|(_, &n)| n),
-            );
-        }
+        self.share_neighbors();
+        self.update_fetching();
         self.assign_slots();
         for m in &mut self.members {
             m.cat.update(cursor, dt);
         }
         self.tick_feeding(dt);
+        self.update_bonds(dt);
+    }
+
+    /// What cat `j` is to cat `i`
+    pub fn kinship(&self, i: usize, j: usize) -> Kinship {
+        let (a, b) = (&self.members[i], &self.members[j]);
+        if i == j {
+            Kinship::None
+        } else if a.mother.as_deref() == Some(&b.name) {
+            Kinship::Mother
+        } else if b.mother.as_deref() == Some(&a.name) {
+            Kinship::Kitten
+        } else if a.mother.is_some() && a.mother == b.mother {
+            Kinship::Sibling
+        } else {
+            Kinship::None
+        }
+    }
+
+    /// How cats `i` and `j` get on, from the bond table, or as on first meeting if they haven't
+    /// met yet. Family is never below its floor.
+    pub fn bond(&self, i: usize, j: usize) -> Bond {
+        let (a, b) = (&self.members[i], &self.members[j]);
+        let kin = self.kinship(i, j);
+        match self.bonds.get(&a.name, &b.name) {
+            Some(bond) => bond.with_floor(kin),
+            None => Bond::first_meeting(self.bond_baseline(i, j), kin),
+        }
+    }
+
+    fn bond_baseline(&self, i: usize, j: usize) -> f32 {
+        let traits = |m: &Member| (m.cat.behaviors.temperament, m.kitten);
+        Bond::baseline(traits(&self.members[i]), traits(&self.members[j]))
+    }
+
+    #[cfg(test)]
+    pub fn set_bond(&mut self, i: usize, j: usize, bond: Bond) {
+        let (a, b) = (self.members[i].name.clone(), self.members[j].name.clone());
+        self.bonds.set(&a, &b, bond);
+    }
+
+    /// Uses `bonds` (loaded from disk) for how the cats get on
+    pub fn with_bonds(mut self, bonds: Bonds) -> Self {
+        self.bonds = bonds;
+        self
+    }
+
+    /// Saves the bonds every few minutes; call once a frame
+    pub fn save_bonds_if_due(&mut self) {
+        if self.bonds_unsaved >= BONDS_SAVE_SECS {
+            self.save_bonds();
+        }
+    }
+
+    pub fn save_bonds(&mut self) {
+        self.bonds_unsaved = 0.0;
+        if self.members.len() > 1 {
+            self.bonds.save();
+        }
+    }
+
+    /// Gives every cat a snapshot of the others as they were at the end of the last tick, with
+    /// what each is to it and how well they get on
+    fn share_neighbors(&mut self) {
+        let n = self.members.len();
+        let mut all: Vec<Vec<Neighbor>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut seen = Vec::with_capacity(n.saturating_sub(1));
+            for (j, other) in self.members.iter().enumerate() {
+                if j == i {
+                    continue;
+                }
+                let cat = &other.cat;
+                let bond = self.bond(i, j);
+                seen.push(Neighbor {
+                    head: cat.nodes[0],
+                    center: cat.body_point(),
+                    radius: CatSim::PERSONAL_SPACE * cat.scale,
+                    scale: cat.scale,
+                    speed: cat.speed,
+                    pose: Pose::of(cat),
+                    roaming: cat.roaming,
+                    kin: self.kinship(i, j),
+                    familiarity: bond.familiarity,
+                    affection: bond.affection,
+                });
+            }
+            all.push(seen);
+        }
+        for (m, seen) in self.members.iter_mut().zip(all) {
+            m.cat.neighbors = seen;
+        }
+    }
+
+    /// The index into cat `i`'s `neighbors` of cat `j`
+    fn neighbor_index(i: usize, j: usize) -> usize {
+        if j < i { j } else { j - 1 }
+    }
+
+    /// Sends a mother to fetch her kitten when it has wandered off on its own (shaken off by the
+    /// cursor) out of her reach. Once she reaches it, it comes back with her.
+    fn update_fetching(&mut self) {
+        for k in 0..self.members.len() {
+            let Some(m) = self.members[k]
+                .mother
+                .as_deref()
+                .and_then(|name| self.index_of(name))
+            else {
+                continue;
+            };
+            let (mother, kitten) = (&self.members[m].cat, &self.members[k].cat);
+            let able = self.follow_cursor
+                && kitten.roaming
+                && !mother.roaming
+                && mother.feeding_phase.is_none()
+                && kitten.feeding_phase.is_none()
+                && !matches!(Pose::of(mother), Pose::Busy | Pose::Racing);
+            let fetching = self.members[m].fetching == Some(k);
+            let gap = mother.nodes[0].distance(kitten.nodes[0]);
+            let reached = gap < 1.6 * CatSim::PERSONAL_SPACE * (mother.scale + kitten.scale);
+            let far = gap > FETCH_RADIUS * mother.scale;
+            if able && fetching && reached {
+                self.members[k].cat.call_back();
+                self.members[m].fetching = None;
+                self.members[m].cat.fetch_target = None;
+            } else if able && (fetching || (far && self.members[m].fetching.is_none())) {
+                self.members[m].fetching = Some(k);
+                self.members[m].cat.fetch_target = Some(self.members[k].cat.nodes[0]);
+            } else if fetching {
+                self.members[m].fetching = None;
+                self.members[m].cat.fetch_target = None;
+            }
+        }
+    }
+
+    /// Cats get to know each other over time, faster while near each other, and grow fond of
+    /// each other resting side by side. Away from each other, fondness drifts back toward what
+    /// their temperaments make of each other.
+    fn update_bonds(&mut self, dt: f32) {
+        let n = self.members.len();
+        if n < 2 {
+            return;
+        }
+        self.bonds_unsaved += dt;
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let (a, b) = (&self.members[i].cat, &self.members[j].cat);
+                let s = a.scale.max(b.scale);
+                let gap = a.nodes[0].distance(b.nodes[0]);
+                let near = gap < 150.0 * s;
+                let resting_together = near && Pose::of(a).is_resting() && Pose::of(b).is_resting();
+                let mut bond = self.bond(i, j);
+                let meet_rate = if near { 1.0 / 2700.0 } else { 0.0 };
+                bond.familiarity = (bond.familiarity + dt * (1.0 / 10800.0 + meet_rate)).min(1.0);
+                if resting_together {
+                    bond.affection += dt / 1500.0;
+                }
+                let baseline = self.bond_baseline(i, j);
+                bond.affection += (baseline - bond.affection) * (dt / 7200.0).min(1.0);
+                let bond = bond.with_floor(self.kinship(i, j));
+                let (na, nb) = (self.members[i].name.clone(), self.members[j].name.clone());
+                self.bonds.set(&na, &nb, bond);
+            }
+        }
     }
 
     /// Gives every cat that gathers round the cursor (or the bowl) a spot of its own on a
@@ -389,12 +557,12 @@ impl Clowder {
         let wants: Vec<Option<(Vec2, f32)>> = self.cats().map(CatSim::wants_slot).collect();
         // Points already taken and how much room each needs: first the cats that don't take a
         // spot (eating, hunting, resting where they settled) where they are now
-        let mut taken: Vec<(Vec2, f32)> = Vec::new();
-        for (cat, want) in self.cats().zip(&wants) {
+        let mut taken: Vec<(Vec2, f32, usize)> = Vec::new();
+        for (j, (cat, want)) in self.cats().zip(&wants).enumerate() {
             if want.is_none() {
                 let room = CatSim::PERSONAL_SPACE * cat.scale;
-                taken.push((cat.nodes[0], room));
-                taken.push((cat.body_point(), room));
+                taken.push((cat.nodes[0], room, j));
+                taken.push((cat.body_point(), room, j));
             }
         }
         let mut order: Vec<usize> = (0..n).collect();
@@ -418,14 +586,19 @@ impl Clowder {
                 Some(slot) if near => slot.angle,
                 _ => head_angle,
             };
-            // A cat at rest faces the centre, so its body lies further out on the same ray
+            // A cat at rest faces the centre, so its body lies further out on the same ray. How
+            // much room it leaves another cat depends on how well the two get on.
+            let neighbors = &cat.neighbors;
             let fits = |angle: f32, radius: f32| {
                 let ray = Vec2::from_angle(angle);
                 [radius, radius + body].into_iter().all(|r| {
                     let p = center + ray * r;
-                    taken
-                        .iter()
-                        .all(|&(q, q_room)| p.distance(q) >= room + q_room)
+                    taken.iter().all(|&(q, q_room, j)| {
+                        let space = neighbors
+                            .get(Self::neighbor_index(i, j))
+                            .map_or(1.0, Neighbor::space);
+                        p.distance(q) >= (room + q_room) * space
+                    })
                 })
             };
             // Look round the circle, first on the side the cat is on, then further out
@@ -447,8 +620,8 @@ impl Clowder {
             });
             let (angle, radius) = chosen.unwrap_or((preferred, ring));
             let ray = Vec2::from_angle(angle);
-            taken.push((center + ray * radius, room));
-            taken.push((center + ray * (radius + body), room));
+            taken.push((center + ray * radius, room, i));
+            taken.push((center + ray * (radius + body), room, i));
             let cat = &mut self.members[i].cat;
             if near
                 && cat
@@ -776,8 +949,14 @@ mod tests {
         );
         let cursor = Vec2::new(420.0, 300.0);
         run(&mut group, cursor, 20.0);
-        // Turning round, lying down or a neighbour's fidgeting never gets them up
-        assert_eq!(frames_moving(&mut group, cursor, 90.0), vec![0; 4]);
+        // Turning round, lying down or a neighbour's fidgeting never gets them up. The kitten
+        // wakes from its naps by itself and stands, but doesn't walk off.
+        let moving = frames_moving(&mut group, cursor, 90.0);
+        assert_eq!([moving[0], moving[1], moving[3]], [0; 3]);
+        assert!(
+            moving[2] < 40,
+            "the kitten only stands up after naps: {moving:?}"
+        );
 
         let bowl = Vec2::new(300.0, 250.0);
         group.begin_bowl_placement(FeedPreset::Mins15, bowl);
@@ -947,5 +1126,99 @@ mod tests {
         // Different cats make different choices
         let mut group = clowder(&[profile("Luna"), profile("Milo")], Vec2::new(600.0, 400.0));
         assert_ne!(group.cat_mut(0).rand_u32(), group.cat_mut(1).rand_u32());
+    }
+
+    #[test]
+    fn a_kitten_keeps_within_reach_of_its_mother() {
+        let start = Vec2::new(900.0, 600.0);
+        let mut group = clowder(&[profile("Luna"), kitten_of("Pip", "Luna")], start);
+        run(&mut group, start, 8.0);
+        // Shaken off, the mother wanders off while the kitten would follow the cursor
+        group.cat_mut(0).shoo();
+        let leash = CatSim::KITTEN_LEASH;
+        let (mut leashed, mut widest, mut from_cursor) = (0, 0.0f32, 0.0f32);
+        for frame in 0..(60.0 / DT) as usize {
+            group.update(start, DT);
+            let (mother, kitten) = (group.cat(0), group.cat(1));
+            leashed += usize::from(kitten.leashed);
+            if frame as f32 * DT > 5.0 {
+                widest = widest.max(kitten.nodes[0].distance(mother.body_point()));
+                from_cursor = from_cursor.max(kitten.nodes[0].distance(start));
+            }
+        }
+        assert!(leashed > 0, "the leash never held the kitten back");
+        assert!(
+            from_cursor > leash,
+            "the mother never went far: {from_cursor}"
+        );
+        assert!(
+            widest < leash * 1.35,
+            "the kitten got {widest} px from its mother"
+        );
+    }
+
+    #[test]
+    fn a_mother_fetches_her_kitten_that_wandered_off() {
+        let start = Vec2::new(900.0, 600.0);
+        let mut group = clowder(&[profile("Luna"), kitten_of("Pip", "Luna")], start);
+        run(&mut group, start, 8.0);
+        group.cat_mut(1).shoo();
+        let mut fetched = false;
+        for _ in 0..(120.0 / DT) as usize {
+            group.update(start, DT);
+            fetched |= group.cat(0).fetch_target.is_some();
+            if fetched && !group.cat(1).roaming {
+                break;
+            }
+        }
+        assert!(fetched, "the mother never went for her kitten");
+        assert!(!group.cat(1).roaming, "the kitten is still off on its own");
+        // Both come back to the cursor, the kitten at its mother's side
+        run(&mut group, start, 20.0);
+        let (mother, kitten) = (group.cat(0), group.cat(1));
+        assert!(mother.fetch_target.is_none());
+        assert!(mother.nodes[0].distance(start) < 100.0);
+        assert!(kitten.nodes[0].distance(mother.body_point()) < CatSim::KITTEN_LEASH);
+    }
+
+    #[test]
+    fn cats_get_to_know_each_other_and_friends_sit_closer() {
+        let start = Vec2::new(600.0, 400.0);
+        let mut group = clowder(
+            &[profile("Luna"), profile("Milo"), kitten_of("Pip", "Luna")],
+            start,
+        );
+        let first = group.bond(0, 1);
+        assert_eq!(first.familiarity, 0.0);
+        let family = group.bond(0, 2);
+        assert!(family.familiarity >= 0.9 && family.affection >= 0.8);
+        run(&mut group, start, 600.0);
+        let later = group.bond(0, 1);
+        assert!(later.familiarity > 0.2, "familiarity {}", later.familiarity);
+        assert!(
+            later.affection > first.affection + 0.1,
+            "affection {}",
+            later.affection
+        );
+
+        // Strangers leave each other more room than friends
+        let gap = |bond: Option<Bond>| {
+            let mut group = clowder(&[profile("Luna"), profile("Milo")], start);
+            if let Some(bond) = bond {
+                group.set_bond(0, 1, bond);
+            }
+            let cursor = Vec2::new(1000.0, 600.0);
+            run(&mut group, cursor, 20.0);
+            group.cat(0).nodes[0].distance(group.cat(1).nodes[0])
+        };
+        let strangers = gap(None);
+        let friends = gap(Some(Bond {
+            familiarity: 1.0,
+            affection: 0.9,
+        }));
+        assert!(
+            friends + 5.0 < strangers,
+            "friends {friends:.0} px apart, strangers {strangers:.0} px"
+        );
     }
 }

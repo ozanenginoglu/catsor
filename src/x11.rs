@@ -1,5 +1,6 @@
 use crate::Args;
 use crate::autostart;
+use crate::bonds::Bonds;
 use crate::cat::FeedPreset;
 use crate::cat::clowder::Clowder;
 use crate::coat::{Coat, CoatLibrary};
@@ -734,7 +735,10 @@ pub fn run(args: &Args, prefs: UserPrefs, coats: CoatLibrary) -> BoxResult<()> {
 
         let needs_raise = match app.process_events()? {
             Flow::Continue { needs_raise } => needs_raise,
-            Flow::Quit => return Ok(()),
+            Flow::Quit => {
+                app.clowder.save_bonds();
+                return Ok(());
+            }
         };
         app.release_stale_bowl_grab();
         app.step_cat(dt);
@@ -785,7 +789,8 @@ impl X11App {
             prefs.playful_quirks,
             &coats,
             start_cursor,
-        );
+        )
+        .with_bonds(Bonds::load());
         let _ = conn.randr_query_version(1, 5).map(|cookie| cookie.reply());
         let monitors = query_monitors(&conn, env.root);
 
@@ -1138,6 +1143,7 @@ impl X11App {
         {
             let cursor_pos = Vec2::new(reply.root_x as f32, reply.root_y as f32);
             self.clowder.update(cursor_pos, dt);
+            self.clowder.save_bonds_if_due();
             self.keep_awake.tick(&self.conn, self.clowder.keeps_awake());
         } else {
             self.keep_awake.set_active(&self.conn, false);
