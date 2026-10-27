@@ -1,6 +1,6 @@
 [package]
 name = "catsor"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 description = "Top-down procedural desktop cat companion for Linux (X11) and Windows that leisurely follows the cursor"
 license = "Apache-2.0"
