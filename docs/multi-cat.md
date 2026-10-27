@@ -1,6 +1,6 @@
 # Multiple cats (design)
 
-Status: **phases 1–3 are implemented** (multiple cats, slots, shared bowl, per-cat tray pages; awareness, kitten tuning, the leash, fetching and bonds; greetings, grooming each other, sleeping together and nursing; see `behavior.md` → "Several cats", "Sharing the bowl", "Kittens", "Doing things together" and "Bonds"). Phases 4–5 are still a proposal. When a phase lands, move what it settles into `behavior.md` / `animation.md` / `platform-notes.md` and trim it from here.
+Status: **phases 1–4 are implemented** (multiple cats, slots, shared bowl, per-cat tray pages; awareness, kitten tuning, the leash, fetching and bonds; greetings, grooming each other, sleeping together and nursing; play and friction; see `behavior.md` → "Several cats", "Sharing the bowl", "Kittens", "Doing things together", "Playing and squabbling" and "Bonds"). Phase 5 is still a proposal. When a phase lands, move what it settles into `behavior.md` / `animation.md` / `platform-notes.md` and trim it from here.
 
 Catsor today runs exactly one `CatSim` in one overlay window. This design covers two things: running several cats at once, and making them aware of each other: greeting, grooming, playing, squabbling, and mother cats raising kittens.
 
@@ -60,7 +60,7 @@ All cats follow. Instead of one `rest_target` per cat at `stop_radius` from the 
 - A kitten's slot is next to its mother's. *(Not done: kittens take their own slots after the grown cats; the leash keeps them within reach of their mother.)*
 - Temperament keeps working per cat: an Aloof cat can still hang back or take its AloofNotice pause, and a Lazy cat may stay asleep while the others move.
 - **Spacing:** separation steering while walking, plus a personal-space radius by temperament (Aloof large, Playful small, kitten↔mother almost zero). Cats only overlap during joint activities.
-- **Laser wiggle:** every cat in range gets excited, but only one gets to pounce on the cursor. The losers sit and flick their tails, or pounce on the winner's tail.
+- **Laser wiggle:** every cat in range gets excited, but only one gets to pounce on the cursor. The losers sit and flick their tails, or pounce on the winner's tail. *(Done. Only kittens and Playful cats go for the winner's tail; the winner doesn't notice.)*
 - **Shake over a cat** starts roaming for that cat only.
 - **Follow Cursor off** makes every cat roam. Kittens then stay within the leash of their roaming mother instead of wandering alone, and friends sometimes wander together. **Playful Hunting** is likewise one switch for everyone.
 
@@ -68,7 +68,7 @@ All cats follow. Instead of one `rest_target` per cat at `stop_radius` from the 
 
 - One bowl; the Clowder runs a **queue**. One cat eats; the others sit near the bowl watching, tails twitching.
 - Queue order depends on bonds and temperament: a **mother always lets her kittens eat first** and waits beside them, and Aloof cats wait their turn.
-- Friction: a pushy cat (Playful, or a kitten with a weak bond to the eater) sometimes head-butts in. The eater either gives way, or flattens its ears and gives a short paw swat, and the pushy cat backs off.
+- Friction: a pushy cat (Playful, or a kitten with a weak bond to the eater) sometimes head-butts in. The eater either gives way, or flattens its ears and gives a short paw swat, and the pushy cat backs off. *(Done; the push is walking up beside the eater's face rather than a drawn head-butt.)*
 - The eating session ends when every queued cat has eaten or the feed preset ends. Keep-awake stays as it is.
 
 ## Social behaviours
@@ -92,14 +92,14 @@ These are in roughly ascending cost. Each is a new `Activity` variant (or a role
 
 ### Play
 - **Tail stalk:** StalkWiggle → Pouncing aimed at another cat's tail tip instead of the cursor. Mostly reuses existing code.
-- **Chase:** one gallops off, the other chases; they sometimes swap roles.
-- **Wrestle:** a short tangle, both rolling BellyUp and PawBatting, then both groom ("we weren't fighting").
+- **Chase:** one gallops off, the other chases; they sometimes swap roles. *(Done: the runner circles the cursor, so a chase never leaves the screen area the user is at.)*
+- **Wrestle:** a short tangle, both rolling BellyUp and PawBatting, then both groom ("we weren't fighting"). *(Done face to face, taking turns; the two bodies aren't drawn tangled together.)*
 - **Zoomies spread:** a Playful friend or kitten joins a cat that has the zoomies.
 
 ### Friction
-- **Play escalation** (mostly kitten↔kitten): a wrestle or chase gets too rough, one **puffs up** (thicker tail outline, ears flattened back, body arched a little), there's a short standoff, they break apart, and both groom.
+- **Play escalation** (mostly kitten↔kitten): a wrestle or chase gets too rough, one **puffs up** (thicker tail outline, ears flattened back, body arched a little), there's a short standoff, they break apart, and both groom. *(Done; from above, the arch shows as a slightly shorter, bowed body standing side-on, with its fur fluffed out.)*
 - **Pestering:** a kitten keeps pouncing on a non-mother adult's tail; the adult tolerates it for a while, then gives a paw swat or walks off with its tail held still.
-- **Crowding an Aloof cat:** it turns away and leaves; repeated crowding means a standoff.
+- **Crowding an Aloof cat:** it turns away and leaves; repeated crowding means a standoff. *(Not done: Aloof cats only keep more space and squabble more readily.)*
 - Friction costs a little affection (see Bonds); greetings and grooming each other win it back.
 
 ## Mother and kitten
@@ -107,9 +107,9 @@ These are in roughly ascending cost. Each is a new `Activity` variant (or a role
 - **Leash:** the kitten follows the cursor but stays within a leash radius of its mother. If she's too far, it trots over to her first, tail up.
 - **Watching over:** the mother tracks her kitten with her head while resting. If it strays past a larger radius, she gets up and fetches it (walks to it, nose boop, walks back with it following). *(Done without the nose boop, which comes with the greetings in phase 3.)*
 - **Carrying by the scruff** (stretch goal): if the kitten is very far, or asleep away from her, she picks it up by the scruff and carries it back. The kitten hangs limp from her mouth, with its chain anchored to her head node. This needs special handling for the render order and windows.
-- **Grooming:** the mother grooms her kitten much more often than adults groom each other. The kitten squirms and escapes after a while (mild friction that costs no affection).
+- **Grooming:** the mother grooms her kitten much more often than adults groom each other. The kitten squirms and escapes after a while (mild friction that costs no affection). *(The squirming isn't done.)*
 - **Nursing / naps:** when the mother lies on her side (DramaticFlop pose), her kittens curl into the curve of her belly. Awake kittens there knead (front paws alternating). *(Done for the mother lying down in any pose or asleep: the kitten kneads 6–12 s against her side, then naps there.)*
-- **Tail lure:** the mother flicks her tail on purpose to get the kitten to play. She tolerates tail pounces far longer than other adults do, and ends it with a gentle head boop.
+- **Tail lure:** the mother flicks her tail on purpose to get the kitten to play. She tolerates tail pounces far longer than other adults do, and ends it with a gentle head boop. *(Done, the boop as a nose boop.)*
 - **Food:** her kittens eat first (see Shared bowl).
 - **Siblings** (same mother) start with a high bond: more wrestling, sleeping in piles, and more play escalation.
 
@@ -141,5 +141,5 @@ The Realistic temperament keeps the rule from `behavior.md`: social interactions
 1. **Multiple cats (done):** `[[cat]]` config with names, `kitten`, `mother` and migration; `Clowder` with slots and spacing; a window per cat on X11 and Win32; tray Cats section; shared bowl queue (with mother-first). Kittens use adult behaviour at a smaller size for now.
 2. **Awareness and kittens (done):** head tracking, tail-up, copying, startle; kitten tuning; the leash and the mother watching over her kitten; bonds with persistence.
 3. **Paired interactions (done):** nose boop, head bunt, sniff circle, grooming each other, sleeping together, nursing/kneading.
-4. **Play and friction:** tail stalk, chase, wrestle, zoomies spreading, laser competition, play escalation and puffing up, pestering, bowl friction, tail lure.
+4. **Play and friction (done):** tail stalk, chase, wrestle, zoomies spreading, laser competition, play escalation and puffing up, pestering, bowl friction, tail lure.
 5. **Stretch:** carrying by the scruff, growing up, coat inheritance.

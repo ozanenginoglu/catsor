@@ -1,5 +1,5 @@
 use super::{
-    Activity, BODY_NODES, CatSim, FeedPreset, FeedingPhase, SocialKind, Temperament,
+    Activity, BODY_NODES, CatSim, FeedPreset, FeedingPhase, SocialKind, SocialRole, Temperament,
     dist_to_segment, pounce_stretch, pounce_travel, smoothstep, wrap_angle,
 };
 use glam::Vec2;
@@ -38,6 +38,8 @@ struct Steering {
     fetching: bool,
     /// On its way to another cat for something they do together
     social_errand: bool,
+    /// Backing off from another cat
+    retreating: bool,
     to_target: Vec2,
     dist_to_target: f32,
     /// Where the cat looks and turns to: the cursor, or while roaming where it is going
@@ -54,6 +56,7 @@ impl Steering {
             || self.make_way
             || self.fetching
             || self.social_errand
+            || self.retreating
             || self.dist_to_cursor > radius
     }
 }
@@ -114,7 +117,8 @@ impl CatSim {
             1.0 + 0.25 * self.gallop_weight
         } else {
             1.0
-        };
+        }
+        .max(1.0 + 0.85 * self.bristle);
         self.tail_puff += (target_puff - self.tail_puff) * (1.0 - (-dt * 6.0).exp());
 
         // 2. State machine transitions
@@ -740,13 +744,21 @@ impl CatSim {
             self.slot_settled_at = Some(effective_target_cursor);
         }
         let social_point = self.social_target();
+        let retreat_point = self.retreat_point();
         if hunting {
-            // A crouch or leap under way keeps its own target
+            // A crouch or leap under way keeps its own target, following another cat's tail tip
+            if let Some((e, p)) = self.social_partner()
+                && e.kind == SocialKind::TailStalk
+            {
+                self.rest_target = p.tail_tip;
+            }
         } else if let Some(point) = social_point {
             self.rest_target = point;
         } else if self.social.is_some() {
             // Doing its part with another cat right here
             self.rest_target = head_pos;
+        } else if let Some(point) = retreat_point {
+            self.rest_target = point;
         } else if let Some(point) = fetch_point {
             self.rest_target = point;
         } else if self.roaming {
@@ -793,6 +805,7 @@ impl CatSim {
             && slot_point.is_some_and(|p| head_pos.distance(p) > Self::SLOT_ARRIVAL * self.scale);
         let fetching = fetch_point.is_some_and(|p| head_pos.distance(p) > 8.0 * self.scale);
         let social_errand = social_point.is_some_and(|p| head_pos.distance(p) > 8.0 * self.scale);
+        let retreating = retreat_point.is_some();
 
         // A roaming cat is moved by having somewhere to go (`roam_errand`), not by the cursor.
         // A cat with a spot of its own measures from that spot, as if it were sitting
@@ -837,6 +850,8 @@ impl CatSim {
         let wants_to_pounce = !self.roaming
             && fetch_point.is_none()
             && self.social.is_none()
+            && self.retreat.is_none()
+            && !self.laser_rival
             && !self.is_waiting_for_bowl()
             && self.behaviors.playful_quirks
             && self.play_excitement > 0.55
@@ -852,6 +867,7 @@ impl CatSim {
             make_way,
             fetching,
             social_errand,
+            retreating,
             to_target,
             dist_to_target: to_target.length(),
             look_angle,
@@ -946,7 +962,18 @@ impl CatSim {
             } => {
                 self.idle_time += dt;
                 timer += dt;
-                if steer.wakes(wake_radius_sit) {
+                if timer >= duration
+                    && let Some(before) = self.swat_return.take()
+                {
+                    // Swatted the cat pushing in; back to eating
+                    self.activity = before;
+                } else if self.swat_return.is_some() {
+                    self.activity = Activity::PawBatting {
+                        side,
+                        timer,
+                        duration,
+                    };
+                } else if steer.wakes(wake_radius_sit) {
                     self.activity = Activity::StandingUp { progress: 0.2 };
                     self.idle_time = 0.0;
                 } else if timer >= duration {
@@ -1174,6 +1201,29 @@ impl CatSim {
                     self.activity = Activity::Kneading { timer, duration };
                 }
             }
+            Activity::Standoff {
+                mut timer,
+                duration,
+            } => {
+                timer += dt;
+                self.idle_time = 0.0;
+                // Faces the other cat; the puffed-up one stands side-on to it, looking bigger
+                if let Some((e, p)) = self.social_partner() {
+                    let to = p.center - self.body_point();
+                    let side_on = if e.role == SocialRole::Active {
+                        std::f32::consts::FRAC_PI_2 * e.side
+                    } else {
+                        0.0
+                    };
+                    let want = to.y.atan2(to.x) + side_on;
+                    let err = wrap_angle(want - self.body_angle);
+                    self.body_angle = wrap_angle(self.body_angle + err * (dt * 2.5).min(1.0));
+                }
+                self.activity = Activity::Standoff { timer, duration };
+                if timer >= duration || self.social.is_none() {
+                    self.activity = Activity::StandingIdle { timer: 0.0 };
+                }
+            }
         }
     }
 
@@ -1189,8 +1239,19 @@ impl CatSim {
     /// Stops what it was doing with another cat straight away (the cursor moved off, or the
     /// other cat is gone) and gets up to carry on
     pub(super) fn abandon_social(&mut self) {
-        self.social = None;
-        if matches!(
+        let was = self.social.take();
+        if let Some(before) = self.swat_return.take() {
+            self.activity = before;
+            return;
+        }
+        if matches!(self.activity, Activity::StalkWiggle { .. })
+            && was.is_some_and(|e| e.kind == SocialKind::TailStalk)
+        {
+            self.manual_pounce = false;
+        }
+        if matches!(self.activity, Activity::Standoff { .. }) {
+            self.activity = Activity::StandingIdle { timer: 0.0 };
+        } else if matches!(
             self.activity,
             Activity::Greeting { .. }
                 | Activity::Sniffing { .. }
@@ -1593,6 +1654,13 @@ impl CatSim {
 
     fn steer_walk(&mut self, steer: &Steering, tuning: &TemperamentTuning, dt: f32) {
         let dist_to_target = steer.dist_to_target;
+        // Chasing another cat, or being chased, is a gallop like a sprint to the cursor, flat
+        // out right up to the other cat
+        let chase = self
+            .social
+            .filter(|e| e.kind == SocialKind::Chase && e.acting)
+            .map(|e| e.role);
+        let racing = self.sprinting || chase.is_some();
         let mut desired_dir = if dist_to_target > 0.5 {
             steer.to_target / dist_to_target
         } else {
@@ -1603,7 +1671,11 @@ impl CatSim {
         if dist_to_target > my_radius {
             let head = self.nodes[0];
             let mut push = Vec2::ZERO;
-            let partner = self.social.map(|e| e.partner);
+            // Up to the cat it's doing something with, except round to its tail
+            let partner = self
+                .social
+                .filter(|e| e.kind != SocialKind::TailStalk)
+                .map(|e| e.partner);
             for (_, n) in self
                 .neighbors
                 .iter()
@@ -1631,19 +1703,19 @@ impl CatSim {
         // (R = v / omega) stays graceful and compact rather than sweeping wide loops.
         let proximity_boost =
             1.0 + ((90.0 * self.scale - dist_to_target).max(0.0) / (90.0 * self.scale)) * 0.65;
-        let base_turn = if self.sprinting { 10.5 } else { 5.6 };
-        let turn_gain = if self.sprinting { 13.5 } else { 7.5 };
+        let base_turn = if racing { 10.5 } else { 5.6 };
+        let turn_gain = if racing { 13.5 } else { 7.5 };
         let max_turn_rate = base_turn * proximity_boost;
         let desired_turn =
             (angle_err * turn_gain * proximity_boost).clamp(-max_turn_rate, max_turn_rate);
-        let turn_smooth = 1.0 - (-dt * if self.sprinting { 18.0 } else { 14.0 }).exp();
+        let turn_smooth = 1.0 - (-dt * if racing { 18.0 } else { 14.0 }).exp();
         self.angular_vel += (desired_turn - self.angular_vel) * turn_smooth;
         self.body_angle = wrap_angle(self.body_angle + self.angular_vel * dt);
 
         // Leisurely speed profile (Walk at <300px distance, relaxed Trot when further away),
         // or bounding rotary gallop when triggered by rapid left-right cursor shake.
         let turn_slowdown = ((1.0 + angle_err.cos()) * 0.5).max(0.22);
-        let slow_radius = if self.sprinting {
+        let slow_radius = if racing {
             68.0 * self.scale
         } else {
             95.0 * self.scale
@@ -1656,7 +1728,7 @@ impl CatSim {
                 ((dist_to_target / self.scale - 20.0) / 40.0).clamp(0.0, 1.0),
             ));
         }
-        let cruise_speed = if self.sprinting {
+        let cruise_speed = if racing {
             (290.0 + 75.0 * trot_ramp) * self.scale * tuning.speed_mult
         } else {
             (tuning.walk_cruise + (tuning.trot_cruise - tuning.walk_cruise) * trot_ramp)
@@ -1667,12 +1739,14 @@ impl CatSim {
         let rubbing = self
             .social
             .is_some_and(|e| e.kind == SocialKind::HeadBunt && e.acting);
-        let (cruise_speed, slow_radius) = if rubbing {
-            (cruise_speed.min(32.0 * self.scale), 12.0 * self.scale)
-        } else {
-            (cruise_speed, slow_radius)
+        let (cruise_speed, slow_radius) = match chase {
+            _ if rubbing => (cruise_speed.min(32.0 * self.scale), 12.0 * self.scale),
+            // The chaser is a little faster, so it catches up in the end
+            Some(SocialRole::Active) => (Self::CHASER_SPEED * self.scale, 4.0 * self.scale),
+            Some(SocialRole::Passive) => (Self::RUNNER_SPEED * self.scale, 4.0 * self.scale),
+            None => (cruise_speed, slow_radius),
         };
-        let brake_exp = if self.sprinting { 0.68 } else { 0.92 };
+        let brake_exp = if racing { 0.68 } else { 0.92 };
         let target_speed = if dist_to_target < slow_radius {
             cruise_speed * (dist_to_target / slow_radius).powf(brake_exp)
         } else {
@@ -1682,8 +1756,8 @@ impl CatSim {
         let speed_rate = if dist_to_target < 12.0 * self.scale {
             24.0
         } else if target_speed < self.speed {
-            if self.sprinting { 16.0 } else { 9.0 }
-        } else if self.sprinting {
+            if racing { 16.0 } else { 9.0 }
+        } else if racing {
             16.0
         } else {
             5.5
@@ -1691,7 +1765,7 @@ impl CatSim {
         let accel = 1.0 - (-dt * speed_rate).exp();
         self.speed += (target_speed - self.speed) * accel;
 
-        let target_gallop = if self.sprinting {
+        let target_gallop = if racing {
             smoothstep(((self.speed / self.scale - 90.0) / 80.0).clamp(0.0, 1.0))
         } else {
             0.0
@@ -1757,6 +1831,8 @@ impl CatSim {
             Activity::GroomingOther { .. } => (1.16, 0.09 * self.curl_side),
             Activity::Kneading { .. } => (1.26, 0.07 * self.curl_side),
             Activity::Sniffing { dir, .. } => (1.45, 0.22 * dir),
+            // Back arched (a little shorter seen from above), body bowed toward the other cat
+            Activity::Standoff { .. } => (1.42, 0.16 * self.curl_side),
             Activity::StandingUp { .. }
             | Activity::Walking
             | Activity::StandingIdle { .. }

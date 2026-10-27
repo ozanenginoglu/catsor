@@ -20,6 +20,12 @@ impl CatSim {
             self.ear_left_twitch = -0.24;
             self.ear_right_twitch = -0.24;
         }
+        // Ears flattened sideways at a cat it is cross with
+        if self.bristle > 0.05 {
+            let flat = -0.5 * self.bristle;
+            self.ear_left_twitch = self.ear_left_twitch.min(flat);
+            self.ear_right_twitch = self.ear_right_twitch.min(flat);
+        }
         let desired_yaw = match self.activity {
             Activity::Sleeping => self.curl_side * 2.38 + (self.time * 1.2).sin() * 0.02,
             Activity::BellyUp { side, timer } => -side * 0.22 + (timer * 1.6).sin() * 0.12,
@@ -40,8 +46,12 @@ impl CatSim {
                 }
             }
             Activity::PawBatting { side, timer, .. } => {
-                // Intently watches the cursor while batting at it, then glances away
-                let rel = wrap_angle(look_angle - self.body_angle).clamp(-0.6, 0.6);
+                // Intently watches the cursor (or the cat) while batting at it, then glances away
+                let at = match (self.social, watch_angle) {
+                    (Some(_), Some(angle)) => angle,
+                    _ => look_angle,
+                };
+                let rel = wrap_angle(at - self.body_angle).clamp(-0.6, 0.6);
                 rel * 0.7 + (timer * 14.0).sin() * 0.06 * side
             }
             Activity::TailChasing { dir, .. } => {
@@ -50,8 +60,8 @@ impl CatSim {
             }
             // Looking down and into the circle at the spot it is about to lie on
             Activity::Circling { dir, .. } => dir * 0.3,
-            // Nose to nose with the other cat
-            Activity::Greeting { .. } => {
+            // Nose to nose with the other cat, or glaring at it
+            Activity::Greeting { .. } | Activity::Standoff { .. } => {
                 watch_angle.map_or(0.0, |a| wrap_angle(a - self.body_angle).clamp(-0.9, 0.9))
             }
             // Nose toward the other cat's rear, inside the circle
@@ -365,6 +375,16 @@ impl CatSim {
                 turn_counterbalance,
             ),
             Activity::StandingUp { .. } | Activity::StandingIdle { .. } => (0.12, 1.35, 0.0),
+            Activity::Standoff { .. } => (0.08, 1.0, 0.0),
+        };
+        // Lashing: wide, quick sweeps (and out from round the paws, for a kitten to pounce on)
+        let (sway_amp, sway_speed) = if self.tail_lash > 0.0 {
+            (
+                sway_amp.max(0.42 * self.tail_lash),
+                sway_speed + (4.2 - sway_speed).max(0.0) * self.tail_lash,
+            )
+        } else {
+            (sway_amp, sway_speed)
         };
 
         // Held up (to greet a friend) it sways less; held still near a cat it dislikes, hardly at all
@@ -387,7 +407,8 @@ impl CatSim {
                 | Activity::Grooming { .. }
                 | Activity::GroomingOther { .. }
                 | Activity::AloofNotice { .. }
-        ) && !self.sit_turning;
+        ) && !self.sit_turning
+            && self.tail_lash < 0.3;
         let wrap_rate = if wraps_tail { 1.6 } else { 5.0 };
         self.sit_tail_wrap += (f32::from(u8::from(wraps_tail)) - self.sit_tail_wrap)
             * (1.0 - (-dt * wrap_rate).exp());

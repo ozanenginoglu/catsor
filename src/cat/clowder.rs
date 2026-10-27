@@ -5,8 +5,8 @@
 //! first.
 
 use super::{
-    CatSim, FeedPreset, Kinship, Neighbor, Pose, Slot, SocialKind, SocialRole, Temperament,
-    wrap_angle,
+    Activity, CatSim, FeedPreset, Kinship, Neighbor, Pose, Slot, SocialKind, SocialRole,
+    TOTAL_NODES, Temperament, wrap_angle,
 };
 use crate::bonds::{Bond, Bonds};
 use crate::coat::{Coat, CoatId, CoatLibrary, fresh_seed};
@@ -28,12 +28,27 @@ const BONDS_SAVE_SECS: f32 = 300.0;
 const DIRECTOR_TICK: f32 = 0.5;
 /// How long (seconds) two cats must have been apart to greet each other when they meet again
 const GREET_AFTER: f32 = 90.0;
+/// How long (seconds) a pair rests from playing after playing, and after a squabble
+const PLAY_REST: f32 = 25.0;
+const SQUABBLE_REST: f32 = 120.0;
+/// How long (seconds) the cat that got the laser dot keeps it after it last crouched or leapt
+const LASER_HOLD: f32 = 3.0;
 
 /// Names handed to cats added from the tray, in order, skipping names already in use
 const NAMES: [&str; 12] = [
     "Luna", "Milo", "Pip", "Mochi", "Olive", "Biscuit", "Nori", "Ziggy", "Maple", "Tofu",
     "Juniper", "Pepper",
 ];
+
+/// Something the director might start between two cats this tick, and the chance it does
+struct Idea {
+    active: usize,
+    passive: usize,
+    kind: SocialKind,
+    chance: f32,
+    /// `Engagement::limit`
+    limit: u8,
+}
 
 /// One cat as saved in the config: who it is and how it looks and behaves
 #[derive(Debug, Clone, PartialEq)]
@@ -129,6 +144,12 @@ pub struct Clowder {
     rng_state: u64,
     /// Whether cats start doing things together (off in tests of other mechanics)
     social: bool,
+    /// The cat hunting the laser dot (the wiggling cursor); the others leave it to that one
+    hunter: Option<usize>,
+    /// Time left before the hunter gives the dot up, having stopped hunting it
+    hunter_hold: f32,
+    /// Seconds each pair (by name) still rests from playing together
+    play_rest: BTreeMap<(String, String), f32>,
 }
 
 impl Clowder {
@@ -155,6 +176,9 @@ impl Clowder {
             director_timer: DIRECTOR_TICK,
             rng_state: 0x2545_f491_4f6c_dd1d,
             social: true,
+            hunter: None,
+            hunter_hold: 0.0,
+            play_rest: BTreeMap::new(),
         };
         let default_profile = [CatProfile::default()];
         let profiles = if profiles.is_empty() {
@@ -372,7 +396,9 @@ impl Clowder {
             m.cat.fetch_target = None;
             m.partner = None;
             m.cat.end_social();
+            m.cat.laser_rival = false;
         }
+        self.hunter = None;
         if let Some(session) = &mut self.feeding {
             if session.eater == Some(i) {
                 session.eater = None;
@@ -395,6 +421,7 @@ impl Clowder {
     pub fn update(&mut self, cursor: Vec2, dt: f32) {
         self.share_neighbors();
         self.update_fetching();
+        self.referee_laser(dt);
         self.tend_engagements();
         self.direct(dt);
         self.assign_slots();
@@ -479,6 +506,7 @@ impl Clowder {
                 seen.push(Neighbor {
                     head: cat.nodes[0],
                     center: cat.body_point(),
+                    tail_tip: cat.nodes[TOTAL_NODES - 1],
                     radius: CatSim::PERSONAL_SPACE * cat.scale,
                     scale: cat.scale,
                     speed: cat.speed,
@@ -587,7 +615,8 @@ impl Clowder {
     }
 
     /// Ends what two cats were doing together once either is done with it (or was pulled
-    /// away), for both. Something that went well warms them to each other a little.
+    /// away), for both, and starts whatever follows from it. Something that went well warms
+    /// them to each other a little; friction cools them a little.
     fn tend_engagements(&mut self) {
         for i in 0..self.members.len() {
             let Some(j) = self.members[i].partner else {
@@ -596,19 +625,39 @@ impl Clowder {
                 }
                 continue;
             };
+            let over = |c: &CatSim| c.social.is_none_or(|e| e.done);
+            // Pouncing on the tail of a cat busy with the laser dot: only one of them knows
+            if self.members[j].partner != Some(i) {
+                if over(&self.members[i].cat) {
+                    self.members[i].cat.end_social();
+                    self.members[i].partner = None;
+                }
+                continue;
+            }
             if j < i {
                 continue;
             }
-            let over = |c: &CatSim| c.social.is_none_or(|e| e.done);
-            let (a, b) = (&self.members[i].cat, &self.members[j].cat);
+            // Which one went over (the first, when both did)
+            let (act, pas) = match self.members[i].cat.social {
+                Some(e) if e.role == SocialRole::Passive => (j, i),
+                _ => (i, j),
+            };
+            let (ea, ep) = (self.members[act].cat.social, self.members[pas].cat.social);
+            if let (Some(e), Some(_)) = (ea, ep)
+                && e.kind == SocialKind::BowlPush
+                && e.acting
+                && !e.done
+            {
+                self.settle_bowl_push(act, pas);
+                continue;
+            }
+            let (a, b) = (&self.members[act].cat, &self.members[pas].cat);
             if over(a) || over(b) {
                 // Neither was pulled away, and they got to it
-                let went_well = a.social.is_some()
-                    && b.social.is_some()
-                    && [a, b]
-                        .into_iter()
-                        .any(|c| c.social.is_some_and(|e| e.acting));
-                let warmth = match a.social.or(b.social).map(|e| e.kind) {
+                let both = ea.is_some() && ep.is_some();
+                let went_well = both && [ea, ep].into_iter().flatten().any(|e| e.acting);
+                let kind = ea.or(ep).map(|e| e.kind);
+                let warmth = match kind {
                     Some(SocialKind::Groom) => 0.06,
                     Some(SocialKind::NoseBoop | SocialKind::HeadBunt | SocialKind::SniffCircle) => {
                         0.03
@@ -616,27 +665,275 @@ impl Clowder {
                     _ => 0.0,
                 };
                 if went_well && warmth > 0.0 {
-                    let mut bond = self.bond(i, j);
-                    bond.affection = (bond.affection + warmth).min(1.0);
-                    let (na, nb) = (self.members[i].name.clone(), self.members[j].name.clone());
-                    self.bonds.set(&na, &nb, bond);
+                    self.nudge_affection(act, pas, warmth);
                 }
-                for k in [i, j] {
+                for k in [act, pas] {
                     self.members[k].cat.end_social();
                     self.members[k].partner = None;
+                }
+                if let (Some(kind), Some(e), true) = (kind, ea, both) {
+                    self.follow_up(kind, e, act, pas);
                 }
                 continue;
             }
             // The cat that stays put shares in it once the other one gets there
             let acting = a.social.is_some_and(|e| e.acting) || b.social.is_some_and(|e| e.acting);
-            for k in [i, j] {
+            for k in [act, pas] {
                 if let Some(e) = &mut self.members[k].cat.social
                     && e.role == SocialRole::Passive
                 {
                     e.acting = acting;
+                    // How many times its tail was pounced on, to grow more annoyed
+                    if e.kind == SocialKind::TailStalk {
+                        e.rounds = ea.map_or(0, |e| e.rounds);
+                    }
                 }
             }
         }
+    }
+
+    /// What happens after play or a squabble that ran its course (`e` is the active cat's half)
+    fn follow_up(&mut self, kind: SocialKind, e: super::Engagement, act: usize, pas: usize) {
+        if kind.is_play() {
+            self.rest_from_play(act, pas, PLAY_REST);
+        }
+        match kind {
+            SocialKind::TailStalk if e.rounds >= e.limit => {
+                if self.kinship(act, pas) == Kinship::Mother {
+                    // Its mother has had enough: a gentle boop, nose to nose
+                    self.engage(act, pas, SocialKind::NoseBoop);
+                    self.nudge_affection(act, pas, 0.02);
+                } else if self.members[act].kitten && !self.members[pas].kitten {
+                    // A grown cat pestered by a kitten swats it, or gets up and walks off
+                    if self.rand_f32() < 0.5 {
+                        self.engage_with(pas, act, SocialKind::Swat, 1);
+                    } else {
+                        let from = self.members[act].cat.nodes[0];
+                        self.members[pas].cat.back_off(from, 90.0);
+                        self.nudge_affection(act, pas, -0.02);
+                        self.rest_from_play(act, pas, SQUABBLE_REST);
+                    }
+                } else {
+                    self.nudge_affection(act, pas, 0.02);
+                }
+            }
+            // Caught up: they swap round, roll into a wrestle, or it gets too rough
+            SocialKind::Chase if e.rounds > 0 => {
+                let roll = self.rand_f32();
+                if e.limit > 0 && roll < 0.4 {
+                    self.engage_with(pas, act, SocialKind::Chase, e.limit - 1);
+                } else if roll < 0.7 {
+                    let turns = self.wrestle_turns();
+                    self.engage_with(act, pas, SocialKind::Wrestle, turns);
+                } else if self.rand_f32() < self.escalation(act, pas) {
+                    self.start_standoff(act, pas);
+                } else {
+                    self.nudge_affection(act, pas, 0.02);
+                }
+            }
+            SocialKind::Wrestle if e.rounds >= e.limit => {
+                if self.rand_f32() < self.escalation(act, pas) {
+                    self.start_standoff(act, pas);
+                } else {
+                    // "We weren't fighting"
+                    for k in [act, pas] {
+                        self.members[k].cat.groom_it_off();
+                    }
+                    self.nudge_affection(act, pas, 0.02);
+                }
+            }
+            // They break apart and both groom
+            SocialKind::Standoff if e.acting => {
+                let (pa, pb) = (
+                    self.members[act].cat.body_point(),
+                    self.members[pas].cat.body_point(),
+                );
+                let (da, db) = (55.0 + 20.0 * self.rand_f32(), 55.0 + 20.0 * self.rand_f32());
+                self.members[act].cat.back_off(pb, da);
+                self.members[pas].cat.back_off(pa, db);
+                self.nudge_affection(act, pas, -0.05);
+                self.rest_from_play(act, pas, SQUABBLE_REST);
+            }
+            // The swatted cat backs off
+            SocialKind::Swat if e.acting => {
+                let from = self.members[act].cat.nodes[0];
+                self.members[pas].cat.back_off(from, 35.0);
+                self.nudge_affection(act, pas, -0.04);
+                self.rest_from_play(act, pas, SQUABBLE_REST);
+            }
+            _ => {}
+        }
+    }
+
+    /// A cat pushing in at the bowl got there: the one eating gives way (a mother always lets
+    /// her kitten), or swats it
+    fn settle_bowl_push(&mut self, pusher: usize, eater: usize) {
+        for k in [pusher, eater] {
+            self.members[k].cat.end_social();
+            self.members[k].partner = None;
+        }
+        let gives_way = if self.kinship(pusher, eater) == Kinship::Mother {
+            0.9
+        } else {
+            match self.members[eater].cat.behaviors.temperament {
+                Temperament::Lazy => 0.6,
+                Temperament::Balanced => 0.45,
+                Temperament::Playful | Temperament::Realistic => 0.4,
+                Temperament::Aloof => 0.25,
+            }
+        };
+        self.rest_from_play(pusher, eater, 60.0);
+        if self.rand_f32() < gives_way {
+            self.nudge_affection(pusher, eater, -0.01);
+            self.hand_over_bowl(eater, pusher);
+        } else {
+            self.engage_with(eater, pusher, SocialKind::Swat, 1);
+        }
+    }
+
+    /// The cat eating steps back for one that pushed in, and goes to the back of the queue
+    fn hand_over_bowl(&mut self, eater: usize, pusher: usize) {
+        let Some(session) = &mut self.feeding else {
+            return;
+        };
+        let Some(bowl_pos) = session.bowl_pos else {
+            return;
+        };
+        if session.eater != Some(eater) {
+            return;
+        }
+        let turn = Self::remaining(session).map_or(TURN_SECS, |r| r.min(TURN_SECS));
+        session.queue.retain(|&q| q != pusher);
+        session.queue.push_back(eater);
+        session.eater = Some(pusher);
+        let preset = session.preset;
+        self.members[eater].cat.wait_for_bowl(preset, bowl_pos);
+        self.members[pusher]
+            .cat
+            .place_bowl_for_turn(bowl_pos, Some(turn));
+    }
+
+    /// Now and then, a pushy cat waiting for the bowl (a Playful one, or a kitten that hardly
+    /// knows the one eating) pushes in beside the cat eating
+    fn stir_bowl(&mut self) {
+        let Some(e) = self.feeding.as_ref().and_then(|s| s.eater) else {
+            return;
+        };
+        let eating_a_while = matches!(
+            self.members[e].cat.activity,
+            Activity::Eating { elapsed, .. } if elapsed > 6.0
+        );
+        if !eating_a_while || self.members[e].partner.is_some() {
+            return;
+        }
+        let per_tick = 1.0 - (-DIRECTOR_TICK / 40.0_f32).exp();
+        for w in 0..self.members.len() {
+            let m = &self.members[w];
+            if w == e
+                || m.partner.is_some()
+                || !m.cat.is_waiting_for_bowl()
+                || !Pose::of(&m.cat).is_resting()
+                || self.resting_from_play(w, e)
+            {
+                continue;
+            }
+            let kin = self.kinship(w, e);
+            let pushy = m.cat.behaviors.temperament == Temperament::Playful
+                || (m.kitten && !kin.is_family() && self.bond(w, e).affection < 0.3)
+                || (m.kitten && kin == Kinship::Mother);
+            if pushy && self.rand_f32() < per_tick {
+                self.engage(w, e, SocialKind::BowlPush);
+                return;
+            }
+        }
+    }
+
+    /// Picks one cat with the laser dot (the cursor wiggled at pounce range) when several want
+    /// it, the one nearest the dot; the others sit back and watch, tails twitching
+    fn referee_laser(&mut self, dt: f32) {
+        let n = self.members.len();
+        if n < 2 {
+            return;
+        }
+        if let Some(h) = self.hunter {
+            if h < n && self.members[h].cat.hunting_cursor() {
+                self.hunter_hold = LASER_HOLD;
+            } else {
+                self.hunter_hold -= dt;
+                if h >= n || self.hunter_hold <= 0.0 {
+                    self.hunter = None;
+                }
+            }
+        }
+        if self.hunter.is_none() {
+            self.hunter = (0..n)
+                .filter(|&i| self.members[i].cat.hunting_cursor())
+                .min_by(|&a, &b| {
+                    let d = |i: usize| {
+                        let c = &self.members[i].cat;
+                        c.nodes[0].distance(c.raw_cursor)
+                    };
+                    d(a).total_cmp(&d(b))
+                });
+            self.hunter_hold = LASER_HOLD;
+        }
+        for i in 0..n {
+            let rival = self.hunter.is_some_and(|h| h != i);
+            let cat = &mut self.members[i].cat;
+            cat.laser_rival = rival;
+            if rival {
+                cat.yield_pounce();
+            }
+        }
+    }
+
+    fn nudge_affection(&mut self, i: usize, j: usize, delta: f32) {
+        let mut bond = self.bond(i, j);
+        bond.affection = (bond.affection + delta).clamp(-1.0, 1.0);
+        let bond = bond.with_floor(self.kinship(i, j));
+        let (a, b) = (self.members[i].name.clone(), self.members[j].name.clone());
+        self.bonds.set(&a, &b, bond);
+    }
+
+    fn rest_from_play(&mut self, i: usize, j: usize, secs: f32) {
+        let key = self.pair_key(i, j);
+        let rest = self.play_rest.entry(key).or_insert(0.0);
+        *rest = rest.max(secs);
+    }
+
+    fn resting_from_play(&self, i: usize, j: usize) -> bool {
+        self.play_rest
+            .get(&self.pair_key(i, j))
+            .is_some_and(|&t| t > 0.0)
+    }
+
+    /// How likely play between these two gets too rough: kittens (siblings most of all), and
+    /// anyone with an Aloof cat
+    fn escalation(&self, i: usize, j: usize) -> f32 {
+        let (a, b) = (&self.members[i], &self.members[j]);
+        let mut chance = if a.kitten && b.kitten { 0.3 } else { 0.12 };
+        if self.kinship(i, j) == Kinship::Sibling {
+            chance += 0.05;
+        }
+        if [a, b]
+            .into_iter()
+            .any(|m| m.cat.behaviors.temperament == Temperament::Aloof)
+        {
+            chance += 0.1;
+        }
+        chance
+    }
+
+    /// One of the two puffs up (a kitten, or either), and they face each other down
+    fn start_standoff(&mut self, i: usize, j: usize) {
+        let (a, b) = (self.members[i].kitten, self.members[j].kitten);
+        let i_puffs = if a != b { a } else { self.rand_f32() < 0.5 };
+        let (puffed, other) = if i_puffs { (i, j) } else { (j, i) };
+        self.engage_with(puffed, other, SocialKind::Standoff, 1);
+    }
+
+    fn wrestle_turns(&mut self) -> u8 {
+        3 + (self.rand_f32() * 3.0) as u8
     }
 
     /// Without cats starting things together, to test other mechanics on their own
@@ -691,18 +988,20 @@ impl Clowder {
                 }
             }
         }
+        for rest in self.play_rest.values_mut() {
+            *rest = (*rest - dt).max(0.0);
+        }
         self.director_timer -= dt;
         if self.director_timer > 0.0 {
             return;
         }
         self.director_timer += DIRECTOR_TICK;
-
-        struct Idea {
-            active: usize,
-            passive: usize,
-            kind: SocialKind,
-            chance: f32,
+        self.stir_bowl();
+        if self.playful_quirks {
+            self.spread_zoomies();
+            self.pounce_on_hunters_tail();
         }
+
         let per_tick = |rate: f32| 1.0 - (-rate * DIRECTOR_TICK).exp();
         let mut ideas = Vec::new();
         for i in 0..n {
@@ -741,6 +1040,7 @@ impl Clowder {
                         passive: j,
                         kind,
                         chance: 0.4,
+                        limit: 1,
                     });
                 }
                 // A kitten goes to knead and nap against its mother lying down
@@ -754,6 +1054,7 @@ impl Clowder {
                         passive: j,
                         kind: SocialKind::Nurse,
                         chance: per_tick(1.0 / 25.0),
+                        limit: 1,
                     });
                 } else if friends && resting_awake(pi) && pj == Pose::Sleeping && gap < 220.0 * s {
                     let family = if kin.is_family() { 2.0 } else { 1.0 };
@@ -764,6 +1065,7 @@ impl Clowder {
                         // A drowsy cat soon goes to curl up against a sleeping friend: the chance
                         // only lasts until it dozes off itself
                         chance: per_tick(family * warm / 8.0),
+                        limit: 1,
                     });
                 }
                 if friends && resting_awake(pi) && resting_awake(pj) && gap < 130.0 * s {
@@ -780,9 +1082,13 @@ impl Clowder {
                         passive: j,
                         kind: SocialKind::Groom,
                         chance: per_tick(rate.max(0.0)),
+                        limit: 1,
                     });
                 }
             }
+        }
+        if self.playful_quirks {
+            self.play_ideas(&mut ideas);
         }
         if ideas.is_empty() {
             return;
@@ -791,14 +1097,177 @@ impl Clowder {
         for k in 0..ideas.len() {
             let idea = &ideas[(start + k) % ideas.len()];
             if self.rand_f32() < idea.chance {
-                let (active, passive, kind) = (idea.active, idea.passive, idea.kind);
+                let (active, passive, kind, limit) =
+                    (idea.active, idea.passive, idea.kind, idea.limit);
                 // Either cat may be the one to rub against the other
                 let (active, passive) = if kind == SocialKind::HeadBunt && self.rand_f32() < 0.5 {
                     (passive, active)
                 } else {
                     (active, passive)
                 };
-                self.engage(active, passive, kind);
+                self.engage_with(active, passive, kind, limit);
+                return;
+            }
+        }
+    }
+
+    /// How keen a cat is to play with other cats
+    fn playfulness(m: &Member) -> f32 {
+        if m.kitten {
+            return 1.0;
+        }
+        match m.cat.behaviors.temperament {
+            Temperament::Playful => 0.6,
+            Temperament::Balanced => 0.3,
+            Temperament::Lazy => 0.12,
+            Temperament::Realistic => 0.12,
+            Temperament::Aloof => 0.1,
+        }
+    }
+
+    /// How many pounces on its tail a grown cat puts up with from a kitten not its own
+    fn tolerance(m: &Member) -> u8 {
+        match m.cat.behaviors.temperament {
+            Temperament::Aloof => 1,
+            Temperament::Balanced | Temperament::Realistic => 2,
+            Temperament::Lazy | Temperament::Playful => 3,
+        }
+    }
+
+    /// Play between two free cats that aren't resting from it: pouncing on a resting cat's tail
+    /// (a kitten pestering a grown cat, or answering its mother's twitching tail), and for
+    /// friends and kittens a chase or a wrestle
+    fn play_ideas(&mut self, ideas: &mut Vec<Idea>) {
+        let n = self.members.len();
+        let per_tick = |rate: f32| 1.0 - (-rate * DIRECTOR_TICK).exp();
+        for i in 0..n {
+            for j in 0..n {
+                if i == j || !self.free(i) || !self.free(j) || self.resting_from_play(i, j) {
+                    continue;
+                }
+                let (mi, mj) = (&self.members[i], &self.members[j]);
+                let (pi, pj) = (Pose::of(&mi.cat), Pose::of(&mj.cat));
+                let gap = mi.cat.nodes[0].distance(mj.cat.nodes[0]);
+                let s = mi.cat.scale.max(mj.cat.scale);
+                if pi == Pose::Sleeping || pj == Pose::Sleeping || gap > 200.0 * s {
+                    continue;
+                }
+                let kin = self.kinship(i, j);
+                let bond = self.bond(i, j);
+                let friends = kin.is_family() || (bond.affection > 0.3 && bond.familiarity > 0.3);
+                let pals = friends || (mi.kitten && mj.kitten);
+                let (fi, fj) = (Self::playfulness(mi), Self::playfulness(mj));
+                let tolerance = Self::tolerance(mj);
+
+                if matches!(pj, Pose::Sitting | Pose::Lying | Pose::Grooming) {
+                    let (rate, limit) = if kin == Kinship::Mother {
+                        // She twitches her tail for it, and puts up with it a long while
+                        (1.0 / 20.0, 3 + (self.rand_f32() * 3.0) as u8)
+                    } else if mi.kitten && !mj.kitten {
+                        (fi * (0.6 + bond.affection).max(0.2) / 25.0, tolerance)
+                    } else if pals {
+                        (fi * fj / 60.0, 1 + (self.rand_f32() * 2.0) as u8)
+                    } else {
+                        (0.0, 0)
+                    };
+                    if rate > 0.0 {
+                        ideas.push(Idea {
+                            active: i,
+                            passive: j,
+                            kind: SocialKind::TailStalk,
+                            chance: per_tick(rate),
+                            limit,
+                        });
+                    }
+                }
+                if i < j && pals {
+                    let family = if kin == Kinship::Sibling { 2.0 } else { 1.0 };
+                    let (chaser, runner) = if self.rand_f32() < 0.5 {
+                        (i, j)
+                    } else {
+                        (j, i)
+                    };
+                    ideas.push(Idea {
+                        active: chaser,
+                        passive: runner,
+                        kind: SocialKind::Chase,
+                        chance: per_tick(fi * fj * family / 35.0),
+                        limit: 2,
+                    });
+                    if gap < 130.0 * s {
+                        let turns = self.wrestle_turns();
+                        ideas.push(Idea {
+                            active: i,
+                            passive: j,
+                            kind: SocialKind::Wrestle,
+                            chance: per_tick(fi * fj * family / 45.0),
+                            limit: turns,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// A Playful friend or a kitten near a cat that just got the zoomies joins in
+    fn spread_zoomies(&mut self) {
+        let n = self.members.len();
+        for i in 0..n {
+            let fresh = matches!(
+                self.members[i].cat.activity,
+                Activity::Zoomies { timer, .. } if timer < DIRECTOR_TICK
+            );
+            if !fresh {
+                continue;
+            }
+            for j in 0..n {
+                if j == i || !self.free(j) {
+                    continue;
+                }
+                let m = &self.members[j];
+                let keen = m.kitten || m.cat.behaviors.temperament == Temperament::Playful;
+                let bond = self.bond(i, j);
+                let friends = self.kinship(i, j).is_family()
+                    || (bond.affection > 0.3 && bond.familiarity > 0.3);
+                let (a, b) = (&self.members[i].cat, &m.cat);
+                let near = a.nodes[0].distance(b.nodes[0]) < 220.0 * a.scale.max(b.scale);
+                if keen && friends && near && Pose::of(b) != Pose::Sleeping && self.rand_f32() < 0.6
+                {
+                    self.members[j].cat.join_zoomies();
+                }
+            }
+        }
+    }
+
+    /// A kitten or Playful cat that lost the laser dot to another cat sometimes pounces on that
+    /// cat's tail instead
+    fn pounce_on_hunters_tail(&mut self) {
+        let Some(h) = self
+            .hunter
+            .filter(|&h| self.members[h].cat.hunting_cursor())
+        else {
+            return;
+        };
+        let tip = self.members[h].cat.nodes[TOTAL_NODES - 1];
+        for i in 0..self.members.len() {
+            let m = &self.members[i];
+            let keen = m.kitten || m.cat.behaviors.temperament == Temperament::Playful;
+            if i == h
+                || !keen
+                || !self.free(i)
+                || m.cat.nodes[0].distance(tip) > 180.0 * m.cat.scale
+            {
+                continue;
+            }
+            if self.rand_f32() < 0.1 {
+                self.members[i].cat.begin_social(
+                    SocialKind::TailStalk,
+                    SocialRole::Active,
+                    Self::neighbor_index(i, h),
+                    1.0,
+                    1,
+                );
+                self.members[i].partner = Some(h);
                 return;
             }
         }
@@ -806,8 +1275,17 @@ impl Clowder {
 
     /// Starts `kind` with `active` going over to `passive` (for a nose boop or sniff, both go)
     fn engage(&mut self, active: usize, passive: usize, kind: SocialKind) {
+        self.engage_with(active, passive, kind, 1);
+    }
+
+    /// `engage`, with `limit` rounds (pounces, wrestling turns, or for a chase the times the two
+    /// may swap round)
+    fn engage_with(&mut self, active: usize, passive: usize, kind: SocialKind, limit: u8) {
         let symmetric = matches!(kind, SocialKind::NoseBoop | SocialKind::SniffCircle);
-        let side = if kind == SocialKind::SniffCircle {
+        let side = if matches!(
+            kind,
+            SocialKind::SniffCircle | SocialKind::Chase | SocialKind::Standoff
+        ) {
             if self.rand_f32() < 0.5 { 1.0 } else { -1.0 }
         } else {
             // Come up on the side of the other cat it's already on
@@ -830,12 +1308,14 @@ impl Clowder {
             SocialRole::Active,
             Self::neighbor_index(active, passive),
             side,
+            limit,
         );
         self.members[passive].cat.begin_social(
             kind,
             passive_role,
             Self::neighbor_index(passive, active),
             side,
+            limit,
         );
         self.members[active].partner = Some(passive);
         self.members[passive].partner = Some(active);
@@ -1725,5 +2205,310 @@ mod tests {
         for cat in group.cats() {
             assert!(cat.nodes[0].distance(away) < 120.0);
         }
+    }
+
+    const FRIENDS: Bond = Bond {
+        familiarity: 0.8,
+        affection: 0.6,
+    };
+
+    /// Where someone at the computer leaves the cursor `secs` in: here, then a little to the
+    /// side, and back, every 45 s (getting the cats up each time)
+    fn shifting_cursor(home: Vec2, secs: f32) -> Vec2 {
+        if ((secs / 45.0) as usize).is_multiple_of(2) {
+            home
+        } else {
+            home + Vec2::new(160.0, 0.0)
+        }
+    }
+
+    /// A grown cat and a kitten that isn't hers
+    fn kitten_and_stranger(temperament: Temperament) -> Clowder {
+        let profiles = [
+            CatProfile {
+                temperament,
+                ..profile("Luna")
+            },
+            CatProfile {
+                size: KITTEN_SIZE,
+                kitten: true,
+                ..profile("Pip")
+            },
+        ];
+        clowder(&profiles, Vec2::new(600.0, 400.0))
+    }
+
+    #[test]
+    fn a_kitten_pounces_on_a_grown_cats_tail_until_it_has_had_enough() {
+        let cursor = Vec2::new(600.0, 400.0);
+        let mut group = kitten_and_stranger(Temperament::Balanced);
+        let mut affection = group.bond(0, 1).affection;
+        let mut cooled = false;
+        let (mut landings, mut worst_miss) = (0, 0.0_f32);
+        let (mut stalked, mut swatted, mut walked_off) = (false, false, false);
+        let mut was_pouncing = false;
+        for k in 0..(600.0 / DT) as usize {
+            group.update(shifting_cursor(cursor, k as f32 * DT), DT);
+            let (luna, pip) = (group.cat(0), group.cat(1));
+            let stalking = pip
+                .social
+                .is_some_and(|e| e.kind == SocialKind::TailStalk && e.role == SocialRole::Active);
+            stalked |= stalking;
+            let pouncing = matches!(pip.activity, Activity::Pouncing { .. });
+            if stalking && was_pouncing && !pouncing {
+                landings += 1;
+                let tip = luna.nodes[TOTAL_NODES - 1];
+                worst_miss = worst_miss.max(pip.nodes[0].distance(tip));
+            }
+            was_pouncing = pouncing && stalking;
+            swatted |= luna
+                .social
+                .is_some_and(|e| e.kind == SocialKind::Swat && e.acting)
+                && matches!(luna.activity, Activity::PawBatting { .. });
+            walked_off |= luna.retreat.is_some();
+            // Affection otherwise only drifts, far more slowly than this
+            let now = group.bond(0, 1).affection;
+            cooled |= now < affection - 0.015;
+            affection = now;
+            if swatted && walked_off {
+                break;
+            }
+        }
+        assert!(stalked && landings >= 2, "{landings} pounces on the tail");
+        assert!(
+            worst_miss < 16.0,
+            "landed {worst_miss} px from the tail tip"
+        );
+        assert!(swatted || walked_off, "Luna put up with it forever");
+        assert!(cooled, "pestering cost nothing");
+    }
+
+    #[test]
+    fn a_mother_twitches_her_tail_for_her_kitten_and_ends_with_a_boop() {
+        let cursor = Vec2::new(600.0, 400.0);
+        let profiles = [profile("Luna"), kitten_of("Pip", "Luna")];
+        let mut group = clowder(&profiles, cursor);
+        let (mut lured, mut pounces, mut booped) = (0.0_f32, 0, false);
+        let mut was_stalking = false;
+        for k in 0..(600.0 / DT) as usize {
+            group.update(shifting_cursor(cursor, k as f32 * DT), DT);
+            let (luna, pip) = (group.cat(0), group.cat(1));
+            let stalking = pip.social.is_some_and(|e| e.kind == SocialKind::TailStalk);
+            if stalking && luna.social.is_some_and(|e| e.acting) {
+                lured = lured.max(luna.tail_lash);
+                if let Some(e) = pip.social {
+                    pounces = pounces.max(e.rounds);
+                }
+            }
+            if was_stalking && !stalking {
+                booped = pip.social.is_some_and(|e| e.kind == SocialKind::NoseBoop);
+                if booped {
+                    break;
+                }
+            }
+            was_stalking = stalking;
+        }
+        assert!(lured > 0.8, "her tail hardly twitched ({lured})");
+        assert!(pounces >= 3, "she put up with only {pounces} pounces");
+        assert!(booped, "it didn't end with a boop");
+    }
+
+    #[test]
+    fn only_one_cat_gets_the_laser_dot_and_the_other_twitches_its_tail() {
+        let cursor = Vec2::new(600.0, 400.0);
+        let mut group = pair(Some(FRIENDS), Temperament::Playful).without_social();
+        run(&mut group, cursor, 12.0);
+        // Dance the dot round in front of them
+        let dot = cursor + Vec2::new(0.0, 150.0);
+        let (mut hunted, mut both, mut lash) = ([false; 2], 0, 0.0_f32);
+        for k in 0..(25.0 / DT) as usize {
+            let jiggle = if k % 2 == 0 { -18.0 } else { 18.0 };
+            let drift = Vec2::new(40.0 * (k as f32 * DT * 0.7).sin(), jiggle);
+            group.update(dot + drift, DT);
+            let hunting: Vec<bool> = group.cats().map(CatSim::hunting_cursor).collect();
+            for (h, now) in hunted.iter_mut().zip(&hunting) {
+                *h |= now;
+            }
+            if hunting.iter().all(|&h| h) {
+                both += 1;
+            }
+            for c in group.cats().filter(|c| c.laser_rival) {
+                lash = lash.max(c.tail_lash);
+            }
+        }
+        assert!(hunted.iter().any(|&h| h), "neither went for the dot");
+        // Two can crouch in the same frame; the second gives way on the next
+        assert!(both <= 2, "both hunted the dot for {both} frames");
+        assert!(
+            lash > 0.5,
+            "the one left out didn't twitch its tail ({lash})"
+        );
+    }
+
+    #[test]
+    fn kittens_chase_each_other_and_wrestle() {
+        let cursor = Vec2::new(600.0, 400.0);
+        let profiles = [
+            profile("Luna"),
+            kitten_of("Pip", "Luna"),
+            kitten_of("Nori", "Luna"),
+        ];
+        let mut group = clowder(&profiles, cursor);
+        let (mut raced, mut caught, mut wrestled, mut farthest) = (false, false, false, 0.0_f32);
+        for k in 0..(600.0 / DT) as usize {
+            let at = shifting_cursor(cursor, k as f32 * DT);
+            group.update(at, DT);
+            let (pip, nori) = (group.cat(1), group.cat(2));
+            let chase = |c: &CatSim| c.social.is_some_and(|e| e.kind == SocialKind::Chase);
+            if chase(pip) && chase(nori) {
+                raced |= Pose::of(pip) == Pose::Racing && Pose::of(nori) == Pose::Racing;
+                caught |= [pip, nori]
+                    .into_iter()
+                    .any(|c| c.social.is_some_and(|e| e.rounds > 0));
+                for c in [pip, nori] {
+                    farthest = farthest.max(c.nodes[0].distance(at));
+                }
+            }
+            let rolling = |c: &CatSim| {
+                c.social.is_some_and(|e| e.kind == SocialKind::Wrestle)
+                    && matches!(c.activity, Activity::BellyUp { .. })
+            };
+            let batting = |c: &CatSim| {
+                c.social.is_some_and(|e| e.kind == SocialKind::Wrestle)
+                    && matches!(c.activity, Activity::PawBatting { .. })
+            };
+            wrestled |= (rolling(pip) && batting(nori)) || (rolling(nori) && batting(pip));
+            if raced && caught && wrestled {
+                break;
+            }
+        }
+        assert!(raced, "they never galloped after each other");
+        assert!(caught, "the chaser never caught up");
+        assert!(
+            farthest < 200.0,
+            "the chase ran {farthest} px from the cursor"
+        );
+        assert!(wrestled, "they never wrestled");
+    }
+
+    #[test]
+    fn a_squabble_puffs_one_up_then_both_back_off_and_groom() {
+        let cursor = Vec2::new(600.0, 400.0);
+        let mut group = pair(Some(FRIENDS), Temperament::Playful).without_social();
+        run(&mut group, cursor, 12.0);
+        let start = group.bond(0, 1).affection;
+        let gap_before = group.cat(0).nodes[0].distance(group.cat(1).nodes[0]);
+        group.start_standoff(0, 1);
+        let (mut puff, mut ears, mut tail) = (0.0_f32, 0.0_f32, 0.0_f32);
+        let mut groomed = [false; 2];
+        let mut gap_after = 0.0_f32;
+        for _ in 0..(15.0 / DT) as usize {
+            group.update(cursor, DT);
+            for c in group.cats() {
+                puff = puff.max(c.bristle);
+                ears = ears.min(c.ear_left_twitch);
+                tail = tail.max(c.tail_puff);
+            }
+            for (g, c) in groomed.iter_mut().zip(group.cats()) {
+                *g |= matches!(c.activity, Activity::Grooming { .. });
+            }
+            gap_after = gap_after.max(group.cat(0).nodes[0].distance(group.cat(1).nodes[0]));
+        }
+        assert!(puff > 0.9 && tail > 1.6, "puffed up {puff}, tail {tail}");
+        assert!(ears < -0.4, "ears only went to {ears}");
+        assert!(
+            gap_after > gap_before + 40.0,
+            "only {gap_before} -> {gap_after} px apart"
+        );
+        assert_eq!(groomed, [true; 2], "both groom it off");
+        assert!(group.bond(0, 1).affection < start - 0.04);
+        assert!(
+            group
+                .cats()
+                .all(|c| c.social.is_none() && c.retreat.is_none())
+        );
+    }
+
+    #[test]
+    fn zoomies_spread_to_a_playful_friend_but_not_a_stranger() {
+        let cursor = Vec2::new(600.0, 400.0);
+        let joins = |bond: Bond| {
+            let mut group = pair(Some(bond), Temperament::Playful);
+            run(&mut group, cursor, 12.0);
+            let mut joined = 0;
+            for _ in 0..6 {
+                let center = group.cat(0).nodes[2];
+                group.members[0].cat.activity = Activity::Zoomies {
+                    center,
+                    dir: 1.0,
+                    timer: 0.0,
+                    duration: 1.8,
+                };
+                let mut zoomed = false;
+                // Joining in, not a fit of its own later on
+                for _ in 0..(1.0 / DT) as usize {
+                    group.update(cursor, DT);
+                    zoomed |= matches!(group.cat(1).activity, Activity::Zoomies { .. });
+                }
+                joined += usize::from(zoomed);
+                run(&mut group, cursor, 12.0);
+            }
+            joined
+        };
+        assert!(joins(FRIENDS) >= 2, "a friend never joined in");
+        let stranger = Bond {
+            familiarity: 0.0,
+            affection: 0.0,
+        };
+        assert_eq!(joins(stranger), 0);
+    }
+
+    #[test]
+    fn a_pushy_cat_pushes_in_at_the_bowl() {
+        let profiles = [
+            profile("Luna"),
+            CatProfile {
+                temperament: Temperament::Playful,
+                ..profile("Milo")
+            },
+        ];
+        let bowl = Vec2::new(600.0, 400.0);
+        let mut group = clowder(&profiles, bowl - Vec2::new(0.0, 60.0));
+        group.begin_bowl_placement(FeedPreset::Indefinite, bowl);
+        group.place_bowl(bowl);
+        let (mut pushed, mut outcome) = (false, None);
+        for _ in 0..(400.0 / DT) as usize {
+            group.update(bowl, DT);
+            let milo = group.cat(1);
+            pushed |= milo
+                .social
+                .is_some_and(|e| e.kind == SocialKind::BowlPush && e.acting);
+            if pushed && outcome.is_none() {
+                if group
+                    .cat(0)
+                    .social
+                    .is_some_and(|e| e.kind == SocialKind::Swat)
+                {
+                    outcome = Some("swat");
+                } else if group.feeding.as_ref().and_then(|s| s.eater) == Some(1) {
+                    outcome = Some("gave way");
+                }
+            }
+            // The bowl stays down for the cat at it, swatting or not
+            if let Some(e) = group.feeding.as_ref().and_then(|s| s.eater)
+                && group.cat(e).is_feeding()
+            {
+                assert_eq!(group.cat(e).eating_bowl_pos(), Some(bowl));
+            }
+            if outcome.is_some() {
+                run(&mut group, bowl, 5.0);
+                break;
+            }
+        }
+        assert!(pushed, "Milo waited for its turn");
+        assert!(outcome.is_some(), "Luna neither gave way nor swatted");
+        assert!(group.feeding.is_some(), "feeding stopped");
+        let eater = group.feeding.as_ref().and_then(|s| s.eater).unwrap();
+        assert!(matches!(group.cat(eater).activity, Activity::Eating { .. }));
     }
 }

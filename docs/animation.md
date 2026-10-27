@@ -51,6 +51,7 @@ Each activity has a target `(posture_extension, curl_amount)`. Both values are a
 | Greeting | as standing | 0 |
 | GroomingOther | 1.16 | 0.09 × side |
 | Kneading | 1.26 | 0.07 × side |
+| Standoff | 1.42 (back arched, so a little shorter from above) | 0.16 × side |
 
 Values blended in alongside posture:
 - `belly_roll` (0–1, roll-on at 2.4/s and roll-off at 2.8/s): once it passes 0.35 the paws are drawn **on top of** the torso, and the belly is shown.
@@ -111,7 +112,9 @@ Each tail segment chases a target angle. The follow rate is 16/s at the base and
 - extra noise and a hook at the tip,
 - while Sitting, Grooming or AloofNotice, a **sitting wrap** (`sit_tail_wrap`, eases in over ~1 s): extra bend per segment (`SIT_TAIL_WRAP`) turns the tail sideways off the rump, runs it forward along the flank and hooks it in toward the front paws. Only the tip keeps flicking. It unwraps quickly when the cat moves or turns.
 
-- while greeting a friend (or for a kitten on the move), a **raised tail** (`tail_raise`, 0–1): seen from above, each segment is foreshortened by up to `TAIL_RAISE_FORESHORTEN` (most at the upright base) and the tip hooks to the curl side by `TAIL_RAISE_HOOK`; the sway is cut by up to 60%. Near a cat it dislikes, `tail_still` cuts the sway by up to 70%. See [behavior.md](behavior.md#what-each-cat-sees-of-the-others).
+- while greeting a friend (or for a kitten on the move), a **raised tail** (`tail_raise`, 0–1): seen from above, each segment is foreshortened by up to `TAIL_RAISE_FORESHORTEN` (most at the upright base) and the tip hooks to the curl side by `TAIL_RAISE_HOOK`; the sway is cut by up to 60%. Near a cat it dislikes, `tail_still` cuts the sway by up to 70%; it also holds its tail still backing off from another cat. See [behavior.md](behavior.md#what-each-cat-sees-of-the-others).
+- a **lashing tail** (`tail_lash`, 0–1, eases in at 4/s): the sway is at least 0.42 × lash and its speed rises toward 4.2, and above 0.3 the sitting wrap lets go so the tail lies out. A cat lashes its tail watching another cat hunt the laser dot, as a kitten pounces on it (a mother all along, to lure her kitten), facing another cat down and swatting.
+- **puffed up** (`bristle`, 0–1, eases in at 4/s; 1 for the puffed-up cat in a standoff, 0.5 for the other, about 0.45 swatting): `tail_puff` goes to at least 1 + 0.85 × bristle (a bottlebrush tail), and the ears flatten to at most −0.5 × bristle. See [behavior.md](behavior.md#playing-and-squabbling).
 
 TailChasing, Circling and Sniffing are "spinning" activities (`Activity::is_spinning`): they use the moving spine with a gentler sway, short spinning strides, and paws that land along each socket's own path.
 
@@ -119,11 +122,11 @@ The tail is always drawn **under** the body and head, so it never covers the fac
 
 ### Head & ears
 
-`update_head_and_ears` sets `head_yaw` per activity. A cat greeting nose to nose locks its head on the other cat (±0.9 rad), one grooming another turns its head to it with a licking bob, one sniffing turns its nose into the circle, and a kneading kitten barely moves its head. Normally the head follows the cursor up to `MAX_HEAD_YAW` (1.4 rad, ~80°) to either side. When the cursor is still and near (so it holds little attention) and the cat is watching another cat, the head turns 80% of the way toward that cat instead, and the idle wander makes up the rest. It stays within about ±0.6 rad during PawBatting, StalkWiggle and Pouncing. If the cursor goes more than ~100° behind a sitting cat, the cat shuffles round on the spot to face it (`SIT_TURN_RATE`, 1.8 rad/s, pivoting around its torso) instead of standing up. It looks back toward the tail while chasing it, tucks around (2.38 rad × curl side) when sleeping, and bobs into the bowl while eating. The ears are separate angles. Negative is flattened back ("airplane ears": stalking, zoomies) and positive is pricked forward.
+`update_head_and_ears` sets `head_yaw` per activity. A cat greeting nose to nose, or in a standoff, locks its head on the other cat (±0.9 rad); one swatting another cat watches it rather than the cursor; one grooming another turns its head to it with a licking bob, one sniffing turns its nose into the circle, and a kneading kitten barely moves its head. Normally the head follows the cursor up to `MAX_HEAD_YAW` (1.4 rad, ~80°) to either side. When the cursor is still and near (so it holds little attention) and the cat is watching another cat, the head turns 80% of the way toward that cat instead, and the idle wander makes up the rest. It stays within about ±0.6 rad during PawBatting, StalkWiggle and Pouncing. If the cursor goes more than ~100° behind a sitting cat, the cat shuffles round on the spot to face it (`SIT_TURN_RATE`, 1.8 rad/s, pivoting around its torso) instead of standing up. It looks back toward the tail while chasing it, tucks around (2.38 rad × curl side) when sleeping, and bobs into the bowl while eating. The ears are separate angles. Negative is flattened back ("airplane ears": stalking, zoomies) and positive is pricked forward.
 
 ## Rendering (`render.rs`)
 
-Two social touches in the renderer: a kneading kitten's front legs tread in turn (`Activity::Kneading`), and `CatSim::blissful()` (kneading, or being groomed) closes the eyes like sleeping does.
+Three social touches in the renderer: a kneading kitten's front legs tread in turn (`Activity::Kneading`), `CatSim::blissful()` (kneading, or being groomed) closes the eyes like sleeping does, and a puffed-up cat's body is up to 1.1 px × scale wider from neck to rump (`bristle` in `body_half_widths`). A cat swatting at another cat while eating keeps its bowl drawn (`is_feeding` counts the swat).
 
 `render_cat(cat, pixmap, clip_mask, window_origin)` draws into a premultiplied-RGBA tiny-skia `Pixmap` the same size as the overlay window. World positions are converted to window space by subtracting `window_origin`. Each node gets a tangent and a normal vector, and outlines are built by offsetting along the normals.
 

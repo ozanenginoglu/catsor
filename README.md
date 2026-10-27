@@ -77,7 +77,7 @@ Left- or right-click the tray icon to open the menu. Press Esc or click outside 
 |---|---|
 | **Cats** | One row per cat (a coat swatch, the name, "(kitten)" for kittens). Click one to open its page, below. **Add Cat** brings in a new cat with a random coat; it walks in from the nearest screen edge (up to 6 cats). **Size** row: click to cycle Compact 0.8× → Normal 1.0× → Large 1.35× → Extra Large 1.75× for every cat (a `--scale` outside these shows as "Custom") |
 | **Feed (keep awake)** | 15 m · 30 m · 1 h · 2 h · Unlimited. While feeding, a **Stop Feeding** row appears (choosing the active preset again also stops) |
-| **Behaviors** | Follow Cursor · Playful Hunting (pounce/zoomies/tail-chase/paw-bat). Each is one switch for every cat |
+| **Behaviors** | Follow Cursor · Playful Hunting (pounce/zoomies/tail-chase/paw-bat, and cats playing with each other). Each is one switch for every cat |
 | | Show Cat(s) (checkbox) · Start on Login (checkbox) · About Catsor (shows the version, opens the GitHub page) · Quit Catsor |
 
 A cat's page (**Back** returns to the main page):
@@ -99,6 +99,7 @@ A cat's page (**Back** returns to the main page):
 - **Turn off Follow Cursor** in the tray menu and the cat roams the same way, until you turn it back on.
 - **Leave it alone.** It sits, then lies down, then curls up and sleeps.
 - **Add a second cat** (or a kitten). Each cat finds its own spot round the cursor, and they keep out of each other's way. They watch each other, hold their tails up for friends, and grow fond of each other the more time they spend together. Shake a kitten off and watch its mother fetch it back. Leave them be and they greet each other (strangers sniff each other round in a circle; friends rub against each other), groom each other, curl up together to sleep, and a kitten comes to knead and nap against its mother.
+- **Let them play** (with Playful Hunting on). Kittens and Playful cats chase each other round the cursor, wrestle, and pounce on each other's tails; a mother twitches her tail for her kitten to pounce on. A grown cat pestered by a kitten soon swats it or walks off, play that gets too rough ends with one puffed up in a short standoff before both groom it off, and one cat's zoomies set off its friends. Wiggle the laser dot at several cats and only one gets to hunt it; the others twitch their tails, and a kitten may go for the winner's tail instead. At the bowl, a pushy cat may push in beside the one eating, which gives way or swats it.
 
 ### Feeding mode (keep-awake)
 

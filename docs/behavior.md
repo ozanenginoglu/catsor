@@ -114,6 +114,8 @@ A reversal counts toward `play_excitement` only if **all** of these are true:
 
 A jump of 75 px or more, or a cursor 230 px or more from the head, resets excitement to 0. Otherwise excitement decays at 0.4/s. Once excitement is above **0.55** and both the raw and the smoothed cursor are 85–230 px away, a Sitting, StandingUp, StandingIdle or Walking (not sprinting) cat goes into `StalkWiggle`, a low crouch with flattened ears. Walking and StandingIdle matter because a cursor moved out to pounce range wakes a sitting cat before a wiggle there has built enough excitement; the cat then stops on its way over and crouches. A Balanced cat needs under a second of a 4 Hz wiggle. The crouch lasts 0.6–0.85 s, or 1.4–2.4 s for Realistic. The cat holds a still stare for the first 30% of the crouch, then the butt wiggle fades in: weight shifting between the hind paws at about 3 Hz, right up to the launch. Then it goes into `Pouncing`, a leap of at most 180 px (90 px, about two body lengths, for Realistic; a cat with farther to go lands short and walks the rest). The leap follows `pounce_travel`, a trapezoidal speed profile: a hard push-off over the first 20%, steady flight, then braking over the last 25% as the forepaws land.
 
+With several cats, only one hunts the dot at a time; the others watch with twitching tails (see [Playing and squabbling](#playing-and-squabbling)).
+
 > The reversal requirement is deliberate (commit `2c02ff9`). Before it, a sudden point-to-point mouse move counted as excitement and made the cat do a straight-line pounce across the screen. Normal moves must always lead to a walk.
 
 ### Left-right shake → gallop
@@ -262,9 +264,37 @@ Each `Neighbor` also carries the other cat's scale, speed and `Pose` (Moving, Ra
 | Sleeping together | First to a point behind and beside the sleeper, then forward along its side, so it lies down alongside | Falls straight asleep, curled toward its friend |
 | Nursing | To the mother's side, 18 px out | `Kneading`: lying, front paws treading in turn, eyes shut, for 6–12 s, then falls asleep there |
 
-While engaged, a cat takes no spot round the cursor, ignores its partner when steering round other cats, doesn't do quirks, copy, pounce or go roaming, and the passive cat doesn't lie down from sitting (or roll off its side onto its back) mid-act. Its "distance to the cursor" is how far the cursor has moved since the engagement began.
+While engaged, a cat takes no spot round the cursor, ignores its partner when steering round other cats (except on its way round to a tail it stalks), doesn't do quirks, copy, pounce at the cursor or go roaming, and the passive cat doesn't lie down from sitting (or roll off its side onto its back) mid-act. Its "distance to the cursor" is how far the cursor has moved since the engagement began.
 
-**Ending.** A cat marks its half done when its act is over, when it gives up getting there (20 s, `SOCIAL_GIVE_UP`), when its part is interrupted (a sleeper wakes, a resting partner gets up), or when something more pressing comes up (sprinting, feeding, being shaken off, fetching a kitten). `tend_engagements` then ends it for **both** cats (`end_social`): a social pose turns into standing, sitting or lying, and they carry on as before (back to their spots by the cursor). If the cursor moves more than the sit wake radius from where it was when they began, each cat drops it at once (`abandon_social`) and gets up. A greeting or grooming that both cats saw through adds 0.03 or 0.06 to their affection. Removing a cat ends everything under way.
+**Ending.** A cat marks its half done when its act is over, when it gives up getting there (20 s, `SOCIAL_GIVE_UP`), when its part is interrupted (a sleeper wakes, a resting partner gets up), or when something more pressing comes up (sprinting, feeding, being shaken off, fetching a kitten). `tend_engagements` then ends it for **both** cats (`end_social`): a social pose turns into standing, sitting or lying, and they carry on as before (back to their spots by the cursor). If the cursor moves more than the sit wake radius from where it was when they began, each cat drops it at once (`abandon_social`) and gets up. A greeting or grooming that both cats saw through adds 0.03 or 0.06 to their affection (play and friction: see below). Removing a cat ends everything under way. A sniff circle counts as there once a cat's nose is within 18 px of the other's body as well, since two cats each heading for the other's rear can chase each other round.
+
+### Playing and squabbling
+
+Play and friction are engagements too, started by the same director, and only while **Playful Hunting** is on. A pair that played rests from playing together for 25 s (`PLAY_REST`), and for 2 minutes after a squabble (`SQUABBLE_REST`); playing needs both cats awake and within 200 px. How keen each cat is (its playfulness) is 1.0 for a kitten, otherwise Playful 0.6, Balanced 0.3, Lazy and Realistic 0.12, Aloof 0.1.
+
+| Kind | When (rate per second) | What happens |
+|---|---|---|
+| **Tail stalk** | A cat resting awake (Sitting, Lying, Grooming) and another cat near it. A kitten and its mother: 1/20, the mother lures it. A kitten and a grown cat not its mother: playfulness × (0.6 + affection) / 25, at least 0.2 / 25 (**pestering**). Two friends or two kittens: product of playfulness / 60 | The stalker walks round (not through) the other cat to a point 55 px out beyond its tail tip (`TAIL_STALK_RANGE`) and crouches (`StalkWiggle`) facing the tip, which it follows as it moves, then leaps on it. It does this `limit` times: 3–5 for its mother, the grown cat's tolerance when pestering (Aloof 1, Balanced and Realistic 2, Lazy and Playful 3), 1–2 between friends. The cat whose tail it is lashes its tail (more with each pounce), and out from round its paws; a mother lashes hers all along to lure her kitten |
+| **Chase** | Two friends or two kittens. Product of playfulness / 35, × 2 for siblings | The runner gallops round the cursor (as it was when the chase began, 100 px out, `CHASE_RADIUS`) at 205 px/s; after a 0.5 s head start the chaser gallops straight at it at 240 px/s, without braking. It has caught up once within 20 px of the runner's body (`TAG_RANGE`), from 1.5 s on; a chase that hasn't caught up in 9 s ends |
+| **Wrestle** | Two friends or two kittens within 130 px. Product of playfulness / 45, × 2 for siblings | The active cat walks up face to face. Then each, by turns, lies on its back pawing (`BellyUp`, 1.3 s) and bats at the other (`PawBatting`), the passive cat starting on its back; 3–5 turns |
+
+**What follows.** When one of these runs its course, `tend_engagements` ends it and `follow_up` decides what comes next:
+
+- A **tail stalk** on a mother's tail ends with a nose boop. A grown cat pestered by a kitten not its own swats it (half the time) or gets up and walks 90 px off, tail held still. Between friends it just ends.
+- A **chase** that caught up: 40% of the time they swap round (at most twice), 30% they roll into a **wrestle**, otherwise it may get too rough.
+- A **wrestle** may get too rough; otherwise both groom ("we weren't fighting").
+- **Too rough** (escalation): 0.3 for two kittens, else 0.12, +0.05 for siblings and +0.1 if either is Aloof. One of them (the kitten, if only one is) **puffs up**, and they have a **standoff** (`Activity::Standoff`, 1.8–3 s): both stand stiff with ears flattened (`bristle`), facing each other; the puffed-up one stands side-on, tail fluffed out and lashing. Then both back off 55–75 px from each other and groom.
+- A **swat** (`PawBatting` at the other cat, ears flat, 0.55–0.8 s): the swatted cat backs off 35 px.
+
+A cat backing off (`CatSim::retreat`) walks to its point with its tail held still and grooms when it gets there; it then stays put (`wake_anchor`) until the cursor moves.
+
+**Zoomies spread.** A cat that has just got the zoomies sets off a free friend within 220 px that is a kitten or Playful, 60% of the time (once per fit; the friend's fit can set off another).
+
+**The laser dot.** When the cursor wiggles at pounce range, every cat in range gets excited, but `referee_laser` lets only one hunt it: the first to crouch (the nearest to the dot if several start together). Any other cat crouching at it sits back down (`yield_pounce`), and while that cat has the dot (until 3 s after it last crouched or leapt, `LASER_HOLD`) the others don't go for it (`laser_rival`) and twitch their tails watching. Now and then (10% per tick) a kitten or Playful cat left out within 180 px goes and pounces on the hunter's tail instead, an engagement only it is part of.
+
+**At the bowl.** Once the cat eating has eaten for 6 s, a pushy cat waiting its turn (Playful, or a kitten that isn't family and whose affection for the eater is under 0.3, or a kitten whose mother is eating) may push in, at 1/40 per second: it walks up beside the eater's face (`BowlPush`). The eater gives way (90% for a mother and her kitten; otherwise Lazy 0.6, Balanced 0.45, Playful and Realistic 0.4, Aloof 0.25), and the pushy cat eats, the eater going to the back of the queue; or it swats the pushy cat and goes straight back to eating (the bowl stays drawn), and the pushy cat backs off and waits again. Either way the two don't push or play for a minute.
+
+**Affection.** Play that runs its course (a stalk between friends, a chase or a wrestle that ends well, a mother's boop) adds 0.02. Friction costs: a standoff 0.05, a swat 0.04, walking off from a pestering kitten 0.02, giving way at the bowl 0.01. Family never drops below its floor.
 
 ### Bonds
 

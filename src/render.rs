@@ -234,14 +234,16 @@ fn body_half_widths(cat: &CatSim) -> [f32; BODY_NODES] {
     let waist_plump = (compact_factor * 1.45 - stretch_factor * 1.10) * s + crouch_bonus * 0.6;
     let hip_plump = (compact_factor * 0.85 - stretch_factor * 0.40) * s + crouch_bonus;
     let shoulder_streamline = stretch_factor * 0.35 * s;
+    // Fur standing on end along the back, puffed up at another cat
+    let fluff = cat.bristle * 1.1 * s;
 
     [
-        5.8 * s,                                                      // 0: Under-head neck anchor
-        6.5 * s,                                                      // 1: Neck collar
-        8.9 * s + breath * 0.6 - shoulder_streamline, // 2: Shoulders / Free-floating Scapula
-        7.8 * s + breath + waist_plump,               // 3: Waist / Mid-torso
-        8.5 * s + hip_plump,                          // 4: Hips / Haunches
-        5.0 * s + (compact_factor * 0.4 - stretch_factor * 0.25) * s, // 5: Rump / Tail base
+        5.8 * s,                                              // 0: Under-head neck anchor
+        6.5 * s + fluff * 0.4,                                // 1: Neck collar
+        8.9 * s + breath * 0.6 - shoulder_streamline + fluff, // 2: Shoulders / Free-floating Scapula
+        7.8 * s + breath + waist_plump + fluff,               // 3: Waist / Mid-torso
+        8.5 * s + hip_plump + fluff,                          // 4: Hips / Haunches
+        5.0 * s + (compact_factor * 0.4 - stretch_factor * 0.25) * s + fluff * 0.6, // 5: Rump / Tail base
     ]
 }
 

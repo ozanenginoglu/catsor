@@ -200,7 +200,8 @@ impl Pose {
             | Activity::TailChasing { .. }
             | Activity::Greeting { .. }
             | Activity::Sniffing { .. }
-            | Activity::GroomingOther { .. } => Self::Busy,
+            | Activity::GroomingOther { .. }
+            | Activity::Standoff { .. } => Self::Busy,
             Activity::Kneading { .. } => Self::Lying,
         }
     }
@@ -221,6 +222,8 @@ pub struct Neighbor {
     pub head: Vec2,
     /// Middle of the body (`CatSim::body_point`)
     pub center: Vec2,
+    /// End of the tail
+    pub tail_tip: Vec2,
     /// Personal-space radius (already scaled)
     pub radius: f32,
     pub scale: f32,
@@ -238,9 +241,11 @@ impl Neighbor {
     /// A stranger: no kin, never met, neutral
     #[cfg(test)]
     pub fn at(head: Vec2, body_angle: f32, scale: f32) -> Self {
+        let back = -Vec2::from_angle(body_angle);
         Self {
             head,
-            center: head - Vec2::from_angle(body_angle) * (CatSim::BODY_SPACING_OFFSET * scale),
+            center: head + back * (CatSim::BODY_SPACING_OFFSET * scale),
+            tail_tip: head + back * (70.0 * scale),
             radius: CatSim::PERSONAL_SPACE * scale,
             scale,
             speed: 0.0,
@@ -396,6 +401,11 @@ pub enum Activity {
         timer: f32,
         duration: f32,
     },
+    /// Standing stiff, ears flat, facing down another cat after play got too rough
+    Standoff {
+        timer: f32,
+        duration: f32,
+    },
 }
 
 impl Activity {
@@ -423,6 +433,34 @@ pub enum SocialKind {
     SleepTogether,
     /// A kitten kneads against its mother's belly, then falls asleep there
     Nurse,
+    /// One crouches and pounces on the other's tail tip, perhaps several times (a kitten
+    /// pestering a grown cat, or answering its mother's twitching tail)
+    TailStalk,
+    /// One gallops after the other round the cursor until it catches up
+    Chase,
+    /// A short tangle: in turn on its back and batting with a paw
+    Wrestle,
+    /// Play got too rough: both stand still, ears flat, the active one puffed up
+    Standoff,
+    /// The active one gives the other a quick paw swat, ears flat
+    Swat,
+    /// A cat waiting for the bowl pushes in beside the one eating
+    BowlPush,
+}
+
+impl SocialKind {
+    /// Done where the cats are, without walking over first
+    pub fn in_place(self) -> bool {
+        matches!(self, Self::Standoff | Self::Swat)
+    }
+
+    /// Play or friction rather than getting on: a pair rests from these for a while after
+    pub fn is_play(self) -> bool {
+        matches!(
+            self,
+            Self::TailStalk | Self::Chase | Self::Wrestle | Self::Standoff | Self::Swat
+        )
+    }
 }
 
 /// Which half of a `SocialKind` a cat does: the one that goes over and acts, or the one that
@@ -452,6 +490,10 @@ pub struct Engagement {
     pub anchor: Vec2,
     /// Seconds since it began
     pub timer: f32,
+    /// Pounces on the tail, or turns in a wrestle, so far (for a chase, 1 once caught up)
+    pub rounds: u8,
+    /// How many rounds before it's over, set by `Clowder`
+    pub limit: u8,
 }
 
 /// World-space articulated paw state for realistic 4-beat walk & 2-beat trot
@@ -687,6 +729,17 @@ pub struct CatSim {
     tail_still: f32,
     /// What this cat is doing with another cat, set up and ended by `Clowder`
     pub social: Option<Engagement>,
+    /// 0..1: fur standing up and ears flat (1 is fully puffed, facing another cat down)
+    pub bristle: f32,
+    /// 0..1: how hard the tail lashes (annoyed, or twitching to lure a kitten)
+    tail_lash: f32,
+    /// Somewhere to back off to, away from another cat; grooms when it gets there
+    retreat: Option<Vec2>,
+    /// The activity a paw swat at another cat interrupted, to go back to (eating, say)
+    swat_return: Option<Activity>,
+    /// Another cat has the laser dot: this one only watches it, tail twitching. Set by
+    /// `Clowder`
+    pub(crate) laser_rival: bool,
 }
 
 impl CatSim {
@@ -852,6 +905,11 @@ impl CatSim {
             tail_raise: 0.0,
             tail_still: 0.0,
             social: None,
+            bristle: 0.0,
+            tail_lash: 0.0,
+            retreat: None,
+            swat_return: None,
+            laser_rival: false,
         }
     }
 
@@ -883,6 +941,15 @@ impl CatSim {
     const SNIFF_SPIN: f32 = 1.3;
     /// Radius (unscaled px) of the circle two cats walk round sniffing each other
     const SNIFF_RADIUS: f32 = 12.0;
+    /// How far (unscaled px) from another cat's tail tip a cat crouches to pounce on it
+    const TAIL_STALK_RANGE: f32 = 55.0;
+    /// Radius (unscaled px) round the cursor of the circle a chased cat runs
+    const CHASE_RADIUS: f32 = 100.0;
+    /// Gallop speeds (unscaled px/s) of a chasing and a chased cat
+    const CHASER_SPEED: f32 = 240.0;
+    const RUNNER_SPEED: f32 = 205.0;
+    /// How close (unscaled px) a chasing cat gets to the other's body to have caught it
+    const TAG_RANGE: f32 = 20.0;
 
     /// Dynamically rescales the cat in-place without teleporting or kinking the spine
     pub fn set_scale(&mut self, new_scale: f32) {
@@ -1154,7 +1221,9 @@ impl CatSim {
     }
 
     pub fn is_feeding(&self) -> bool {
+        // A swat at a cat pushing in is only a moment away from the bowl
         matches!(self.activity, Activity::Eating { .. })
+            || matches!(self.swat_return, Some(Activity::Eating { .. }))
     }
 
     /// Returns the fixed screen position of the bowl the cat is currently eating from
