@@ -1,6 +1,8 @@
 use crate::Args;
 use crate::autostart;
 use crate::cat::{CatSim, FeedPreset};
+use crate::coat::{Coat, CoatLibrary};
+use crate::designer::{DESIGNER_H, DESIGNER_TITLE, DESIGNER_W, Designer, DesignerInput};
 use crate::prefs::UserPrefs;
 use crate::render::{bowl_window_dim, cat_window_dim, render_bowl_overlay, render_cat};
 use crate::tray::{
@@ -9,16 +11,16 @@ use crate::tray::{
 use glam::Vec2;
 use std::time::{Duration, Instant};
 use tiny_skia::{Mask, Pixmap};
-use x11rb::connection::Connection;
+use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::Event;
 use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::shape::{self, ConnectionExt as _};
 use x11rb::protocol::xfixes::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
-    Atom, AtomEnum, ChangeWindowAttributesAux, ClipOrdering, Colormap, ColormapAlloc,
-    ConfigureWindowAux, ConnectionExt as _, CreateGCAux, CreateWindowAux, EventMask, Gcontext,
-    GrabMode, ImageFormat, PropMode, Screen, ScreenSaver, StackMode, Visibility, VisualClass,
-    Visualid, Window, WindowClass,
+    Atom, AtomEnum, ChangeWindowAttributesAux, ClientMessageEvent, ClipOrdering, Colormap,
+    ColormapAlloc, ConfigureWindowAux, ConnectionExt as _, CreateGCAux, CreateWindowAux, EventMask,
+    Gcontext, GrabMode, ImageFormat, KeyButMask, Keysym, PropMode, Screen, ScreenSaver, StackMode,
+    Visibility, VisualClass, Visualid, Window, WindowClass,
 };
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
@@ -151,6 +153,11 @@ impl Drop for X11KeepAwake {
 /// Screen-wide handles every overlay window is created with
 struct OverlayEnv {
     root: Window,
+    /// The root window's own (opaque) visual, for the ordinary designer window
+    root_depth: u8,
+    root_visual: Visualid,
+    screen_w: u16,
+    screen_h: u16,
     depth: u8,
     visual_id: Visualid,
     colormap: Colormap,
@@ -182,6 +189,10 @@ impl OverlayEnv {
 
         Ok(Self {
             root,
+            root_depth: screen.root_depth,
+            root_visual: screen.root_visual,
+            screen_w: screen.width_in_pixels,
+            screen_h: screen.height_in_pixels,
             depth,
             visual_id,
             colormap,
@@ -321,6 +332,315 @@ impl OverlayWindow {
     }
 }
 
+/// The coat designer: an ordinary window the window manager decorates, focuses and lets the
+/// user move (unlike the overlays). Contents, input handling and saving live in `designer.rs`
+struct DesignerWindow {
+    win: Window,
+    gc: Gcontext,
+    depth: u8,
+    w: u16,
+    h: u16,
+    wm_protocols: Atom,
+    wm_delete: Atom,
+    net_active_window: Atom,
+    /// Keyboard mapping, to turn keycodes into keysyms without xkbcommon
+    min_keycode: u8,
+    keysyms_per_keycode: u8,
+    keysyms: Vec<Keysym>,
+    designer: Designer,
+    /// Reused frame buffers, reallocated when the window is resized
+    frame: Pixmap,
+    bgra: Vec<u8>,
+}
+
+impl DesignerWindow {
+    fn open(
+        conn: &RustConnection,
+        env: &OverlayEnv,
+        current: &Coat,
+        coats: &CoatLibrary,
+    ) -> BoxResult<Self> {
+        let (w, h) = (DESIGNER_W as u16, DESIGNER_H as u16);
+        let x = (env.screen_w.saturating_sub(w) / 2) as i16;
+        let y = (env.screen_h.saturating_sub(h) / 2) as i16;
+        let win = conn.generate_id()?;
+        conn.create_window(
+            env.root_depth,
+            win,
+            env.root,
+            x,
+            y,
+            w,
+            h,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            env.root_visual,
+            &CreateWindowAux::new()
+                .background_pixel(0x0023_2530)
+                .event_mask(
+                    EventMask::EXPOSURE
+                        | EventMask::BUTTON_PRESS
+                        | EventMask::BUTTON_RELEASE
+                        | EventMask::POINTER_MOTION
+                        | EventMask::LEAVE_WINDOW
+                        | EventMask::KEY_PRESS
+                        | EventMask::STRUCTURE_NOTIFY,
+                ),
+        )?;
+
+        let utf8 = intern(conn, b"UTF8_STRING")?;
+        let wm_protocols = intern(conn, b"WM_PROTOCOLS")?;
+        let wm_delete = intern(conn, b"WM_DELETE_WINDOW")?;
+        let wm_type_dialog = intern(conn, b"_NET_WM_WINDOW_TYPE_DIALOG")?;
+        let net_active_window = intern(conn, b"_NET_ACTIVE_WINDOW")?;
+        conn.change_property8(
+            PropMode::REPLACE,
+            win,
+            AtomEnum::WM_NAME,
+            AtomEnum::STRING,
+            DESIGNER_TITLE.as_bytes(),
+        )?;
+        conn.change_property8(
+            PropMode::REPLACE,
+            win,
+            intern(conn, b"_NET_WM_NAME")?,
+            utf8,
+            DESIGNER_TITLE.as_bytes(),
+        )?;
+        conn.change_property8(
+            PropMode::REPLACE,
+            win,
+            AtomEnum::WM_CLASS,
+            AtomEnum::STRING,
+            b"catsor-designer\0Catsor\0",
+        )?;
+        conn.change_property32(
+            PropMode::REPLACE,
+            win,
+            wm_protocols,
+            AtomEnum::ATOM,
+            &[wm_delete],
+        )?;
+        // A fixed-size dialog. Being transient also makes tiling window managers such as
+        // xmonad float it instead of tiling it
+        conn.change_property32(
+            PropMode::REPLACE,
+            win,
+            env.wm_type,
+            AtomEnum::ATOM,
+            &[wm_type_dialog],
+        )?;
+        conn.change_property32(
+            PropMode::REPLACE,
+            win,
+            AtomEnum::WM_TRANSIENT_FOR,
+            AtomEnum::WINDOW,
+            &[env.root],
+        )?;
+        let (w32, h32) = (w as u32, h as u32);
+        // ICCCM WM_SIZE_HINTS: PPosition | PMinSize | PMaxSize
+        let hints: [u32; 18] = [
+            (1 << 2) | (1 << 4) | (1 << 5),
+            x as u32,
+            y as u32,
+            w32,
+            h32,
+            w32,
+            h32,
+            w32,
+            h32,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        conn.change_property32(
+            PropMode::REPLACE,
+            win,
+            AtomEnum::WM_NORMAL_HINTS,
+            AtomEnum::WM_SIZE_HINTS,
+            &hints,
+        )?;
+
+        let gc = conn.generate_id()?;
+        conn.create_gc(gc, win, &CreateGCAux::new())?;
+
+        let setup = conn.setup();
+        let (min_keycode, max_keycode) = (setup.min_keycode, setup.max_keycode);
+        let mapping = conn
+            .get_keyboard_mapping(min_keycode, max_keycode - min_keycode + 1)?
+            .reply()?;
+
+        conn.map_window(win)?;
+        conn.flush()?;
+        Ok(Self {
+            win,
+            gc,
+            depth: env.root_depth,
+            w,
+            h,
+            wm_protocols,
+            wm_delete,
+            net_active_window,
+            min_keycode,
+            keysyms_per_keycode: mapping.keysyms_per_keycode,
+            keysyms: mapping.keysyms,
+            designer: Designer::new(current, coats),
+            frame: Pixmap::new(w as u32, h as u32).ok_or("Failed to allocate Pixmap")?,
+            bgra: Vec::new(),
+        })
+    }
+
+    /// Asks the window manager to raise and focus the already open designer
+    fn activate(&self, conn: &RustConnection, root: Window) -> BoxResult<()> {
+        conn.map_window(self.win)?;
+        conn.configure_window(
+            self.win,
+            &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+        )?;
+        let ev = ClientMessageEvent::new(32, self.win, self.net_active_window, [1, 0, 0, 0, 0]);
+        conn.send_event(
+            false,
+            root,
+            EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+            ev,
+        )?;
+        Ok(())
+    }
+
+    /// The keysym for a key press, from the keycode's first two columns
+    fn keysym(&self, keycode: u8, state: KeyButMask) -> Keysym {
+        let per = self.keysyms_per_keycode as usize;
+        let base = keycode.saturating_sub(self.min_keycode) as usize * per;
+        let col = |i: usize| {
+            if i < per {
+                self.keysyms.get(base + i).copied().unwrap_or(0)
+            } else {
+                0
+            }
+        };
+        resolve_keysym(
+            col(0),
+            col(1),
+            state.contains(KeyButMask::SHIFT),
+            state.contains(KeyButMask::LOCK),
+            state.contains(KeyButMask::MOD2),
+        )
+    }
+
+    /// Turns an event on the designer window into designer input. `None` means the event
+    /// isn't for this window; `Some(true)` means the designer asked to close
+    fn handle_event(
+        &mut self,
+        event: &Event,
+        coats: &mut CoatLibrary,
+        cat: &mut crate::cat::CatSim,
+    ) -> Option<bool> {
+        let input = match event {
+            Event::Expose(ev) if ev.window == self.win => {
+                self.designer.invalidate();
+                return Some(false);
+            }
+            Event::ConfigureNotify(ev) if ev.window == self.win => {
+                if (ev.width, ev.height) != (self.w, self.h)
+                    && let Some(frame) =
+                        Pixmap::new(ev.width.max(1) as u32, ev.height.max(1) as u32)
+                {
+                    self.frame = frame;
+                }
+                self.w = ev.width;
+                self.h = ev.height;
+                self.designer
+                    .set_window_size(ev.width as u32, ev.height as u32);
+                return Some(false);
+            }
+            Event::ClientMessage(ev) if ev.window == self.win => {
+                if ev.type_ == self.wm_protocols && ev.data.as_data32()[0] == self.wm_delete {
+                    DesignerInput::Close
+                } else {
+                    return Some(false);
+                }
+            }
+            Event::ButtonPress(ev) if ev.event == self.win => {
+                if ev.detail != 1 {
+                    return Some(false);
+                }
+                DesignerInput::Press(ev.event_x as f32, ev.event_y as f32)
+            }
+            Event::ButtonRelease(ev) if ev.event == self.win => {
+                if ev.detail != 1 {
+                    return Some(false);
+                }
+                DesignerInput::Release
+            }
+            Event::MotionNotify(ev) if ev.event == self.win => {
+                DesignerInput::Move(ev.event_x as f32, ev.event_y as f32)
+            }
+            Event::LeaveNotify(ev) if ev.event == self.win => DesignerInput::Leave,
+            Event::KeyPress(ev) if ev.event == self.win => {
+                match self.keysym(ev.detail, ev.state) {
+                    0xff08 => DesignerInput::Backspace,
+                    0xff0d | 0xff8d => DesignerInput::Enter,
+                    0xff1b => DesignerInput::Escape,
+                    // Keypad digits (with NumLock on)
+                    sym @ 0xffb0..=0xffb9 => {
+                        DesignerInput::Char((b'0' + (sym - 0xffb0) as u8) as char)
+                    }
+                    // Printable ASCII and Latin-1 keysyms equal their code points
+                    sym @ (0x20..=0x7e | 0xa0..=0xff) => match char::from_u32(sym) {
+                        Some(c) => DesignerInput::Char(c),
+                        None => return Some(false),
+                    },
+                    _ => return Some(false),
+                }
+            }
+            Event::DestroyNotify(ev) if ev.window == self.win => return Some(true),
+            _ => return None,
+        };
+        Some(self.designer.handle(input, coats, cat))
+    }
+
+    /// Redraws and uploads the contents if they changed
+    fn present(&mut self, conn: &RustConnection) -> BoxResult<()> {
+        if !self.designer.take_dirty() {
+            return Ok(());
+        }
+        let w = self.frame.width() as u16;
+        self.designer.render(&mut self.frame.as_mut());
+        self.bgra.resize(self.frame.data().len(), 0);
+        rgba_to_bgra(self.frame.data(), &mut self.bgra);
+        // Upload in horizontal strips so each request stays under the server's size limit
+        let row_bytes = w as usize * 4;
+        let rows_per_req = ((conn.maximum_request_bytes().saturating_sub(64)) / row_bytes).max(1);
+        for (i, strip) in self.bgra.chunks(rows_per_req * row_bytes).enumerate() {
+            conn.put_image(
+                ImageFormat::Z_PIXMAP,
+                self.win,
+                self.gc,
+                w,
+                (strip.len() / row_bytes) as u16,
+                0,
+                (i * rows_per_req) as i16,
+                0,
+                self.depth,
+                strip,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn close(self, conn: &RustConnection) {
+        let _ = conn.free_gc(self.gc);
+        let _ = conn.destroy_window(self.win);
+        let _ = conn.flush();
+    }
+}
+
 enum Flow {
     Continue { needs_raise: bool },
     Quit,
@@ -331,6 +651,9 @@ struct X11App {
     env: OverlayEnv,
     gc: Gcontext,
     cat: CatSim,
+    /// Custom coats from `coats.toml`, reloaded when the file changes
+    coats: CoatLibrary,
+    designer: Option<DesignerWindow>,
     cat_win: OverlayWindow,
     /// Standalone bowl window shown while carrying or walking to the placed bowl
     bowl_win: OverlayWindow,
@@ -384,8 +707,11 @@ fn monitor_at(monitors: &[(Vec2, Vec2)], p: Vec2) -> Option<(Vec2, Vec2)> {
     })
 }
 
-pub fn run(args: &Args, prefs: UserPrefs) -> BoxResult<()> {
-    let mut app = X11App::new(args, prefs)?;
+pub fn run(args: &Args, prefs: UserPrefs, coats: CoatLibrary) -> BoxResult<()> {
+    let mut app = X11App::new(args, prefs, coats)?;
+    if args.design_coat {
+        app.handle_tray_action(TrayAction::OpenDesigner)?;
+    }
     let frame_duration = Duration::from_secs_f64(1.0 / (args.fps.max(15) as f64));
     let mut last_tick = Instant::now();
     let mut raise_counter = 0u32;
@@ -409,6 +735,14 @@ pub fn run(args: &Args, prefs: UserPrefs) -> BoxResult<()> {
         if !app.cat_hidden {
             app.draw_cat(needs_raise)?;
         }
+        if let Some(dw) = &mut app.designer
+            && let Err(e) = dw.present(&app.conn)
+        {
+            eprintln!("catsor: closing the coat designer, drawing it failed: {e}");
+            if let Some(dw) = app.designer.take() {
+                dw.close(&app.conn);
+            }
+        }
         app.conn.flush()?;
 
         let elapsed = now.elapsed();
@@ -419,7 +753,7 @@ pub fn run(args: &Args, prefs: UserPrefs) -> BoxResult<()> {
 }
 
 impl X11App {
-    fn new(args: &Args, prefs: UserPrefs) -> BoxResult<Self> {
+    fn new(args: &Args, prefs: UserPrefs, coats: CoatLibrary) -> BoxResult<Self> {
         let (conn, screen_num) = x11rb::connect(None)?;
         let screen = &conn.setup().roots[screen_num];
         let env = OverlayEnv::new(&conn, screen)?;
@@ -432,7 +766,7 @@ impl X11App {
         // Query initial cursor location so the cat spawns nearby
         let pointer = conn.query_pointer(env.root)?.reply()?;
         let start_cursor = Vec2::new(pointer.root_x as f32, pointer.root_y as f32);
-        let mut cat = CatSim::new(start_cursor, prefs.scale, prefs.coat);
+        let mut cat = CatSim::new(start_cursor, prefs.scale, coats.resolve(&prefs.coat));
         cat.behaviors = prefs.behaviors;
         let _ = conn.randr_query_version(1, 5).map(|cookie| cookie.reply());
         let monitors = query_monitors(&conn, env.root);
@@ -488,6 +822,8 @@ impl X11App {
             env,
             gc,
             cat,
+            coats,
+            designer: None,
             cat_win,
             bowl_win,
             bowl_mapped: false,
@@ -509,6 +845,14 @@ impl X11App {
         let overlay_atom = self.env.catsor_overlay;
         let open_menu_win = self.tray.as_ref().and_then(|t| t.open_menu_window());
         while let Some(event) = self.conn.poll_for_event()? {
+            if let Some(dw) = &mut self.designer
+                && let Some(close) = dw.handle_event(&event, &mut self.coats, &mut self.cat)
+            {
+                if close && let Some(dw) = self.designer.take() {
+                    dw.close(&self.conn);
+                }
+                continue;
+            }
             let conn = &self.conn;
             match &event {
                 Event::VisibilityNotify(ev)
@@ -571,7 +915,8 @@ impl X11App {
 
     fn handle_tray_action(&mut self, action: TrayAction) -> BoxResult<Flow> {
         let mut needs_raise = false;
-        let Some(action) = apply_shared_action(action, &mut self.cat, &mut self.start_on_login)
+        let Some(action) =
+            apply_shared_action(action, &mut self.cat, &self.coats, &mut self.start_on_login)
         else {
             return Ok(Flow::Continue { needs_raise });
         };
@@ -613,14 +958,32 @@ impl X11App {
                 }
             }
             TrayAction::OpenAbout => open_about_page(),
+            // The designer is optional: if its window fails, say so and keep the cat running
+            TrayAction::OpenDesigner => match &self.designer {
+                Some(dw) => {
+                    if let Err(e) = dw.activate(&self.conn, self.env.root) {
+                        eprintln!("catsor: failed to raise the coat designer: {e}");
+                    }
+                }
+                None => {
+                    match DesignerWindow::open(&self.conn, &self.env, &self.cat.coat, &self.coats) {
+                        Ok(dw) => self.designer = Some(dw),
+                        Err(e) => eprintln!("catsor: failed to open the coat designer: {e}"),
+                    }
+                }
+            },
             TrayAction::Quit => {
+                if let Some(dw) = self.designer.take() {
+                    dw.close(&self.conn);
+                }
                 if let Some(tray_ctrl) = &mut self.tray {
                     tray_ctrl.close_menu(&self.conn)?;
                 }
                 return Ok(Flow::Quit);
             }
             // Handled by `apply_shared_action`
-            TrayAction::SetCoat(_)
+            TrayAction::NextCoat
+            | TrayAction::RandomCoat
             | TrayAction::SetTemperament(_)
             | TrayAction::ToggleFollowCursor
             | TrayAction::TogglePlayfulQuirks
@@ -686,6 +1049,7 @@ impl X11App {
     /// Advances the simulation from the root-window cursor. A hidden cat stays paused unless
     /// it is feeding.
     fn step_cat(&mut self, dt: f32) {
+        self.coats.refresh(&mut self.cat);
         self.update_roam_bounds();
         if (!self.cat_hidden || self.cat.feeding_preset().is_some())
             && let Ok(cookie) = self.conn.query_pointer(self.env.root)
@@ -811,5 +1175,49 @@ fn open_about_page() {
             std::thread::spawn(move || child.wait());
         }
         Err(e) => eprintln!("catsor: failed to open {ABOUT_URL}: {e}"),
+    }
+}
+
+/// Picks the keysym for a key press from the keycode's first two keysym columns (unshifted,
+/// shifted), following the core protocol rules: Shift selects the second column, Caps Lock
+/// only shifts letters (Shift + Caps Lock gives lower case), and with NumLock on keypad keys
+/// use their second (digit) column unless Shift is held
+fn resolve_keysym(col0: Keysym, col1: Keysym, shift: bool, lock: bool, numlock: bool) -> Keysym {
+    let col1 = if col1 == 0 { col0 } else { col1 };
+    let is_keypad = |sym: Keysym| (0xff80..=0xffbd).contains(&sym);
+    if numlock && is_keypad(col1) {
+        return if shift { col0 } else { col1 };
+    }
+    // Latin-1 letters have distinct lower and upper case keysyms in the two columns
+    let is_letter = col0 != col1 && char::from_u32(col0).is_some_and(|c| c.is_alphabetic());
+    if lock && is_letter {
+        return if shift { col0 } else { col1 };
+    }
+    if shift { col1 } else { col0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_keysym;
+
+    #[test]
+    fn caps_lock_shifts_only_letters_and_numlock_enables_keypad_digits() {
+        let (a, upper_a) = (0x61, 0x41);
+        let (one, bang) = (0x31, 0x21);
+        // Shift
+        assert_eq!(resolve_keysym(a, upper_a, false, false, false), a);
+        assert_eq!(resolve_keysym(a, upper_a, true, false, false), upper_a);
+        assert_eq!(resolve_keysym(one, bang, true, false, false), bang);
+        // Caps Lock: letters only, and Shift undoes it
+        assert_eq!(resolve_keysym(a, upper_a, false, true, false), upper_a);
+        assert_eq!(resolve_keysym(a, upper_a, true, true, false), a);
+        assert_eq!(resolve_keysym(one, bang, false, true, false), one);
+        // Keypad: KP_End / KP_1
+        let (kp_end, kp_1) = (0xff9c, 0xffb1);
+        assert_eq!(resolve_keysym(kp_end, kp_1, false, false, true), kp_1);
+        assert_eq!(resolve_keysym(kp_end, kp_1, true, false, true), kp_end);
+        assert_eq!(resolve_keysym(kp_end, kp_1, false, false, false), kp_end);
+        // Keys with a single keysym
+        assert_eq!(resolve_keysym(0xff08, 0, true, true, true), 0xff08);
     }
 }

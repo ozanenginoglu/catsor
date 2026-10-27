@@ -1,6 +1,7 @@
 mod behavior;
 mod body;
 
+use crate::coat::Coat;
 use glam::Vec2;
 
 /// Number of spine nodes from head (0) to tail base (5)
@@ -8,56 +9,6 @@ pub const BODY_NODES: usize = 6;
 /// Number of tail segments after the tail base (6..12)
 pub const TAIL_NODES: usize = 6;
 pub const TOTAL_NODES: usize = BODY_NODES + TAIL_NODES;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum CoatStyle {
-    /// White base with warm ginger & charcoal patches (centerpiece from reference)
-    Calico,
-    /// Warm cinnamon/taupe brown with darker flank shading
-    Brown,
-    /// Sleek dark slate charcoal with deep edge shading
-    Charcoal,
-    /// White & charcoal tuxedo with nose blaze
-    Tuxedo,
-    /// Pearl silver-white with cool gray shading
-    Silver,
-}
-
-impl CoatStyle {
-    pub const ALL: [CoatStyle; 5] = [
-        CoatStyle::Calico,
-        CoatStyle::Brown,
-        CoatStyle::Charcoal,
-        CoatStyle::Tuxedo,
-        CoatStyle::Silver,
-    ];
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            CoatStyle::Calico => "Calico",
-            CoatStyle::Brown => "Brown",
-            CoatStyle::Charcoal => "Charcoal",
-            CoatStyle::Tuxedo => "Tuxedo",
-            CoatStyle::Silver => "Silver",
-        }
-    }
-
-    pub const fn as_config_str(self) -> &'static str {
-        match self {
-            CoatStyle::Calico => "calico",
-            CoatStyle::Brown => "brown",
-            CoatStyle::Charcoal => "charcoal",
-            CoatStyle::Tuxedo => "tuxedo",
-            CoatStyle::Silver => "silver",
-        }
-    }
-
-    pub fn from_config_str(s: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|c| c.as_config_str().eq_ignore_ascii_case(s))
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Temperament {
@@ -327,7 +278,7 @@ impl Gait {
 #[cfg_attr(test, derive(Clone))]
 pub struct CatSim {
     pub scale: f32,
-    pub coat: CoatStyle,
+    pub coat: Coat,
     pub activity: Activity,
     pub behaviors: BehaviorConfig,
     pub feeding_phase: Option<FeedingPhase>,
@@ -487,7 +438,7 @@ impl CatSim {
     /// rump, run forward along the flank, then hook in toward the front paws
     const SIT_TAIL_WRAP: [f32; TAIL_NODES] = [0.78, 0.74, 0.36, 0.24, 0.22, 0.40];
 
-    pub fn new(start_pos: Vec2, scale: f32, coat: CoatStyle) -> Self {
+    pub fn new(start_pos: Vec2, scale: f32, coat: impl Into<Coat>) -> Self {
         let initial_offset = Vec2::new(-42.0 * scale, 24.0 * scale);
         let head_pos = start_pos + initial_offset;
         let mut nodes = [head_pos; TOTAL_NODES];
@@ -545,7 +496,7 @@ impl CatSim {
 
         Self {
             scale,
-            coat,
+            coat: coat.into(),
             activity: Activity::Sitting,
             behaviors: BehaviorConfig::default(),
             feeding_phase: None,

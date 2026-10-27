@@ -1,4 +1,5 @@
-use crate::cat::{BehaviorConfig, CatSim, CoatStyle, Temperament};
+use crate::cat::{BehaviorConfig, CatSim, Temperament};
+use crate::coat::{CoatId, strip_comment, unquote};
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -7,9 +8,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct UserPrefs {
-    pub coat: CoatStyle,
+    /// A built-in coat, a custom coat from `coats.toml` by name, or a random coat's seed
+    pub coat: CoatId,
     pub scale: f32,
     pub behaviors: BehaviorConfig,
 }
@@ -17,7 +19,7 @@ pub struct UserPrefs {
 impl Default for UserPrefs {
     fn default() -> Self {
         Self {
-            coat: CoatStyle::Calico,
+            coat: CoatId::default(),
             scale: 1.0,
             behaviors: BehaviorConfig::default(),
         }
@@ -27,7 +29,7 @@ impl Default for UserPrefs {
 impl UserPrefs {
     pub fn from_cat(cat: &CatSim) -> Self {
         Self {
-            coat: cat.coat,
+            coat: cat.coat.id.clone(),
             scale: cat.scale.clamp(0.5, 2.5),
             behaviors: cat.behaviors,
         }
@@ -47,57 +49,17 @@ impl UserPrefs {
         }
     }
 
-    pub fn save(self) {
+    pub fn save(&self) {
         if let Some(path) = default_config_path() {
             let _ = self.save_to_path(&path);
         }
     }
 
-    pub fn save_to_path(self, path: &Path) -> io::Result<()> {
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent)?;
-        }
-        let content = self.to_toml_string();
-        let pid = std::process::id();
-        let file_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("config.toml");
-
-        let (mut file, tmp_path) = loop {
-            let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let candidate = path.with_file_name(format!(".{file_name}.{pid}.{seq}.tmp"));
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&candidate)
-            {
-                Ok(f) => break (f, candidate),
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(e),
-            }
-        };
-
-        if let Err(err) = file
-            .write_all(content.as_bytes())
-            .and_then(|()| file.sync_all())
-        {
-            drop(file);
-            let _ = fs::remove_file(&tmp_path);
-            return Err(err);
-        }
-        drop(file);
-
-        if let Err(err) = fs::rename(&tmp_path, path) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(err);
-        }
-        Ok(())
+    pub fn save_to_path(&self, path: &Path) -> io::Result<()> {
+        write_atomic(path, &self.to_toml_string())
     }
 
-    pub fn to_toml_string(self) -> String {
+    pub fn to_toml_string(&self) -> String {
         format!(
             "# Catsor user preferences\n\
              coat = \"{}\"\n\
@@ -105,7 +67,7 @@ impl UserPrefs {
              scale = {:.2}\n\
              follow_cursor = {}\n\
              playful_quirks = {}\n",
-            self.coat.as_config_str(),
+            self.coat.to_config_string(),
             self.behaviors.temperament.as_config_str(),
             self.scale.clamp(0.5, 2.5),
             self.behaviors.follow_cursor,
@@ -116,7 +78,7 @@ impl UserPrefs {
     pub fn parse_toml(input: &str) -> Self {
         let mut prefs = Self::default();
         for raw_line in input.lines() {
-            let line = raw_line.split('#').next().unwrap_or("").trim();
+            let line = strip_comment(raw_line).trim();
             if line.is_empty() {
                 continue;
             }
@@ -124,11 +86,11 @@ impl UserPrefs {
                 continue;
             };
             let key = raw_key.trim();
-            let val = raw_val.trim().trim_matches('"').trim_matches('\'').trim();
+            let val = unquote(raw_val).trim();
 
             match key {
                 "coat" => {
-                    if let Some(c) = CoatStyle::from_config_str(val) {
+                    if let Some(c) = CoatId::parse(val) {
                         prefs.coat = c;
                     }
                 }
@@ -159,6 +121,50 @@ impl UserPrefs {
         }
         prefs
     }
+}
+
+/// Writes `content` to `path` through a temp file in the same directory and a rename, so a
+/// crash mid-write never leaves a half-written file. Creates the parent directory if needed
+pub(crate) fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let pid = std::process::id();
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("config.toml");
+    let (mut file, tmp_path) = loop {
+        let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = path.with_file_name(format!(".{file_name}.{pid}.{seq}.tmp"));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(f) => break (f, candidate),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
+
+    if let Err(err) = file
+        .write_all(content.as_bytes())
+        .and_then(|()| file.sync_all())
+    {
+        drop(file);
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    drop(file);
+
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    Ok(())
 }
 
 fn parse_bool(val: &str) -> Option<bool> {
@@ -254,11 +260,12 @@ fn resolve_config_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coat::CoatStyle;
 
     #[test]
     fn roundtrips_all_user_preferences() {
         let prefs = UserPrefs {
-            coat: CoatStyle::Tuxedo,
+            coat: CoatId::Builtin(CoatStyle::Tuxedo),
             scale: 1.35,
             behaviors: BehaviorConfig {
                 temperament: Temperament::Playful,
@@ -268,9 +275,22 @@ mod tests {
         };
         let serialized = prefs.to_toml_string();
         let parsed = UserPrefs::parse_toml(&serialized);
-        assert_eq!(parsed.coat, CoatStyle::Tuxedo);
+        assert_eq!(parsed.coat, CoatId::Builtin(CoatStyle::Tuxedo));
         assert!((parsed.scale - 1.35).abs() < 1e-4);
         assert_eq!(parsed.behaviors, prefs.behaviors);
+
+        for coat in [
+            CoatId::Custom("Mr. #1 Cat".into()),
+            CoatId::Custom("Jones'".into()),
+            CoatId::Custom("'Tis".into()),
+            CoatId::Random(0xdead_beef),
+        ] {
+            let prefs = UserPrefs {
+                coat: coat.clone(),
+                ..UserPrefs::default()
+            };
+            assert_eq!(UserPrefs::parse_toml(&prefs.to_toml_string()).coat, coat);
+        }
     }
 
     #[test]
@@ -280,7 +300,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
 
         let prefs = UserPrefs {
-            coat: CoatStyle::Silver,
+            coat: CoatId::Builtin(CoatStyle::Silver),
             scale: 0.80,
             behaviors: BehaviorConfig {
                 temperament: Temperament::Aloof,
@@ -291,7 +311,7 @@ mod tests {
         prefs.save_to_path(&path).unwrap();
 
         let loaded = UserPrefs::load_from_path(&path);
-        assert_eq!(loaded.coat, CoatStyle::Silver);
+        assert_eq!(loaded.coat, CoatId::Builtin(CoatStyle::Silver));
         assert!((loaded.scale - 0.80).abs() < 1e-4);
         assert_eq!(loaded.behaviors, prefs.behaviors);
 
@@ -306,7 +326,7 @@ mod tests {
             startle_enabled = true
         ";
         let parsed = UserPrefs::parse_toml(custom);
-        assert_eq!(parsed.coat, CoatStyle::Charcoal);
+        assert_eq!(parsed.coat, CoatId::Builtin(CoatStyle::Charcoal));
         assert_eq!(parsed.behaviors.temperament, Temperament::Lazy);
         assert!((parsed.scale - 2.5).abs() < 1e-4);
         assert!(!parsed.behaviors.follow_cursor);

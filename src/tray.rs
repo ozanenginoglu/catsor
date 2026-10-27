@@ -1,5 +1,6 @@
 use crate::autostart;
-use crate::cat::{Activity, BehaviorConfig, CatSim, CoatStyle, FeedPreset, Temperament};
+use crate::cat::{Activity, BehaviorConfig, CatSim, FeedPreset, Temperament};
+use crate::coat::{Coat, CoatId, CoatLibrary, fresh_seed};
 use crate::prefs::UserPrefs;
 use crate::render::coat_swatch_colors;
 #[cfg(not(any(target_os = "windows", windows_check)))]
@@ -31,9 +32,9 @@ const XEMBED_MAPPED: u32 = 1 << 0;
 pub(crate) const MENU_WIDTH: u16 = 228;
 /// Opened by the About row
 pub(crate) const ABOUT_URL: &str = env!("CARGO_PKG_REPOSITORY");
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TrayState {
-    pub coat: CoatStyle,
+    pub coat: Coat,
     pub behaviors: BehaviorConfig,
     pub scale: f32,
     pub sleeping: bool,
@@ -46,7 +47,7 @@ pub struct TrayState {
 impl TrayState {
     pub fn from_cat(cat: &CatSim, hidden: bool, start_on_login: bool) -> Self {
         Self {
-            coat: cat.coat,
+            coat: cat.coat.clone(),
             behaviors: cat.behaviors,
             scale: cat.scale,
             sleeping: matches!(cat.activity, Activity::Sleeping),
@@ -65,7 +66,12 @@ impl TrayState {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TrayAction {
-    SetCoat(CoatStyle),
+    /// Advance to the next built-in or custom coat
+    NextCoat,
+    /// Roll a new random coat
+    RandomCoat,
+    /// Open the coat designer window
+    OpenDesigner,
     SetTemperament(Temperament),
     ToggleFollowCursor,
     TogglePlayfulQuirks,
@@ -92,10 +98,18 @@ pub(crate) fn normalize_tray_action(action: TrayAction, active: Option<FeedPrese
 pub(crate) fn apply_shared_action(
     action: TrayAction,
     cat: &mut CatSim,
+    coats: &CoatLibrary,
     start_on_login: &mut bool,
 ) -> Option<TrayAction> {
     match normalize_tray_action(action, cat.feeding_preset()) {
-        TrayAction::SetCoat(coat) => cat.coat = coat,
+        TrayAction::NextCoat => cat.coat = coats.next_after(&cat.coat.id),
+        TrayAction::RandomCoat => {
+            let mut seed = fresh_seed();
+            if cat.coat.id == CoatId::Random(seed) {
+                seed = seed.wrapping_add(1);
+            }
+            cat.coat = Coat::random(seed);
+        }
         TrayAction::SetTemperament(temp) => cat.behaviors.temperament = temp,
         TrayAction::ToggleFollowCursor => {
             cat.behaviors.follow_cursor = !cat.behaviors.follow_cursor;
@@ -131,7 +145,7 @@ pub(crate) enum MenuRow {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Indicator {
     /// Click advances to the next value; optionally shows a coat swatch on the right
-    Cycle(Option<CoatStyle>),
+    Cycle(Option<Swatch>),
     FeedRadio {
         selected: bool,
         remaining_secs: Option<u32>,
@@ -139,8 +153,13 @@ pub(crate) enum Indicator {
     Checkbox(bool),
     Stop,
     Info,
+    /// Pencil: opens an editor
+    Edit,
     Danger,
 }
+
+/// Coat swatch colours: `(base, accent, outline)`
+pub(crate) type Swatch = (Color, Color, Color);
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HitEntry {
@@ -761,7 +780,7 @@ impl TrayController {
             return Ok(());
         };
         render_tray_icon(
-            self.last_state.coat,
+            &self.last_state.coat,
             self.last_state.sleeping,
             self.last_state.hidden,
             self.tray_opaque_bg,
@@ -870,10 +889,22 @@ pub(crate) fn build_rows(state: &TrayState) -> Vec<MenuRow> {
 
     rows.push(MenuRow::Header("APPEARANCE"));
     rows.push(MenuRow::Item {
-        label: Cow::Owned(format!("Coat: {}", state.coat.label())),
-        action: TrayAction::SetCoat(next_in(&CoatStyle::ALL, state.coat)),
-        indicator: Indicator::Cycle(Some(state.coat)),
+        label: Cow::Owned(format!("Coat: {}", state.coat.name)),
+        action: TrayAction::NextCoat,
+        indicator: Indicator::Cycle(Some(coat_swatch_colors(&state.coat))),
         close_on_click: false,
+    });
+    rows.push(MenuRow::Item {
+        label: Cow::Borrowed("Random Coat"),
+        action: TrayAction::RandomCoat,
+        indicator: Indicator::Cycle(None),
+        close_on_click: false,
+    });
+    rows.push(MenuRow::Item {
+        label: Cow::Borrowed("Design Coat..."),
+        action: TrayAction::OpenDesigner,
+        indicator: Indicator::Edit,
+        close_on_click: true,
     });
     let (size_label, next_scale) = size_row(state.scale);
     rows.push(MenuRow::Item {
@@ -1087,8 +1118,7 @@ pub(crate) fn render_menu_pixmap(
                             paint.set_color(Color::from_rgba8(0xbd, 0x93, 0xf9, 240));
                             pixmap.stroke_path(&p, &paint, &st, Transform::identity(), None);
                         }
-                        if let Some(coat) = swatch {
-                            let (base, accent, outline) = coat_swatch_colors(coat);
+                        if let Some((base, accent, outline)) = swatch {
                             let sx = w - 22.0;
                             if let Some(sw) = PathBuilder::from_circle(sx, cy, 5.5) {
                                 paint.set_color(base);
@@ -1178,6 +1208,36 @@ pub(crate) fn render_menu_pixmap(
                             );
                         }
                     }
+                    Indicator::Edit => {
+                        // Pencil, tip at the bottom left
+                        let st = Stroke {
+                            width: 2.4,
+                            line_cap: LineCap::Butt,
+                            ..Default::default()
+                        };
+                        let mut pb = PathBuilder::new();
+                        pb.move_to(ix - 1.6, cy + 1.6);
+                        pb.line_to(ix + 3.4, cy - 3.4);
+                        if let Some(p) = pb.finish() {
+                            paint.set_color(Color::from_rgba8(0xbd, 0x93, 0xf9, 240));
+                            pixmap.stroke_path(&p, &paint, &st, Transform::identity(), None);
+                        }
+                        let mut tip = PathBuilder::new();
+                        tip.move_to(ix - 2.45, cy + 0.75);
+                        tip.line_to(ix - 0.75, cy + 2.45);
+                        tip.line_to(ix - 3.6, cy + 3.6);
+                        tip.close();
+                        if let Some(p) = tip.finish() {
+                            paint.set_color(Color::from_rgba8(0xf8, 0xf8, 0xf2, 230));
+                            pixmap.fill_path(
+                                &p,
+                                &paint,
+                                FillRule::Winding,
+                                Transform::identity(),
+                                None,
+                            );
+                        }
+                    }
                     Indicator::Danger => {
                         let mut pb = PathBuilder::new();
                         pb.move_to(ix - 3.0, cy - 3.0);
@@ -1241,7 +1301,7 @@ fn draw_radio_indicator(pixmap: &mut PixmapMut, cx: f32, cy: f32, selected: bool
     }
 }
 
-fn draw_checkbox_indicator(pixmap: &mut PixmapMut, cx: f32, cy: f32, checked: bool) {
+pub(crate) fn draw_checkbox_indicator(pixmap: &mut PixmapMut, cx: f32, cy: f32, checked: bool) {
     let mut paint = Paint::default();
 
     if let Some(box_path) = build_rounded_rect(cx - 5.0, cy - 5.0, 10.0, 10.0, 2.5) {
@@ -1282,7 +1342,13 @@ fn draw_checkbox_indicator(pixmap: &mut PixmapMut, cx: f32, cy: f32, checked: bo
     }
 }
 
-fn build_rounded_rect(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<tiny_skia::Path> {
+pub(crate) fn build_rounded_rect(
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    r: f32,
+) -> Option<tiny_skia::Path> {
     let r = r.min(w * 0.5).min(h * 0.5);
     let mut pb = PathBuilder::new();
     pb.move_to(x + r, y);
@@ -1299,7 +1365,19 @@ fn build_rounded_rect(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<tiny_ski
 }
 
 /// Draws crisp 5x7 bitmap text onto `pixmap`.
-fn draw_text(pixmap: &mut PixmapMut, text: &str, mut x: f32, y: f32, color: Color) {
+pub(crate) fn draw_text(pixmap: &mut PixmapMut, text: &str, x: f32, y: f32, color: Color) {
+    draw_text_sized(pixmap, text, x, y, 1.0, color);
+}
+
+/// Bitmap text with every font pixel drawn as a `px` x `px` square (advance is `6 * px`)
+pub(crate) fn draw_text_sized(
+    pixmap: &mut PixmapMut,
+    text: &str,
+    mut x: f32,
+    y: f32,
+    px: f32,
+    color: Color,
+) {
     let mut paint = Paint::default();
     paint.set_color(color);
 
@@ -1314,19 +1392,19 @@ fn draw_text(pixmap: &mut PixmapMut, text: &str, mut x: f32, y: f32, color: Colo
         for (row_idx, &bits) in glyph.iter().enumerate() {
             for col_idx in 0..5 {
                 if (bits >> (4 - col_idx)) & 1 == 1 {
-                    let px = x + col_idx as f32;
-                    let py = y + dy + row_idx as f32;
-                    if let Some(rect) = Rect::from_xywh(px, py, 1.0, 1.0) {
+                    let gx = x + col_idx as f32 * px;
+                    let gy = y + (dy + row_idx as f32) * px;
+                    if let Some(rect) = Rect::from_xywh(gx, gy, px, px) {
                         pixmap.fill_rect(rect, &paint, Transform::identity(), None);
                     }
                 }
             }
         }
-        x += 6.0;
+        x += 6.0 * px;
     }
 }
 
-const fn glyph_5x7(ch: char) -> [u8; 7] {
+pub(crate) const fn glyph_5x7(ch: char) -> [u8; 7] {
     match ch {
         'A' => [
             0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
@@ -1545,10 +1623,11 @@ const fn glyph_5x7(ch: char) -> [u8; 7] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coat::CoatStyle;
 
     fn test_state() -> TrayState {
         TrayState {
-            coat: CoatStyle::Calico,
+            coat: Coat::builtin(CoatStyle::Calico),
             behaviors: BehaviorConfig::default(),
             scale: 1.0,
             sleeping: false,
@@ -1584,10 +1663,12 @@ mod tests {
         let rows = build_rows(&state);
         let (menu_h, hits) = compute_layout(&rows);
 
-        // coat + size + temperament + 5 feed presets + stop + 2 toggles + show + login + about + quit
-        assert_eq!(hits.len(), 15);
-        // Must fit comfortably on a 768 px tall screen with a panel
-        assert!(menu_h > 200 && menu_h < 400, "menu_h = {menu_h}");
+        // coat + random coat + design + size + temperament + 5 feed presets + stop + 2 toggles
+        // + show + login + about + quit
+        assert_eq!(hits.len(), 17);
+        // Must fit comfortably on a 768 px tall screen with a panel (the menu is clamped on
+        // screen with an 8 px margin)
+        assert!(menu_h > 200 && menu_h < 440, "menu_h = {menu_h}");
 
         // Verify every hit region is strictly ordered and non-overlapping
         for pair in hits.windows(2) {
@@ -1595,25 +1676,29 @@ mod tests {
             assert!(pair[0].y_bottom <= pair[1].y_top);
         }
 
-        assert!(matches!(hits[0].action, TrayAction::SetCoat(_)));
-        assert!(matches!(hits[1].action, TrayAction::SetScale(_)));
-        assert!(matches!(hits[2].action, TrayAction::SetTemperament(_)));
+        assert_eq!(hits[0].action, TrayAction::NextCoat);
+        assert_eq!(hits[1].action, TrayAction::RandomCoat);
+        assert_eq!(hits[2].action, TrayAction::OpenDesigner);
+        assert!(hits[2].close_on_click);
+        assert!(matches!(hits[3].action, TrayAction::SetScale(_)));
+        assert!(matches!(hits[4].action, TrayAction::SetTemperament(_)));
         assert_eq!(
-            hits[3].action,
+            hits[5].action,
             TrayAction::SelectFeedPreset(FeedPreset::Mins15)
         );
-        assert!(hits[3].close_on_click);
-        assert_eq!(hits[8].action, TrayAction::StopFeeding);
-        assert!(hits[8].close_on_click);
-        assert_eq!(hits[12].action, TrayAction::ToggleStartOnLogin);
-        assert_eq!(hits[13].action, TrayAction::OpenAbout);
-        assert!(hits[13].close_on_click);
-        assert_eq!(hits[14].action, TrayAction::Quit);
-        assert!(hits[14].close_on_click);
+        assert!(hits[5].close_on_click);
+        assert_eq!(hits[10].action, TrayAction::StopFeeding);
+        assert!(hits[10].close_on_click);
+        assert_eq!(hits[14].action, TrayAction::ToggleStartOnLogin);
+        assert_eq!(hits[15].action, TrayAction::OpenAbout);
+        assert!(hits[15].close_on_click);
+        assert_eq!(hits[16].action, TrayAction::Quit);
+        assert!(hits[16].close_on_click);
         for h in &hits {
             if matches!(
                 h.action,
-                TrayAction::SetCoat(_)
+                TrayAction::NextCoat
+                    | TrayAction::RandomCoat
                     | TrayAction::SetScale(_)
                     | TrayAction::SetTemperament(_)
                     | TrayAction::ToggleHidden
@@ -1649,22 +1734,24 @@ mod tests {
     }
 
     #[test]
-    fn coat_row_cycles_through_every_coat() {
+    fn coat_row_shows_the_current_coat_name() {
         let mut state = test_state();
-        let mut seen = Vec::new();
-        for _ in 0..CoatStyle::ALL.len() {
-            seen.push(state.coat);
-            let next = actions(&state)
-                .into_iter()
-                .find_map(|a| match a {
-                    TrayAction::SetCoat(c) => Some(c),
-                    _ => None,
-                })
-                .unwrap();
-            state.coat = next;
+        assert_eq!(label_of(&state, TrayAction::NextCoat), "Coat: Calico");
+        assert_eq!(label_of(&state, TrayAction::RandomCoat), "Random Coat");
+        assert_eq!(label_of(&state, TrayAction::OpenDesigner), "Design Coat...");
+        state.coat = Coat::random(42);
+        assert_eq!(
+            label_of(&state, TrayAction::NextCoat),
+            format!("Coat: {}", state.coat.name)
+        );
+        // Random coat names only use characters the bitmap font has
+        for seed in 0..200 {
+            let name = Coat::random(seed).name;
+            assert!(
+                name.chars().all(|c| c == ' ' || glyph_5x7(c) != [0; 7]),
+                "{name}"
+            );
         }
-        assert_eq!(state.coat, CoatStyle::Calico);
-        assert_eq!(seen, CoatStyle::ALL.to_vec());
     }
 
     #[test]
@@ -1759,7 +1846,12 @@ mod tests {
     fn tray_icon_never_clips_at_edges_across_coats_and_states() {
         for &(w, h) in &[(24u32, 24u32), (24u32, 28u32), (28u32, 28u32)] {
             let mut pixmap = Pixmap::new(w, h).unwrap();
-            for coat in CoatStyle::ALL {
+            let coats = CoatStyle::ALL
+                .into_iter()
+                .map(Coat::builtin)
+                .chain((0..12).map(Coat::random));
+            for coat in coats {
+                let (coat, name) = (&coat, &coat.name);
                 for &(sleeping, hidden) in &[(false, false), (true, false), (false, true)] {
                     crate::render::render_tray_icon(
                         coat,
@@ -1773,14 +1865,14 @@ mod tests {
                     for x in 0..w {
                         let top_a = data[(x as usize) * 4 + 3];
                         let bot_a = data[((h - 1) * w + x) as usize * 4 + 3];
-                        assert_eq!(top_a, 0, "top edge clipped for {coat:?} at {w}x{h}");
-                        assert_eq!(bot_a, 0, "bottom edge clipped for {coat:?} at {w}x{h}");
+                        assert_eq!(top_a, 0, "top edge clipped for {name} at {w}x{h}");
+                        assert_eq!(bot_a, 0, "bottom edge clipped for {name} at {w}x{h}");
                     }
                     for y in 0..h {
                         let left_a = data[(y * w) as usize * 4 + 3];
                         let right_a = data[(y * w + (w - 1)) as usize * 4 + 3];
-                        assert_eq!(left_a, 0, "left edge clipped for {coat:?} at {w}x{h}");
-                        assert_eq!(right_a, 0, "right edge clipped for {coat:?} at {w}x{h}");
+                        assert_eq!(left_a, 0, "left edge clipped for {name} at {w}x{h}");
+                        assert_eq!(right_a, 0, "right edge clipped for {name} at {w}x{h}");
                     }
                 }
             }

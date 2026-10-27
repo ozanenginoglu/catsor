@@ -1,7 +1,8 @@
 //! `--preview-sheet`: a static PNG of every coat in a grid of poses (`docs/preview.png`).
 //! Each pose is reached by running the real simulation, not by posing the skeleton by hand.
 
-use crate::cat::{Activity, CatSim, CoatStyle, FeedPreset};
+use crate::cat::{Activity, CatSim, FeedPreset};
+use crate::coat::{Coat, CoatStyle};
 use crate::render::render_cat;
 use glam::Vec2;
 use std::f32::consts::FRAC_PI_2;
@@ -18,7 +19,7 @@ const COATS: [CoatStyle; 5] = [
 
 /// One cell of the grid; rows are moving, resting and playing
 #[derive(Clone, Copy)]
-enum Pose {
+pub(crate) enum Pose {
     Walk,
     Trot,
     Gallop,
@@ -77,17 +78,17 @@ fn chase(cat: &mut CatSim, mut angle: f32, turn: f32, lead: f32, secs: f32) {
 }
 
 /// A cat that walked up toward a resting cursor and sat down facing it (upward)
-fn settled(coat: CoatStyle, scale: f32) -> (CatSim, Vec2) {
-    let mut cat = CatSim::new(Vec2::ZERO, scale, coat);
+fn settled(coat: &Coat, scale: f32) -> (CatSim, Vec2) {
+    let mut cat = CatSim::new(Vec2::ZERO, scale, coat.clone());
     let cursor = cat.nodes[0] + Vec2::new(10.0, -150.0) * scale;
     run(&mut cat, cursor, 8.0);
     (cat, cursor)
 }
 
-fn posed(pose: Pose, coat: CoatStyle, scale: f32) -> CatSim {
+pub(crate) fn posed(pose: Pose, coat: &Coat, scale: f32) -> CatSim {
     let up = -FRAC_PI_2;
     let moving = |angle: f32, turn: f32, lead: f32| {
-        let mut cat = CatSim::new(Vec2::ZERO, scale, coat);
+        let mut cat = CatSim::new(Vec2::ZERO, scale, coat.clone());
         chase(&mut cat, angle, turn, lead, 3.0);
         cat
     };
@@ -95,7 +96,7 @@ fn posed(pose: Pose, coat: CoatStyle, scale: f32) -> CatSim {
         Pose::Walk => moving(up + 0.55, 0.0, 130.0),
         Pose::Trot => moving(up + 0.45, 0.0, 400.0),
         Pose::Gallop => {
-            let mut cat = CatSim::new(Vec2::ZERO, scale, coat);
+            let mut cat = CatSim::new(Vec2::ZERO, scale, coat.clone());
             for _ in 0..(2.0 / DT) as usize {
                 cat.sprinting = true;
                 cat.shake_energy = 2.0;
@@ -199,7 +200,7 @@ fn posed(pose: Pose, coat: CoatStyle, scale: f32) -> CatSim {
 }
 
 /// Renders `cat` into its own pixmap, cropped to the pixels it covers
-fn render_cropped(cat: &CatSim) -> Option<Pixmap> {
+pub(crate) fn render_cropped(cat: &CatSim) -> Option<Pixmap> {
     let dim = (150.0 * cat.scale).ceil() as u32;
     let mut full = Pixmap::new(dim, dim)?;
     let mut mask = Mask::new(dim, dim)?;
@@ -224,7 +225,16 @@ fn render_cropped(cat: &CatSim) -> Option<Pixmap> {
     )?)
 }
 
-pub fn generate_preview_sheet(path: &str, scale: f32) -> Result<(), Box<dyn std::error::Error>> {
+/// Renders the grid with one built-in coat per column, or `only` in every column
+pub fn generate_preview_sheet(
+    path: &str,
+    scale: f32,
+    only: Option<Coat>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let coats: Vec<Coat> = match only {
+        Some(coat) => vec![coat; COATS.len()],
+        None => COATS.into_iter().map(Coat::builtin).collect(),
+    };
     let cell = (118.0 * scale).round() as u32;
     let margin = (14.0 * scale).round() as u32;
     let width = margin * 2 + cell * COATS.len() as u32;
@@ -233,7 +243,7 @@ pub fn generate_preview_sheet(path: &str, scale: f32) -> Result<(), Box<dyn std:
     sheet.fill(Color::WHITE);
 
     for (row, poses) in ROWS.iter().enumerate() {
-        for (col, (&pose, &coat)) in poses.iter().zip(COATS.iter()).enumerate() {
+        for (col, (&pose, coat)) in poses.iter().zip(&coats).enumerate() {
             let Some(sprite) = render_cropped(&posed(pose, coat, scale)) else {
                 continue;
             };

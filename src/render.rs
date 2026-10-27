@@ -1,7 +1,7 @@
 use crate::cat::{
-    Activity, BODY_NODES, CatSim, CoatStyle, Gait, TAIL_NODES, TOTAL_NODES, pounce_stretch,
-    smoothstep,
+    Activity, BODY_NODES, CatSim, Gait, TAIL_NODES, TOTAL_NODES, pounce_stretch, smoothstep,
 };
+use crate::coat::{Coat, Pattern, Rgba8};
 use glam::Vec2;
 use tiny_skia::{
     Color, FillRule, LineCap, LineJoin, Mask, Paint, Path, PathBuilder, PixmapMut, Rect, Stroke,
@@ -9,6 +9,7 @@ use tiny_skia::{
 };
 
 struct Palette {
+    pattern: Pattern,
     base: Color,
     flank_shade: Color,
     outline: Color,
@@ -16,76 +17,44 @@ struct Palette {
     ear_outer: Color,
     ear_inner: Color,
     nose: Color,
-    patch_primary: Option<Color>,
-    patch_primary_shade: Option<Color>,
-    patch_secondary: Option<Color>,
+    paw: Color,
+    belly: Color,
+    tummy: Color,
+    chin: Color,
+    /// Back patch, flank patch and shoulder spot; `None` on solid coats
+    patches: Option<[Color; 3]>,
+    tail: Color,
+    tail_shade: Color,
+    tail_rings: Option<Color>,
 }
 
 impl Palette {
-    fn for_coat(coat: CoatStyle) -> Self {
-        match coat {
-            CoatStyle::Calico => Self {
-                base: rgba(238, 235, 230, 255),
-                flank_shade: rgba(210, 205, 198, 255),
-                outline: rgba(68, 56, 48, 255),
-                crease: rgba(168, 160, 150, 210),
-                ear_outer: rgba(226, 134, 66, 255),
-                ear_inner: rgba(178, 88, 34, 255),
-                nose: rgba(68, 52, 46, 255),
-                patch_primary: Some(rgba(220, 124, 54, 255)),
-                patch_primary_shade: Some(rgba(190, 96, 34, 255)),
-                patch_secondary: Some(rgba(58, 60, 66, 255)),
-            },
-            CoatStyle::Brown => Self {
-                base: rgba(154, 118, 88, 255),
-                flank_shade: rgba(126, 94, 68, 255),
-                outline: rgba(56, 38, 24, 255),
-                crease: rgba(94, 66, 44, 225),
-                ear_outer: rgba(146, 110, 80, 255),
-                ear_inner: rgba(98, 66, 42, 255),
-                nose: rgba(44, 28, 18, 255),
-                patch_primary: None,
-                patch_primary_shade: None,
-                patch_secondary: None,
-            },
-            CoatStyle::Charcoal => Self {
-                base: rgba(62, 62, 66, 255),
-                flank_shade: rgba(42, 42, 46, 255),
-                outline: rgba(18, 18, 20, 255),
-                crease: rgba(26, 26, 30, 235),
-                ear_outer: rgba(56, 56, 60, 255),
-                ear_inner: rgba(32, 32, 36, 255),
-                nose: rgba(16, 16, 18, 255),
-                patch_primary: None,
-                patch_primary_shade: None,
-                patch_secondary: None,
-            },
-            CoatStyle::Tuxedo => Self {
-                base: rgba(232, 233, 236, 255),
-                flank_shade: rgba(202, 204, 210, 255),
-                outline: rgba(36, 38, 42, 255),
-                crease: rgba(156, 158, 166, 210),
-                ear_outer: rgba(46, 48, 52, 255),
-                ear_inner: rgba(26, 28, 32, 255),
-                nose: rgba(54, 54, 58, 255),
-                patch_primary: Some(rgba(48, 50, 56, 255)),
-                patch_primary_shade: Some(rgba(34, 36, 40, 255)),
-                patch_secondary: Some(rgba(78, 80, 88, 255)),
-            },
-            CoatStyle::Silver => Self {
-                base: rgba(222, 223, 226, 255),
-                flank_shade: rgba(194, 196, 202, 255),
-                outline: rgba(110, 112, 118, 255),
-                crease: rgba(162, 164, 170, 215),
-                ear_outer: rgba(216, 218, 222, 255),
-                ear_inner: rgba(172, 174, 182, 255),
-                nose: rgba(92, 92, 98, 255),
-                patch_primary: None,
-                patch_primary_shade: None,
-                patch_secondary: None,
-            },
+    fn for_coat(coat: &Coat) -> Self {
+        Self {
+            pattern: coat.pattern,
+            base: color(coat.base),
+            flank_shade: color(coat.shade),
+            outline: color(coat.outline),
+            crease: color(coat.crease),
+            ear_outer: color(coat.ears),
+            ear_inner: color(coat.ear_inner),
+            nose: color(coat.nose),
+            paw: color(coat.paws),
+            belly: color(coat.belly),
+            tummy: color(coat.tummy),
+            chin: color(coat.chin),
+            patches: (coat.pattern != Pattern::Solid)
+                .then(|| [color(coat.patch), color(coat.patch_shade), color(coat.spot)]),
+            tail: color(coat.tail),
+            tail_shade: color(coat.tail_shade),
+            tail_rings: coat.tail_rings.map(color),
         }
     }
+}
+
+#[inline]
+pub(crate) fn color(c: Rgba8) -> Color {
+    Color::from_rgba8(c.r, c.g, c.b, c.a)
 }
 
 #[inline]
@@ -168,7 +137,7 @@ pub fn render_cat(cat: &CatSim, pixmap: &mut PixmapMut, clip_mask: &mut Mask, wi
     pixmap.fill(Color::TRANSPARENT);
 
     let s = cat.scale;
-    let pal = Palette::for_coat(cat.coat);
+    let pal = Palette::for_coat(&cat.coat);
 
     let local = cat.nodes.map(|n| n - window_origin);
 
@@ -555,11 +524,7 @@ fn draw_paws(
     };
     let (s, fwd, side, hip_fwd, hip_side) = (f.s, f.fwd, f.side, f.hip_fwd, f.hip_side);
 
-    let paw_color = match cat.coat {
-        CoatStyle::Tuxedo | CoatStyle::Calico | CoatStyle::Silver => rgba(236, 234, 230, 255),
-        CoatStyle::Brown => rgba(138, 102, 74, 255),
-        CoatStyle::Charcoal => rgba(48, 48, 52, 255),
-    };
+    let paw_color = pal.paw;
     let mut pen = LegPen {
         fill: paw_color,
         outline: pal.outline,
@@ -908,19 +873,15 @@ fn draw_tail(
         return;
     }
 
-    let (tail_base_col, tail_shade_col) = match cat.coat {
-        CoatStyle::Calico => (rgba(220, 124, 54, 255), rgba(182, 92, 32, 255)),
-        _ => (pal.base, pal.flank_shade),
-    };
-    fill_solid(pixmap, &shade_band, tail_shade_col);
+    fill_solid(pixmap, &shade_band, pal.tail_shade);
     if let Some(base_band) = tail_band(&centerline, 0.0, tip, 0.65, s) {
-        fill_solid(pixmap, &base_band, tail_base_col);
+        fill_solid(pixmap, &base_band, pal.tail);
     }
 
-    if cat.coat == CoatStyle::Calico {
+    if let Some(ring_col) = pal.tail_rings {
         for ring_u in [1.0f32, 3.0, 5.0] {
             if let Some(ring) = tail_band(&centerline, ring_u, ring_u + 0.52, 0.92, s) {
-                fill_solid(pixmap, &ring, rgba(178, 82, 24, 235));
+                fill_solid(pixmap, &ring, ring_col);
             }
         }
     }
@@ -1116,7 +1077,7 @@ fn draw_coat_patches(
     body_mask: &Mask,
     pixmap: &mut PixmapMut,
 ) {
-    let Some(primary) = pal.patch_primary else {
+    let Some([primary, flank_col, spot_col]) = pal.patches else {
         return;
     };
     let s = cat.scale;
@@ -1134,11 +1095,7 @@ fn draw_coat_patches(
         pixmap,
     );
 
-    if let Some(sec_col) = match cat.coat {
-        CoatStyle::Calico => pal.patch_primary_shade,
-        CoatStyle::Tuxedo => pal.patch_primary,
-        _ => pal.patch_secondary,
-    } {
+    {
         draw_blob_patch(
             &[
                 local[3] + tangents[3] * (2.5 * s) + normals[3] * (1.2 * s),
@@ -1147,13 +1104,13 @@ fn draw_coat_patches(
                 local[5] + normals[5] * (widths[5] * 1.1),
                 local[4] - normals[4] * (0.8 * s),
             ],
-            sec_col,
+            flank_col,
             body_mask,
             pixmap,
         );
     }
 
-    if let Some(spot_col) = pal.patch_secondary {
+    {
         draw_blob_patch(
             &[
                 local[1] + normals[1] * (widths[1] * 0.25),
@@ -1277,13 +1234,7 @@ fn draw_exposed_belly(
         return;
     }
     let roll_side = cat.belly_roll_side;
-    let (belly_col, tummy_tint) = match cat.coat {
-        CoatStyle::Calico => (rgba(248, 245, 240, 248), rgba(244, 198, 198, 155)),
-        CoatStyle::Tuxedo => (rgba(246, 247, 250, 252), rgba(240, 198, 204, 145)),
-        CoatStyle::Brown => (rgba(218, 188, 156, 244), rgba(236, 192, 174, 145)),
-        CoatStyle::Charcoal => (rgba(108, 108, 116, 242), rgba(152, 132, 138, 135)),
-        CoatStyle::Silver => (rgba(245, 246, 249, 250), rgba(240, 196, 206, 150)),
-    };
+    let (belly_col, tummy_tint) = (pal.belly, pal.tummy);
 
     // Smoothly widen and fade in from zero at the `roll_side` flank toward the center as `roll` goes 0 -> 1
     let shift_factor = roll_side * (1.0 - roll) * 0.58;
@@ -1436,10 +1387,10 @@ fn draw_head_and_ears(
         );
     }
 
-    if let Some(patch_col) = pal.patch_primary {
+    if let Some([patch_col, ..]) = pal.patches {
         clip_mask.clear();
         clip_mask.fill_path(&outer_head, FillRule::Winding, true, Transform::identity());
-        draw_head_patches(cat.coat, &h, patch_col, clip_mask, pixmap);
+        draw_head_patches(pal.pattern, &h, patch_col, clip_mask, pixmap);
     }
 
     // The snout pitches back as the cat rolls over: the upright face fades out while the
@@ -1480,15 +1431,15 @@ fn draw_ears(cat: &CatSim, h: &HeadFrame, pal: &Palette, pixmap: &mut PixmapMut)
 
 /// Coat patches on top of the head, clipped to the head silhouette in `clip_mask`
 fn draw_head_patches(
-    coat: CoatStyle,
+    pattern: Pattern,
     h: &HeadFrame,
     patch_col: Color,
     clip_mask: &Mask,
     pixmap: &mut PixmapMut,
 ) {
     let (c, fwd, side, s) = (h.center, h.fwd, h.side, h.s);
-    match coat {
-        CoatStyle::Calico => {
+    match pattern {
+        Pattern::Calico => {
             draw_blob_patch(
                 &[
                     c + fwd * (7.5 * s),
@@ -1502,7 +1453,7 @@ fn draw_head_patches(
                 pixmap,
             );
         }
-        CoatStyle::Tuxedo => {
+        Pattern::Tuxedo => {
             for sign in [-1.0f32, 1.0f32] {
                 draw_blob_patch(
                     &[
@@ -1517,7 +1468,7 @@ fn draw_head_patches(
                 );
             }
         }
-        _ => {}
+        Pattern::Solid => {}
     }
 }
 
@@ -1567,11 +1518,7 @@ fn draw_upturned_face(
     let lat_shift = side * (cat.belly_roll_side * (1.0 - face_t) * 2.2 * s);
     let fc = h.center + lat_shift;
 
-    let chin_col = match cat.coat {
-        CoatStyle::Calico | CoatStyle::Tuxedo | CoatStyle::Silver => rgba(246, 245, 242, 245),
-        CoatStyle::Brown => rgba(216, 186, 154, 240),
-        CoatStyle::Charcoal => rgba(102, 102, 110, 235),
-    };
+    let chin_col = pal.chin;
     draw_blob_patch(
         &[
             fc - fwd * (2.0 * s),
@@ -1760,7 +1707,7 @@ fn draw_ear(
         return;
     };
 
-    let (outer_col, inner_col) = if pal.patch_primary.is_some() && side_sign > 0.0 {
+    let (outer_col, inner_col) = if pal.patches.is_some() && side_sign > 0.0 {
         (pal.base, pal.flank_shade)
     } else {
         (pal.ear_outer, pal.ear_inner)
@@ -1786,10 +1733,9 @@ fn draw_ear(
 }
 
 /// Returns `(base_color, accent_patch_color, outline_color)` for UI coat swatches.
-pub fn coat_swatch_colors(coat: CoatStyle) -> (Color, Color, Color) {
-    let pal = Palette::for_coat(coat);
-    let accent = pal.patch_primary.unwrap_or(pal.flank_shade);
-    (pal.base, accent, pal.outline)
+pub fn coat_swatch_colors(coat: &Coat) -> (Color, Color, Color) {
+    let (base, accent, outline) = coat.swatch();
+    (color(base), color(accent), color(outline))
 }
 
 fn build_tray_head_path(cx: f32, cy: f32, r: f32, droop: f32) -> Option<tiny_skia::Path> {
@@ -1834,7 +1780,7 @@ fn build_tray_head_path(cx: f32, cy: f32, r: f32, droop: f32) -> Option<tiny_ski
 
 /// Renders a front-facing cat-head silhouette icon for the system tray.
 pub fn render_tray_icon(
-    coat: CoatStyle,
+    coat: &Coat,
     sleeping: bool,
     hidden: bool,
     opaque_bg: bool,
@@ -1854,48 +1800,15 @@ pub fn render_tray_icon(
     let cy = h * 0.5 + r * 0.10;
     let droop = if sleeping || hidden { 1.0 } else { 0.0 };
 
-    let (base, shade, outline, ear_in, nose_col, eye_col) = match coat {
-        CoatStyle::Calico => (
-            rgba(242, 239, 234, 255),
-            rgba(218, 212, 204, 255),
-            rgba(68, 56, 48, 255),
-            rgba(218, 138, 132, 255),
-            rgba(216, 126, 136, 255),
-            rgba(58, 48, 42, 255),
-        ),
-        CoatStyle::Brown => (
-            rgba(162, 124, 92, 255),
-            rgba(134, 100, 72, 255),
-            rgba(56, 38, 24, 255),
-            rgba(196, 132, 118, 255),
-            rgba(74, 46, 34, 255),
-            rgba(46, 30, 18, 255),
-        ),
-        CoatStyle::Charcoal => (
-            rgba(112, 116, 128, 255),
-            rgba(88, 92, 104, 255),
-            rgba(28, 30, 36, 255),
-            rgba(168, 122, 132, 255),
-            rgba(46, 48, 56, 255),
-            rgba(26, 28, 34, 255),
-        ),
-        CoatStyle::Tuxedo => (
-            rgba(238, 240, 244, 255),
-            rgba(212, 215, 222, 255),
-            rgba(34, 36, 42, 255),
-            rgba(164, 118, 128, 255),
-            rgba(216, 132, 146, 255),
-            rgba(34, 36, 42, 255),
-        ),
-        CoatStyle::Silver => (
-            rgba(224, 226, 232, 255),
-            rgba(196, 198, 206, 255),
-            rgba(96, 100, 110, 255),
-            rgba(206, 152, 162, 255),
-            rgba(198, 126, 138, 255),
-            rgba(58, 60, 68, 255),
-        ),
-    };
+    let icon = &coat.icon;
+    let (base, shade, outline, ear_in, nose_col, eye_col) = (
+        color(icon.base),
+        color(icon.shade),
+        color(icon.outline),
+        color(icon.ear_inner),
+        color(icon.nose),
+        color(icon.eyes),
+    );
 
     let Some(head_path) = build_tray_head_path(cx, cy, r, droop) else {
         return;
@@ -1907,40 +1820,40 @@ pub fn render_tray_icon(
         fill_solid(pixmap, &inner_path, base);
     }
 
-    if matches!(coat, CoatStyle::Calico | CoatStyle::Tuxedo)
+    if coat.pattern != Pattern::Solid
         && let Some(mut mask) = Mask::new(pixmap.width(), pixmap.height())
     {
         mask.fill_path(&head_path, FillRule::Winding, true, Transform::identity());
-        match coat {
-            CoatStyle::Calico => {
+        match coat.pattern {
+            Pattern::Calico => {
                 if let Some(orange) =
                     PathBuilder::from_circle(cx - r * 0.48, cy - r * 0.42, r * 0.62)
                 {
-                    fill_solid_masked(pixmap, &orange, rgba(226, 132, 60, 255), &mask);
+                    fill_solid_masked(pixmap, &orange, color(icon.patch), &mask);
                 }
                 if let Some(dark) = PathBuilder::from_circle(cx + r * 0.56, cy - r * 0.52, r * 0.44)
                 {
-                    fill_solid_masked(pixmap, &dark, rgba(62, 64, 72, 255), &mask);
+                    fill_solid_masked(pixmap, &dark, color(icon.spot), &mask);
                 }
             }
-            CoatStyle::Tuxedo => {
+            Pattern::Tuxedo => {
                 for sign in [-1.0f32, 1.0f32] {
                     if let Some(hood) =
                         PathBuilder::from_circle(cx + sign * r * 0.56, cy - r * 0.50, r * 0.50)
                     {
-                        fill_solid_masked(pixmap, &hood, rgba(46, 48, 56, 255), &mask);
+                        fill_solid_masked(pixmap, &hood, color(icon.patch), &mask);
                     }
                 }
             }
-            _ => {}
+            Pattern::Solid => {}
         }
     }
 
     let tip_x = r * (0.76 + 0.08 * droop);
     let tip_y = r * (0.98 - 0.16 * droop);
     for sign in [-1.0f32, 1.0f32] {
-        let ear_col = if coat == CoatStyle::Calico && sign < 0.0 {
-            rgba(186, 96, 40, 255)
+        let ear_col = if coat.pattern == Pattern::Calico && sign < 0.0 {
+            color(icon.patch_ear)
         } else {
             ear_in
         };
@@ -2007,6 +1920,7 @@ pub fn render_tray_icon(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coat::CoatStyle;
     use std::path::Path;
     use tiny_skia::Pixmap;
 
@@ -2015,7 +1929,13 @@ mod tests {
 
     fn app_icon_png(size: u32) -> Vec<u8> {
         let mut pixmap = Pixmap::new(size, size).unwrap();
-        render_tray_icon(CoatStyle::Calico, false, false, false, &mut pixmap.as_mut());
+        render_tray_icon(
+            &Coat::builtin(CoatStyle::Calico),
+            false,
+            false,
+            false,
+            &mut pixmap.as_mut(),
+        );
         pixmap.encode_png().unwrap()
     }
 

@@ -1,4 +1,5 @@
 use super::*;
+use crate::coat::CoatStyle;
 
 #[test]
 fn stands_up_before_walking_and_settles_at_target() {

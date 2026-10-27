@@ -1,6 +1,8 @@
 use crate::Args;
 use crate::autostart;
 use crate::cat::CatSim;
+use crate::coat::{Coat, CoatLibrary};
+use crate::designer::{DESIGNER_H, DESIGNER_TITLE, DESIGNER_W, Designer, DesignerInput};
 use crate::prefs::UserPrefs;
 use crate::render::{
     bowl_window_dim, cat_window_dim, render_bowl_overlay, render_cat, render_tray_icon,
@@ -19,9 +21,10 @@ use std::time::{Duration, Instant};
 use tiny_skia::{Mask, Pixmap};
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CreateBitmap,
-    CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetMonitorInfoW,
-    HBITMAP, HDC, HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, SelectObject,
+    AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, BeginPaint,
+    CreateBitmap, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject,
+    EndPaint, GetMonitorInfoW, HBITMAP, HDC, HGDIOBJ, InvalidateRect, MONITOR_DEFAULTTONEAREST,
+    MONITORINFO, MonitorFromPoint, PAINTSTRUCT, SRCCOPY, SelectObject, StretchDIBits,
 };
 use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -30,11 +33,12 @@ use windows_sys::Win32::System::Power::{
 };
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows_sys::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+    AdjustWindowRectExForDpi, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow,
+    SetProcessDpiAwarenessContext,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_ESCAPE, VK_LBUTTON,
-    VK_RBUTTON,
+    GetAsyncKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+    VK_ESCAPE, VK_LBUTTON, VK_RBUTTON,
 };
 use windows_sys::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
@@ -51,6 +55,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_QUIT,
     WM_RBUTTONDOWN, WM_RBUTTONUP, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    CW_USEDEFAULT, SW_RESTORE, SWP_NOZORDER, WM_CHAR, WM_ERASEBKGND, WM_PAINT, WS_CAPTION,
+    WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
 };
 
 const WM_TRAYICON: u32 = WM_APP + 1;
@@ -219,7 +227,7 @@ fn create_tray_hicon(state: &TrayState) -> Option<HICON> {
     let icon_px = unsafe { GetSystemMetrics(SM_CXSMICON).clamp(24, 64) as u32 };
     let mut pixmap = Pixmap::new(icon_px, icon_px)?;
     render_tray_icon(
-        state.coat,
+        &state.coat,
         state.sleeping,
         state.hidden,
         false,
@@ -446,7 +454,7 @@ impl WinTrayController {
             tracking_mouse: false,
             hovered_idx: None,
             hit_entries,
-            last_state: initial_state,
+            last_state: initial_state.clone(),
             actions: VecDeque::new(),
             taskbar_created_msg,
             readd_tray_requested: false,
@@ -514,7 +522,7 @@ impl WinTrayController {
 
             let icon_changed = state.icon_differs(&st.last_state);
             let menu_changed = state != st.last_state;
-            st.last_state = state;
+            st.last_state = state.clone();
             (readd, icon_changed, st.menu_open && menu_changed)
         };
 
@@ -826,8 +834,266 @@ enum Flow {
     Quit,
 }
 
+/// What the designer window procedure shares with the main loop: input it collected, and the
+/// latest frame to paint
+struct DesignerWndState {
+    inputs: VecDeque<DesignerInput>,
+    /// BGRA pixels of the logical `DESIGNER_W` x `DESIGNER_H` frame
+    frame: Vec<u8>,
+    /// Integer DPI scale; the frame is stretched by it when painted
+    scale: i32,
+    tracking_mouse: bool,
+}
+
+/// The coat designer: an ordinary top-level window (title bar, close button, taskbar entry).
+/// Contents, input handling and saving live in `designer.rs`
+struct DesignerWnd {
+    hwnd: HWND,
+    state_ptr: *const RefCell<DesignerWndState>,
+    designer: Designer,
+    /// Reused render target
+    pixmap: Pixmap,
+}
+
+impl DesignerWnd {
+    fn open(
+        hinstance: HINSTANCE,
+        class_name: &[u16],
+        current: &Coat,
+        coats: &CoatLibrary,
+    ) -> BoxResult<Self> {
+        let pixmap = Pixmap::new(DESIGNER_W, DESIGNER_H).ok_or("Failed to allocate Pixmap")?;
+        let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+        let title = to_wide_null(DESIGNER_TITLE);
+        let hwnd = unsafe {
+            CreateWindowExW(
+                0,
+                class_name.as_ptr(),
+                title.as_ptr(),
+                style,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                DESIGNER_W as i32,
+                DESIGNER_H as i32,
+                null_mut(),
+                null_mut(),
+                hinstance,
+                null(),
+            )
+        };
+        if hwnd.is_null() {
+            return Err("Failed to create the coat designer window".into());
+        }
+
+        // Size the client area to the contents at the monitor's DPI (whole multiples keep the
+        // bitmap font crisp) and centre it on the monitor under the cursor
+        let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+        let scale = ((dpi + 48) / 96).max(1) as i32;
+        let mut rc = RECT {
+            left: 0,
+            top: 0,
+            right: DESIGNER_W as i32 * scale,
+            bottom: DESIGNER_H as i32 * scale,
+        };
+        let mut pt = POINT { x: 0, y: 0 };
+        unsafe {
+            AdjustWindowRectExForDpi(&mut rc, style, 0, 0, dpi);
+            GetCursorPos(&mut pt);
+        }
+        let work = monitor_work_area(pt);
+        let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+        let x = work.left + ((work.right - work.left) - w).max(0) / 2;
+        let y = work.top + ((work.bottom - work.top) - h).max(0) / 2;
+
+        let state = Box::new(RefCell::new(DesignerWndState {
+            inputs: VecDeque::new(),
+            frame: vec![0; (DESIGNER_W * DESIGNER_H * 4) as usize],
+            scale,
+            tracking_mouse: false,
+        }));
+        let state_ptr = Box::into_raw(state) as *const RefCell<DesignerWndState>;
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
+            SetWindowPos(hwnd, null_mut(), x, y, w, h, SWP_NOZORDER);
+            ShowWindow(hwnd, SW_SHOW);
+            SetForegroundWindow(hwnd);
+        }
+        Ok(Self {
+            hwnd,
+            state_ptr,
+            designer: Designer::new(current, coats),
+            pixmap,
+        })
+    }
+
+    fn state_cell(&self) -> &RefCell<DesignerWndState> {
+        unsafe { &*self.state_ptr }
+    }
+
+    fn activate(&self) {
+        unsafe {
+            ShowWindow(self.hwnd, SW_RESTORE);
+            SetForegroundWindow(self.hwnd);
+        }
+    }
+
+    /// Feeds collected input to the designer; returns `true` when it asked to close
+    fn pump(&mut self, coats: &mut CoatLibrary, cat: &mut CatSim) -> bool {
+        let inputs: Vec<DesignerInput> = self.state_cell().borrow_mut().inputs.drain(..).collect();
+        inputs
+            .into_iter()
+            .any(|input| self.designer.handle(input, coats, cat))
+    }
+
+    /// Redraws the frame if it changed and asks Windows to repaint
+    fn present(&mut self) {
+        if !self.designer.take_dirty() {
+            return;
+        }
+        self.designer.render(&mut self.pixmap.as_mut());
+        rgba_to_bgra(
+            self.pixmap.data(),
+            &mut self.state_cell().borrow_mut().frame,
+        );
+        unsafe {
+            InvalidateRect(self.hwnd, null(), 0);
+        }
+    }
+}
+
+impl Drop for DesignerWnd {
+    fn drop(&mut self) {
+        unsafe {
+            SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
+            DestroyWindow(self.hwnd);
+            drop(Box::from_raw(
+                self.state_ptr as *mut RefCell<DesignerWndState>,
+            ));
+        }
+    }
+}
+
+unsafe extern "system" fn designer_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let state_ptr =
+        unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<DesignerWndState> };
+    if state_ptr.is_null() {
+        return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+    }
+    let cell = unsafe { &*state_ptr };
+    let scale = cell.borrow().scale as f32;
+    let pos = || {
+        (
+            (lparam & 0xFFFF) as i16 as f32 / scale,
+            ((lparam >> 16) & 0xFFFF) as i16 as f32 / scale,
+        )
+    };
+    let push = |input| cell.borrow_mut().inputs.push_back(input);
+    match msg {
+        WM_MOUSEMOVE => {
+            let (x, y) = pos();
+            push(DesignerInput::Move(x, y));
+            if !cell.borrow().tracking_mouse {
+                cell.borrow_mut().tracking_mouse = true;
+                let mut tme = TRACKMOUSEEVENT {
+                    cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                unsafe {
+                    TrackMouseEvent(&mut tme);
+                }
+            }
+            0
+        }
+        WM_MOUSELEAVE => {
+            cell.borrow_mut().tracking_mouse = false;
+            push(DesignerInput::Leave);
+            0
+        }
+        WM_LBUTTONDOWN => {
+            // Capture keeps colour drags going when the pointer leaves the window
+            unsafe {
+                SetCapture(hwnd);
+            }
+            let (x, y) = pos();
+            push(DesignerInput::Press(x, y));
+            0
+        }
+        WM_LBUTTONUP => {
+            unsafe {
+                ReleaseCapture();
+            }
+            push(DesignerInput::Release);
+            0
+        }
+        WM_CHAR => {
+            let input = match wparam as u32 {
+                0x08 => Some(DesignerInput::Backspace),
+                0x0d => Some(DesignerInput::Enter),
+                0x1b => Some(DesignerInput::Escape),
+                c if c >= 0x20 => char::from_u32(c).map(DesignerInput::Char),
+                _ => None,
+            };
+            if let Some(input) = input {
+                push(input);
+            }
+            0
+        }
+        WM_PAINT => {
+            unsafe {
+                let mut ps: PAINTSTRUCT = zeroed();
+                let hdc = BeginPaint(hwnd, &mut ps);
+                let st = cell.borrow();
+                let mut bmi: BITMAPINFO = zeroed();
+                bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+                bmi.bmiHeader.biWidth = DESIGNER_W as i32;
+                // Top-down rows, like tiny-skia
+                bmi.bmiHeader.biHeight = -(DESIGNER_H as i32);
+                bmi.bmiHeader.biPlanes = 1;
+                bmi.bmiHeader.biBitCount = 32;
+                bmi.bmiHeader.biCompression = BI_RGB;
+                StretchDIBits(
+                    hdc,
+                    0,
+                    0,
+                    DESIGNER_W as i32 * st.scale,
+                    DESIGNER_H as i32 * st.scale,
+                    0,
+                    0,
+                    DESIGNER_W as i32,
+                    DESIGNER_H as i32,
+                    st.frame.as_ptr() as *const c_void,
+                    &bmi,
+                    DIB_RGB_COLORS,
+                    SRCCOPY,
+                );
+                EndPaint(hwnd, &ps);
+            }
+            0
+        }
+        // Every pixel is painted from the frame, so skip the flicker of erasing first
+        WM_ERASEBKGND => 1,
+        WM_CLOSE => {
+            push(DesignerInput::Close);
+            0
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
 struct WinApp {
     cat: CatSim,
+    /// Custom coats from `coats.toml`, reloaded when the file changes
+    coats: CoatLibrary,
+    hinstance: HINSTANCE,
+    designer_class_name: Vec<u16>,
+    designer: Option<DesignerWnd>,
     cat_win: LayeredWindow,
     /// Standalone bowl window shown while carrying or walking to the placed bowl
     bowl_win: Option<LayeredWindow>,
@@ -841,8 +1107,11 @@ struct WinApp {
     tray: Option<WinTrayController>,
 }
 
-pub fn run(args: &Args, prefs: UserPrefs) -> BoxResult<()> {
-    let mut app = WinApp::new(args, prefs)?;
+pub fn run(args: &Args, prefs: UserPrefs, coats: CoatLibrary) -> BoxResult<()> {
+    let mut app = WinApp::new(args, prefs, coats)?;
+    if args.design_coat {
+        app.open_designer();
+    }
     let frame_duration = Duration::from_secs_f64(1.0 / (args.fps.max(15) as f64));
     let mut last_tick = Instant::now();
     let mut raise_counter = 0u32;
@@ -864,6 +1133,7 @@ pub fn run(args: &Args, prefs: UserPrefs) -> BoxResult<()> {
             }
         };
         app.step_cat(dt);
+        app.update_designer();
 
         raise_counter = raise_counter.wrapping_add(1);
         if raise_counter.is_multiple_of(120) {
@@ -890,7 +1160,7 @@ pub fn run(args: &Args, prefs: UserPrefs) -> BoxResult<()> {
 }
 
 impl WinApp {
-    fn new(args: &Args, prefs: UserPrefs) -> BoxResult<Self> {
+    fn new(args: &Args, prefs: UserPrefs, coats: CoatLibrary) -> BoxResult<Self> {
         unsafe {
             let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         }
@@ -901,13 +1171,15 @@ impl WinApp {
         register_window_class(hinstance, &overlay_class_name, overlay_wnd_proc, cursor);
         let menu_class_name = to_wide_null("catsor_menu_cls");
         register_window_class(hinstance, &menu_class_name, menu_wnd_proc, cursor);
+        let designer_class_name = to_wide_null("catsor_designer_cls");
+        register_window_class(hinstance, &designer_class_name, designer_wnd_proc, cursor);
 
         let mut init_pt = POINT { x: 400, y: 400 };
         unsafe {
             GetCursorPos(&mut init_pt);
         }
         let start_cursor = Vec2::new(init_pt.x as f32, init_pt.y as f32);
-        let mut cat = CatSim::new(start_cursor, prefs.scale, prefs.coat);
+        let mut cat = CatSim::new(start_cursor, prefs.scale, coats.resolve(&prefs.coat));
         cat.behaviors = prefs.behaviors;
 
         let win_dim = cat_window_dim(prefs.scale);
@@ -946,6 +1218,10 @@ impl WinApp {
 
         Ok(Self {
             cat,
+            coats,
+            hinstance,
+            designer_class_name,
+            designer: None,
             cat_win,
             bowl_win,
             bowl_visible: false,
@@ -975,7 +1251,8 @@ impl WinApp {
     fn handle_tray_actions(&mut self) -> BoxResult<Flow> {
         let mut needs_raise = false;
         while let Some(action) = self.tray.as_mut().and_then(|t| t.pop_action()) {
-            let Some(action) = apply_shared_action(action, &mut self.cat, &mut self.start_on_login)
+            let Some(action) =
+                apply_shared_action(action, &mut self.cat, &self.coats, &mut self.start_on_login)
             else {
                 continue;
             };
@@ -1017,9 +1294,11 @@ impl WinApp {
                     }
                 }
                 TrayAction::OpenAbout => open_about_page(),
+                TrayAction::OpenDesigner => self.open_designer(),
                 TrayAction::Quit => return Ok(Flow::Quit),
                 // Handled by `apply_shared_action`
-                TrayAction::SetCoat(_)
+                TrayAction::NextCoat
+                | TrayAction::RandomCoat
                 | TrayAction::SetTemperament(_)
                 | TrayAction::ToggleFollowCursor
                 | TrayAction::TogglePlayfulQuirks
@@ -1029,9 +1308,39 @@ impl WinApp {
         Ok(Flow::Continue { needs_raise })
     }
 
+    /// Opens the coat designer, or brings it forward if it is already open. The designer is
+    /// optional: if its window fails, say so and keep the cat running
+    fn open_designer(&mut self) {
+        match &self.designer {
+            Some(dw) => dw.activate(),
+            None => match DesignerWnd::open(
+                self.hinstance,
+                &self.designer_class_name,
+                &self.cat.coat,
+                &self.coats,
+            ) {
+                Ok(dw) => self.designer = Some(dw),
+                Err(e) => eprintln!("catsor: failed to open the coat designer: {e}"),
+            },
+        }
+    }
+
+    /// Runs the designer's queued input, closing it when asked, and repaints it if needed
+    fn update_designer(&mut self) {
+        let Some(dw) = &mut self.designer else {
+            return;
+        };
+        if dw.pump(&mut self.coats, &mut self.cat) {
+            self.designer = None;
+        } else {
+            dw.present();
+        }
+    }
+
     /// Advances the simulation from the cursor and handles bowl placement clicks (left places
     /// it, right or Escape cancels). A hidden cat stays paused unless it is feeding.
     fn step_cat(&mut self, dt: f32) {
+        self.coats.refresh(&mut self.cat);
         if self.cat_hidden && self.cat.feeding_preset().is_none() {
             self.keep_awake.set_active(false);
             return;
@@ -1124,6 +1433,7 @@ impl WinApp {
     }
 
     fn shutdown(&mut self) {
+        self.designer = None;
         if let Some(tray_ctrl) = &mut self.tray {
             tray_ctrl.close_menu();
         }

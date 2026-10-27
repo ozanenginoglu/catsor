@@ -3,7 +3,8 @@
 //!
 //! `cargo test regenerate_demo_gif -- --ignored --nocapture` (needs `ffmpeg` on `PATH`)
 
-use crate::cat::{Activity, CatSim, CoatStyle, smoothstep};
+use crate::cat::{Activity, CatSim, smoothstep};
+use crate::coat::CoatStyle;
 use crate::render::{cat_window_dim, render_cat};
 use glam::Vec2;
 use std::f32::consts::TAU;

@@ -54,12 +54,15 @@ Without a compositor the window's background shows up black. If there's no tray,
 ```
 catsor [OPTIONS]
 
-  -c, --coat <COAT>                 calico | brown | charcoal | tuxedo | silver
+  -c, --coat <COAT>                 calico | brown | charcoal | tuxedo | silver | random,
+                                    or the name of a custom coat (see Custom coats)
   -s, --scale <SCALE>               size multiplier, 0.5–2.5 (1.0 ≈ 38 px body)
   -t, --temperament <TEMPERAMENT>   balanced | playful | lazy | aloof | realistic
       --no-tray                     don't create a tray icon
       --fps <FPS>                   target frame rate (default 60, min 15)
-      --preview-sheet <PATH>        render a PNG of all coats and poses, then exit
+      --preview-sheet <PATH>        render a PNG of all coats and poses (or only --coat), then exit
+      --print-coat                  print the current coat (or --coat) as a coats.toml entry, then exit
+      --design-coat                 open the coat designer at startup (handy with --no-tray)
 ```
 
 `--coat`, `--scale` and `--temperament` override your saved preferences **and are saved as the new defaults**.
@@ -72,7 +75,7 @@ Left- or right-click the tray icon to open the menu. Press Esc or click outside 
 
 | Section | Items |
 |---|---|
-| **Appearance** | **Coat** row: click to cycle Calico → Brown → Charcoal → Tuxedo → Silver. **Size** row: click to cycle Compact 0.8× → Normal 1.0× → Large 1.35× → Extra Large 1.75× (a `--scale` outside these shows as "Custom"). **Temperament** row: click to cycle Balanced → Playful → Lazy → Aloof → Realistic (see [behavior.md](docs/behavior.md#temperaments)) |
+| **Appearance** | **Coat** row: click to cycle Calico → Brown → Charcoal → Tuxedo → Silver, then your [custom coats](#custom-coats). **Random Coat**: rolls a new random cat (see below). **Design Coat...**: opens the [coat designer](#coat-designer). **Size** row: click to cycle Compact 0.8× → Normal 1.0× → Large 1.35× → Extra Large 1.75× (a `--scale` outside these shows as "Custom"). **Temperament** row: click to cycle Balanced → Playful → Lazy → Aloof → Realistic (see [behavior.md](docs/behavior.md#temperaments)) |
 | **Feed (keep awake)** | 15 m · 30 m · 1 h · 2 h · Unlimited. While feeding, a **Stop Feeding** row appears (choosing the active preset again also stops) |
 | **Behaviors** | Follow Cursor · Playful Hunting (pounce/zoomies/tail-chase/paw-bat) |
 | | Show Cat (checkbox) · Start on Login (checkbox) · About Catsor (shows the version, opens the GitHub page) · Quit Catsor |
@@ -115,6 +118,60 @@ playful_quirks = true
 ```
 
 Lines that are unknown or invalid are skipped, and the default is used for those settings. Feeding sessions and hide/show are not saved; they reset when Catsor restarts.
+
+`coat` is a built-in coat, the name of a custom coat, or `random:<seed>` for a random coat, so the same random cat comes back after a restart.
+
+### Random coats
+
+**Random Coat** in the tray menu rolls a new cat from simplified real cat colour genetics. The base colour is black, chocolate or cinnamon, their dilute versions (blue, lilac, fawn), or ginger or cream. A cat may also be tortoiseshell, and may have no white, tuxedo markings or bicolor/calico white. Ginger cats always get tabby rings on the tail. The tray shows the result's name, such as *Blue tuxedo* or *Dilute calico*. If you want to keep one and tweak it, run `catsor --print-coat` while it's selected and paste the output into `coats.toml`.
+
+### Coat designer
+
+**Design Coat...** in the tray menu opens a window for making your own coat, starting from the one your cat is wearing:
+
+![The coat designer: name field, pattern buttons, colour rows with hex values, a colour picker with quick picks, and a live preview of the cat in four poses plus the tray icon](docs/designer.png)
+
+- **Name** it (up to 22 characters).
+- Pick a **pattern**: Solid, Calico (patches plus a patch-coloured tail), or Tuxedo (a mask and a saddle).
+- Click a **colour row** (fur, patches, second patches) to choose which colour you're editing. Then use the picker square and hue strip, click a quick pick (the top row holds real cat colours), or click the hex value and type one.
+- Toggle **tabby rings** on the tail.
+- **Randomize** rolls a random coat (the name is kept).
+- If the coat has colours you [hand-tuned in `coats.toml`](#custom-coats), the preview includes them and the tabby row shows how many there are. Saving keeps them. **Reset** drops them, so every colour is derived from the designer's colours again.
+
+The preview shows the cat walking, sitting, belly-up and asleep, plus its tray icon, and updates as you edit. **Save** (or Enter) writes the coat to `coats.toml` and puts it on your cat. If the cat was already wearing a custom coat, saving updates that coat, including a rename; otherwise it adds a new one. Esc or **Close** closes the window without saving.
+
+### Custom coats
+
+Custom coats live in `coats.toml`, in the same directory as `config.toml`. You can make them with the designer, write them by hand, or both. Custom coats are added to the end of the tray's **Coat** cycle, and `--coat <name>` selects one. **Edits are picked up live**: save the file and the running cat changes within a second. When the designer saves, it only rewrites its own keys (`name`, `pattern`, `base`, `patch`, `spot`, `tail_rings`) in that coat's entry. Your comments, other coats and any extra overrides you added by hand are kept (unless you pressed **Reset** in the designer).
+
+```toml
+[[coat]]
+name = "Marmalade"         # shown in the tray (up to 22 characters)
+base = "#e08a3c"           # the only other required key
+tail_rings = "#b0602a"     # tabby rings on the tail
+
+[[coat]]
+name = "Oreo"
+pattern = "tuxedo"         # solid (default) | calico | tuxedo
+base = "#f6f6f4"           # fur colour
+patch = "#1e1e22"          # mask and saddle colour
+
+[[coat]]
+name = "Smoke & Peach"
+pattern = "calico"
+base = "#c9cdd6"
+patch = "#f0b48a"          # large patches, ears and tail
+spot = "#5a5f6e"           # the smaller second patch colour
+```
+
+Colours are `"#rrggbb"`, or `"#rrggbbaa"` with alpha. Any colour you leave out is derived from `base`, `patch` and `spot`. To fine-tune a coat you can override `shade`, `outline`, `crease`, `ears`, `ear_inner`, `nose`, `paws`, `belly`, `tummy`, `chin`, `patch_shade`, `tail`, `tail_shade`, `tail_rings` (a colour, `"auto"` for rings a shade darker than the tail, or `"none"`) and `eyes` (tray icon). Overriding a colour also moves the colours derived from it: `tail` sets the tail's shading, `shade` sets the tail shading on solid and tuxedo coats, and `outline` sets the nose and the tray icon's outline and eyes, unless you override those too. The easiest starting point is an existing coat with every colour filled in:
+
+```sh
+catsor --coat tuxedo --print-coat >> ~/.config/catsor/coats.toml   # then rename it and edit
+catsor --coat "Oreo" --preview-sheet /tmp/oreo.png                 # see it in every pose
+```
+
+Entries with a missing name or base, a bad colour, a duplicate name, or a name taken by a built-in coat are skipped with a warning on stderr. If the selected custom coat disappears from the file, the cat falls back to Calico.
 
 ## Development
 
